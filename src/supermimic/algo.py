@@ -68,8 +68,10 @@ class TrainConfig:
     # Scale policy/critic rewards by 1/max(√Var(G), G_r_max/G_max). Stats from sim collect.
     # G_max = max_step_reward(style)/(1-γ) is fixed by the MDP.
     normalize_reward: bool = False
-    # torch.compile the WM window and the imagination horizon. False runs them eager.
+    # torch.compile the world-model window and one imagination step. False runs both eager.
     compile: bool = True
+    # Reward FK. ``warp`` (default) or ``torch``.
+    fk: str = "warp"
     # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
     adv_coef: float = 0.0
     log_every: int = 50
@@ -272,6 +274,35 @@ def world_model_window(
     return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred
 
 
+def imagine_step(
+    policy: Policy,
+    wm: WorldModel,
+    norms: InputNorms,
+    mdp,
+    obs_hist: torch.Tensor,
+    goal: torch.Tensor,
+    p: torch.Tensor,
+    quat: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    q: torch.Tensor,
+    qd: torch.Tensor,
+    a_prev: torch.Tensor,
+    xi_n: torch.Tensor,
+    xi: torch.Tensor,
+    frame: torch.Tensor,
+    deterministic: bool,
+):
+    """One imagination step. This is the compiled policy graph; the horizon loop stays eager."""
+    action = policy(obs_hist, goal, norms, deterministic=deterministic)
+    p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
+    frame = frame + 1
+    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
+    obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
+    return obs_hist, goal, p, quat, v, w, q, qd, frame, action
+
+
 def imagine_horizon(
     policy: Policy,
     wm: WorldModel,
@@ -290,8 +321,9 @@ def imagine_horizon(
     horizon: int,
     gamma: float,
     deterministic: bool,
+    step=imagine_step,
 ):
-    """H-step imagination compiled as one graph.
+    """H-step imagination. ``step`` may be a compiled single step.
 
     Returns the policy loss and the tensors the critic and the logs need.
     ``reward_scale`` is 1 when reward normalization is off.
@@ -321,18 +353,31 @@ def imagine_horizon(
     actions = []
     prev_actions = []
     for _ in range(horizon):
-        action = policy(obs_hist, goal, norms, deterministic=deterministic)
         prev_actions.append(a_prev)
+        obs_hist, goal, p, quat, v, w, q, qd, frame, action = step(
+            policy,
+            wm,
+            norms,
+            mdp,
+            obs_hist,
+            goal,
+            p,
+            quat,
+            v,
+            w,
+            q,
+            qd,
+            a_prev,
+            xi_n,
+            xi,
+            frame,
+            deterministic,
+        )
         actions.append(action)
-        p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
-        frame = frame + 1
-        goal = mdp.motion.goal(frame, GOAL_FRAMES)
-        obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
-        obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
+        a_prev = action
         states.append((p, quat, v, w, q, qd))
         frames.append(frame)
         goals.append(goal)
-        a_prev = action
     flat = _flatten_time(states[1:])
     reward, term_parts = mdp.reward(
         *flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions), terms=True
@@ -378,7 +423,7 @@ class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from .kinematics import TorchKinematics, compile_g1
+        from .kinematics import compile_g1, make_kinematics
         from .motion import MotionLib
         from .sim import TrackingSim
 
@@ -394,7 +439,7 @@ class Trainer:
 
         self.motion = MotionLib.load(device=self.device)
         model, names = compile_g1()
-        self.kin = TorchKinematics(model, names)
+        self.kin = make_kinematics(model, names, cfg.fk, self.device)
         self.sim = TrackingSim(
             cfg.num_envs,
             self.motion,
@@ -408,13 +453,14 @@ class Trainer:
         self.r_max = self.sim.mdp.max_step_reward
         obs_dim = self.sim.mdp.obs_dim
         self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual).to(self.device)
-        # Compiling the whole window / horizon, not a single step. Eager when compile is off.
+        # The world-model window is one graph. The policy compiles a single imagination
+        # step (mode="default"); the horizon loop stays eager. Both are eager when compile is off.
         if cfg.compile:
             self._wm_window = torch.compile(world_model_window, dynamic=False)
-            self._imagine_horizon = torch.compile(imagine_horizon, dynamic=False)
+            self._imagine_step = torch.compile(imagine_step, mode="default", dynamic=False)
         else:
             self._wm_window = world_model_window
-            self._imagine_horizon = imagine_horizon
+            self._imagine_step = imagine_step
         self.policy = Policy(obs_dim, GOAL_DIM, HIST, stochastic=cfg.stochastic_actor).to(self.device)
         self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
@@ -794,7 +840,7 @@ class Trainer:
             frames,
             goals,
             xi,
-        ) = self._imagine_horizon(
+        ) = imagine_horizon(
             self.policy,
             self.wm,
             self.critic,
@@ -812,6 +858,7 @@ class Trainer:
             cfg.horizon,
             cfg.gamma,
             not cfg.stochastic_actor,
+            self._imagine_step,
         )
         term_losses = {name: term_loss[i] for i, name in enumerate(REWARD_TERM_NAMES)}
         term_losses["bootstrap"] = -bootstrap.mean()

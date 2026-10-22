@@ -53,9 +53,11 @@ grad_clip_value: null  # policy only; null disables
 # Running return-based reward scale for policy/critic (FlashSAC-style). Off by default.
 # G_max is MAX_STEP_REWARD/(1-γ) from the MDP, not a hyperparameter.
 normalize_reward: false
-# torch.compile the world-model window and the imagination horizon.
-# The first call of each graph takes a few minutes. false runs them eager.
+# torch.compile the world-model window and one imagination step (mode=default).
+# false runs both eager.
 compile: true
+# Reward FK. warp (default) or torch.
+fk: warp
 # Weight of the LSGAN generator loss added to the world-model MSE. 0 disables it.
 adv_coef: 0.0
 device: cuda

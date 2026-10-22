@@ -1,4 +1,4 @@
-"""Benchmark torch FK throughput and check that torch.compile keeps gradients.
+"""Benchmark torch FK throughput and check that torch.compile / Warp keep gradients.
 
 Training hot path: reward FK on H×B flattened states (32×4096), and optional
 per-step obs FK at B=4096 when obs.anchor_ori=true.
@@ -117,7 +117,7 @@ def check_grads(eager_fn, compiled_fn, batch: int, n_j: int, device: torch.devic
     loss_c.backward()
     g_c = _grads(state_c)
 
-    loss_rel = abs(float(loss_e - loss_c)) / max(abs(float(loss_e)), 1e-8)
+    loss_rel = abs(float(loss_e.detach() - loss_c.detach())) / max(abs(float(loss_e.detach())), 1e-8)
     names = ("p", "quat", "v", "w", "q", "qd")
     print(f"\ngrad check batch={batch}  loss_rel={loss_rel:.3e}", flush=True)
     ok = loss_rel < 1e-4
@@ -144,6 +144,7 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--no-warp", action="store_true")
     parser.add_argument(
         "--compile-mode",
         default="default",
@@ -176,6 +177,33 @@ def main() -> None:
 
     for batch in args.batches:
         bench("eager", eager, batch, n_j, device, args.warmup, args.iters)
+
+    if not args.no_warp and device.type == "cuda":
+        from supermimic.warp_fk import WarpKinematics
+
+        print("\nloading warp FK…", flush=True)
+        warp_kin = WarpKinematics(kin)
+
+        def warp_fwd(p, quat, v, w, q, qd):
+            return warp_kin.forward(p, quat, v, w, q, qd)
+
+        t0 = time.perf_counter()
+        _ = warp_fwd(*_make_state(64, n_j, device, requires_grad=False))
+        _sync(device)
+        print(f"  first fwd compile: {time.perf_counter() - t0:.1f}s", flush=True)
+        t0 = time.perf_counter()
+        state = _make_state(64, n_j, device, requires_grad=True)
+        _loss(warp_fwd(*state)).backward()
+        _sync(device)
+        print(f"  first bwd compile: {time.perf_counter() - t0:.1f}s", flush=True)
+        check_grads(eager, warp_fwd, 256, n_j, device)
+        print(
+            f"\n{'mode':14s} {'batch':>8s} {'fwd_ms':>10s} {'fwd+bwd_ms':>12s} "
+            f"{'fwd_Mps':>10s} {'f+b_Mps':>10s}",
+            flush=True,
+        )
+        for batch in args.batches:
+            bench("warp", warp_fwd, batch, n_j, device, args.warmup, args.iters)
 
     if args.no_compile or device.type != "cuda":
         return

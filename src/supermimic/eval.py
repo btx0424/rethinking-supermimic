@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .kinematics import TorchKinematics, compile_g1
+from .kinematics import compile_g1, make_kinematics
 from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
 from .network import InputNorms, Policy
@@ -18,10 +18,10 @@ def evaluate(ckpt: Path, device: str) -> None:
     torch.manual_seed(0)
     motion = MotionLib.load(device=device)
     model, names = compile_g1()
-    kin = TorchKinematics(model, names)
-    n = motion.num_clips
     saved = torch.load(ckpt, map_location=device, weights_only=False)
     saved_cfg = saved.get("cfg", {})
+    kin = make_kinematics(model, names, str(saved_cfg.get("fk", "warp")), device)
+    n = motion.num_clips
     kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
     sim = TrackingSim(
         n,

@@ -295,6 +295,23 @@ class TorchKinematics:
         )
 
 
+def make_kinematics(
+    model: mujoco.MjModel,
+    joint_names: tuple[str, ...],
+    backend: str = "warp",
+    device: str | torch.device = "cuda",
+):
+    """``warp`` (default) or ``torch``. Both expose ``TorchKinematics``' public attributes."""
+    kin = TorchKinematics(model, joint_names)
+    if backend == "torch":
+        return kin
+    if backend == "warp":
+        from .warp_fk import WarpKinematics
+
+        return WarpKinematics(kin, device)
+    raise ValueError(f"Unknown FK backend {backend!r}. Expected 'warp' or 'torch'.")
+
+
 def compile_g1() -> tuple[mujoco.MjModel, tuple[str, ...]]:
     """Compile the mjlab G1 and return its model plus hinge-joint names."""
     from mjlab.asset_zoo.robots import get_g1_robot_cfg
