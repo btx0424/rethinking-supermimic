@@ -19,7 +19,7 @@ obs:
   base_ang_vel: true
   projected_gravity: true
   last_action: true
-  anchor_ori: false
+  anchor_ori: true
 
 # Reward anchor and the body used by obs.anchor_ori. torso or pelvis.
 anchor: torso

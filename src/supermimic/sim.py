@@ -13,7 +13,7 @@ from mjlab.utils.string import resolve_expr
 
 from .kinematics import TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MAX_STEP_REWARD, MDP, PAPER_OBS_TERMS, flatten_state
+from .mdp import MAX_STEP_REWARD, MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state
 from .motion import BIN_FRAMES, MotionLib
 
 DECIMATION = 4
@@ -106,6 +106,7 @@ class TrackingSim:
         self.start_bin = torch.zeros(n, dtype=torch.long, device=device)
         self.ep_disc = torch.zeros(n, device=device)
         self.ep_ret = torch.zeros(n, device=device)
+        self.ep_term = {name: torch.zeros(n, device=device) for name in REWARD_TERM_NAMES}
         self._ep_counter = 0
         ground = 1.0 if eval_mode else 0.3
         self.sim.model.geom_friction[:, self._terrain_ids, 0] = ground
@@ -142,6 +143,8 @@ class TrackingSim:
         self.start_bin[env_ids] = bins
         self.ep_disc[env_ids] = 0
         self.ep_ret[env_ids] = 0
+        for name in self.ep_term:
+            self.ep_term[name][env_ids] = 0
         self._ep_counter += 1
         self.ep_id[env_ids] = self._ep_counter
         self.scene.write_data_to_sim()
@@ -164,7 +167,9 @@ class TrackingSim:
         p1, quat1, v1, w1, q1, qd1 = self.state()
         last = self.motion.clip_end[self.motion.clip_id[f]] - 1
         f_next = torch.minimum(f + 1, last)
-        reward = self.mdp.reward(p1, quat1, v1, w1, q1, qd1, f_next, action, a_prev)
+        reward, terms = self.mdp.reward(
+            p1, quat1, v1, w1, q1, qd1, f_next, action, a_prev, terms=True
+        )
         hard = self.mdp.termination(p1, quat1, f_next)
         self.ep_step += 1
         self.lifetime += 1
@@ -172,6 +177,8 @@ class TrackingSim:
         clip_end = f_next >= last
         self.ep_disc = self.ep_disc + torch.pow(self.gamma, (self.ep_step - 1).float()) * reward
         self.ep_ret = self.ep_ret + reward
+        for name, value in terms.items():
+            self.ep_term[name] = self.ep_term[name] + value
         self.f = f_next
         self.a_prev = action.detach().clone()
         done = hard | timeout | clip_end
@@ -185,11 +192,13 @@ class TrackingSim:
             "ep": ep,
             "step": step_id,
             "r": reward,
+            "terms": terms,
             "d": hard,
             "timeout": timeout,
             "clip_end": clip_end,
             "done": done,
             "ep_ret": self.ep_ret.clone(),
+            "ep_term": {name: value.clone() for name, value in self.ep_term.items()},
             "ep_len": self.ep_step.clone(),
         }
         if auto_reset and bool(done.any()):

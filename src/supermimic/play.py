@@ -11,16 +11,17 @@ import numpy as np
 import torch
 import viser
 from mjviser import ViserMujocoScene
+from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 
 from .kinematics import TorchKinematics, compile_g1
 from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
 from .network import InputNorms, Policy
 
-# Env 0 = policy (opaque). Env 1 = reference ghost.
-_POLICY_RGB = np.array([210, 210, 210], dtype=np.uint8)
-_REF_RGB = np.array([70, 150, 255], dtype=np.uint8)
-_REF_ALPHA = 0.4
+# Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
+_REF_RGB = (40, 120, 255)
+_REF_ALPHA = 0.45
+_GROUND_Z = -0.02  # feet sit near z=0; keep the plane just under the soles
 
 
 def _qpos_addresses(model: mujoco.MjModel, joint_names: tuple[str, ...]) -> list[int]:
@@ -55,26 +56,59 @@ def _fk(
 ) -> tuple[np.ndarray, np.ndarray]:
     _write_pose(data, root_p, root_quat, q, qpos_adr)
     mujoco.mj_forward(model, data)
-    return data.xpos.copy(), data.xmat.reshape(-1, 3, 3).copy()
+    return data.xpos.copy(), data.xquat.copy()
 
 
 def _clip_length(motion: MotionLib, clip: int) -> int:
     return int(motion.clip_end[clip] - motion.clip_start[clip])
 
 
-def _style_overlay(scene: ViserMujocoScene) -> None:
-    """Paint env0 solid (policy) and env1 translucent blue (reference)."""
-    if scene.num_envs < 2:
-        return
-    for mg in scene._mesh_groups:
-        n = int(mg.body_ids.shape[0])
-        colors = np.zeros((n * scene.num_envs, 3), dtype=np.uint8)
-        opacities = np.ones(n * scene.num_envs, dtype=np.float32)
-        colors[:n] = _POLICY_RGB
-        colors[n : 2 * n] = _REF_RGB
-        opacities[n : 2 * n] = _REF_ALPHA
-        mg.handle.batched_colors = colors
-        mg.handle.batched_opacities = opacities
+class GhostRobot:
+    """Blue translucent robot meshes. Batched GLB from mjviser ignores per-env colors."""
+
+    def __init__(
+        self,
+        server: viser.ViserServer,
+        model: mujoco.MjModel,
+        rgb: tuple[int, int, int] = _REF_RGB,
+        opacity: float = _REF_ALPHA,
+        root: str = "/reference",
+    ):
+        self.handles: list[tuple[int, object]] = []
+        color = np.array(rgb, dtype=np.uint8)
+        alpha = np.float32(opacity)
+        for body_id in range(model.nbody):
+            if is_fixed_body(model, body_id):
+                continue
+            # Visual meshes only (group 2 on the mjlab G1); skip collision geoms.
+            geom_ids = [
+                i
+                for i in range(model.ngeom)
+                if int(model.geom_bodyid[i]) == body_id
+                and int(model.geom_group[i]) == 2
+                and float(model.geom_rgba[i, 3]) > 0.0
+            ]
+            if not geom_ids:
+                continue
+            mesh = merge_geoms(model, geom_ids)
+            handle = server.scene.add_batched_meshes_simple(
+                f"{root}/{get_body_name(model, body_id)}",
+                mesh.vertices.astype(np.float32),
+                mesh.faces.astype(np.int32),
+                batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+                batched_positions=np.zeros((1, 3), dtype=np.float32),
+                batched_colors=color[None],
+                batched_opacities=np.array([alpha], dtype=np.float32),
+                cast_shadow=False,
+                receive_shadow=False,
+                lod="off",
+            )
+            self.handles.append((body_id, handle))
+
+    def update(self, xpos: np.ndarray, xquat: np.ndarray) -> None:
+        for body_id, handle in self.handles:
+            handle.batched_positions = xpos[body_id : body_id + 1]
+            handle.batched_wxyzs = xquat[body_id : body_id + 1]
 
 
 def play(
@@ -89,7 +123,6 @@ def play(
     fps = float(motion.fps)
     clip_names = list(motion.clip_names)
     overlay = ckpt is not None
-    num_envs = 2 if overlay else 1
 
     policy = norms = sim = obs_hist = None
     if overlay:
@@ -123,8 +156,12 @@ def play(
         obs_hist = torch.zeros(1, HIST, sim.mdp.obs_dim, device=device)
 
     server = viser.ViserServer(port=port, label="SuperMimic play")
-    scene = ViserMujocoScene(server, model, num_envs=num_envs)
-    _style_overlay(scene)
+    # Solid robot: policy when overlaying, otherwise the reference.
+    scene = ViserMujocoScene(server, model, num_envs=1)
+    # Keep world frames so the solid robot, blue ghost, and ground share one origin.
+    # (mjviser's camera-tracking offset would yank only the solid robot off the plane.)
+    scene.camera_tracking_enabled = False
+    ghost = GhostRobot(server, model) if overlay else None
     start = motion.root_p[int(motion.clip_start[0])].numpy()
     server.scene.set_up_direction("+z")
     server.scene.add_grid(
@@ -135,7 +172,8 @@ def play(
         infinite_grid=True,
         fade_distance=40.0,
         shadow_opacity=0.15,
-        plane_opacity=0.35,
+        plane_opacity=0.25,
+        position=(0.0, 0.0, _GROUND_Z),
     )
     server.initial_camera.position = start + np.array([2.5, -2.5, 1.5])
     server.initial_camera.look_at = start
@@ -157,7 +195,7 @@ def play(
             initial_value=0,
         )
         legend = server.gui.add_markdown(
-            "solid = **policy**, blue ghost = **reference**"
+            "solid gray = **policy**, blue ghost = **reference**"
             if overlay
             else "**reference** only (pass `--ckpt` to overlay tracking)"
         )
@@ -170,7 +208,7 @@ def play(
             f"**{clip_names[clip]}**  \nclip {clip} · {length} frames · {length / fps:.2f} s"
         )
         legend.content = (
-            "solid = **policy**, blue ghost = **reference**"
+            "solid gray = **policy**, blue ghost = **reference**"
             if overlay
             else "**reference** only (pass `--ckpt` to overlay tracking)"
         )
@@ -183,17 +221,16 @@ def play(
             motion.q[frame].numpy(),
         )
 
-    def push_scene(policy_pose: tuple[np.ndarray, np.ndarray, np.ndarray] | None, clip: int, local: int) -> None:
-        ref_p, ref_quat, ref_q = reference_pose(clip, local)
-        ref_xpos, ref_xmat = _fk(model, data, ref_p, ref_quat, ref_q, qpos_adr)
-        if overlay and policy_pose is not None:
-            pol_xpos, pol_xmat = _fk(model, data, *policy_pose, qpos_adr)
-            scene.update_from_arrays(
-                np.stack((pol_xpos, ref_xpos), axis=0),
-                np.stack((pol_xmat, ref_xmat), axis=0),
-            )
-        else:
-            scene.update_from_arrays(ref_xpos[None], ref_xmat[None])
+    def push_scene(
+        solid_pose: tuple[np.ndarray, np.ndarray, np.ndarray],
+        ghost_pose: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    ) -> None:
+        xpos, _xquat = _fk(model, data, *solid_pose, qpos_adr)
+        xmat = data.xmat.reshape(-1, 3, 3).copy()
+        scene.update_from_arrays(xpos[None], xmat[None])
+        if ghost is not None and ghost_pose is not None:
+            gx, gq = _fk(model, data, *ghost_pose, qpos_adr)
+            ghost.update(gx, gq)
 
     def policy_pose_np() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert sim is not None
@@ -237,7 +274,7 @@ def play(
         refresh_info(clip)
 
     refresh_info(0)
-    push_scene(None, 0, 0)
+    push_scene(reference_pose(0, 0), None)
     print(f"Viewer at http://localhost:{port}", flush=True)
     if ckpt is not None:
         print(f"Policy checkpoint: {ckpt}", flush=True)
@@ -255,11 +292,12 @@ def play(
             if state["need_reset"]:
                 state["need_reset"] = False
                 frame_slider.value = 0
+                ref = reference_pose(clip, 0)
                 if overlay:
                     reset_policy(clip)
-                    push_scene(policy_pose_np(), clip, 0)
+                    push_scene(policy_pose_np(), ref)
                 else:
-                    push_scene(None, clip, 0)
+                    push_scene(ref, None)
                 accumulator = 0.0
 
             if playing.value and length > 1:
@@ -275,7 +313,7 @@ def play(
                                 break
                         local = min(int(sim.ep_step[0].item()), length - 1)  # type: ignore[union-attr]
                         frame_slider.value = local
-                        push_scene(policy_pose_np(), clip, local)
+                        push_scene(policy_pose_np(), reference_pose(clip, local))
                         if not alive:
                             if loop.value:
                                 state["need_reset"] = True
@@ -291,15 +329,15 @@ def play(
                                 nxt = last_frame
                                 playing.value = False
                         frame_slider.value = nxt
-                        push_scene(None, clip, int(frame_slider.value))
+                        push_scene(reference_pose(clip, int(frame_slider.value)), None)
             else:
                 accumulator = 0.0
                 local = int(frame_slider.value)
+                ref = reference_pose(clip, local)
                 if overlay and sim is not None and not state["need_reset"]:
-                    # Scrubbing seeks the reference; policy stays at its current pose.
-                    push_scene(policy_pose_np(), clip, local)
+                    push_scene(policy_pose_np(), ref)
                 else:
-                    push_scene(None, clip, local)
+                    push_scene(ref, None)
 
             time.sleep(0.005)
     except KeyboardInterrupt:

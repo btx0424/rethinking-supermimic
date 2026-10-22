@@ -48,6 +48,18 @@ NOMINAL_ERROR = (
     (NUM_J, 5.0),
 )
 MAX_STEP_REWARD = (4.0 * 1.0 + 2.0 * 0.5) * CONTROL_DT
+# Positive tracking weights (before dt). Penalties are logged as raw means.
+REWARD_TERM_WEIGHT = {
+    "body_pos": 1.0,
+    "body_ori": 1.0,
+    "body_lin_vel": 1.0,
+    "body_ang_vel": 1.0,
+    "root_pos": 0.5,
+    "root_ori": 0.5,
+    "action_rate": 0.1,
+    "joint_limit": 2.0,
+}
+REWARD_TERM_NAMES = tuple(REWARD_TERM_WEIGHT)
 
 
 def resolve_obs_terms(terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -172,7 +184,8 @@ class MDP:
     def bodies(self, p, quat, v, w, q, qd):
         return self.kin.forward(p, quat, v, w, q, qd)
 
-    def reward(self, p, quat, v, w, q, qd, frame, action, a_prev) -> torch.Tensor:
+    def reward(self, p, quat, v, w, q, qd, frame, action, a_prev, terms: bool = False):
+        """Per-step reward (×dt). With ``terms=True``, also return a name→tensor dict that sums to it."""
         body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
         ref_p = self.motion.body_p[frame]
         ref_quat = self.motion.body_quat[frame]
@@ -183,17 +196,24 @@ class MDP:
         e_av = (self.motion.body_w[frame] - body_w).square().sum(-1).mean(-1)
         e_rp = (self.motion.root_p[frame] - p).square().sum(-1)
         e_ro = quat_error_angle(self.motion.root_quat[frame], quat).square()
-        tracking = (
-            torch.exp(-e_pos / 0.3**2)
-            + torch.exp(-e_ori / 0.4**2)
-            + torch.exp(-e_lv / 1.0**2)
-            + torch.exp(-e_av / 3.14**2)
-            + 0.5 * torch.exp(-e_rp / 0.3**2)
-            + 0.5 * torch.exp(-e_ro / 0.4**2)
-        )
         action_rate = (action - a_prev).square().sum(-1)
         joint_limit = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        return (tracking - 0.1 * action_rate - 2.0 * joint_limit) * CONTROL_DT
+        parts = {
+            "body_pos": torch.exp(-e_pos / 0.3**2) * CONTROL_DT,
+            "body_ori": torch.exp(-e_ori / 0.4**2) * CONTROL_DT,
+            "body_lin_vel": torch.exp(-e_lv / 1.0**2) * CONTROL_DT,
+            "body_ang_vel": torch.exp(-e_av / 3.14**2) * CONTROL_DT,
+            "root_pos": 0.5 * torch.exp(-e_rp / 0.3**2) * CONTROL_DT,
+            "root_ori": 0.5 * torch.exp(-e_ro / 0.4**2) * CONTROL_DT,
+            "action_rate": -0.1 * action_rate * CONTROL_DT,
+            "joint_limit": -2.0 * joint_limit * CONTROL_DT,
+        }
+        reward = parts["body_pos"]
+        for name in REWARD_TERM_NAMES[1:]:
+            reward = reward + parts[name]
+        if terms:
+            return reward, parts
+        return reward
 
     def termination(self, p, quat, frame) -> torch.Tensor:
         height, tilt = self._errors(p, quat, frame)

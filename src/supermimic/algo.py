@@ -14,12 +14,15 @@ import torch.nn as nn
 
 from .buffer import ReplayBuffer
 from .mdp import (
+    CONTROL_DT,
     GOAL_DIM,
     GOAL_FRAMES,
     HIST,
     INV_DIM,
     MAX_STEP_REWARD,
     NUM_J,
+    REWARD_TERM_NAMES,
+    REWARD_TERM_WEIGHT,
     XI_DIM,
     invariant_features,
     local_state_error,
@@ -112,6 +115,15 @@ def _unflatten_time(flat: tuple, steps: int) -> tuple:
 
 def _mean(xs: list[float]) -> float:
     return sum(xs) / max(len(xs), 1)
+
+
+def _term_score(name: str, value: torch.Tensor | float) -> float:
+    """Normalize a reward term to a score. Tracking ∈ [0, 1]; penalties are negative means / dt."""
+    scale = REWARD_TERM_WEIGHT[name] * CONTROL_DT
+    x = float(value)
+    if name in ("action_rate", "joint_limit"):
+        return x / CONTROL_DT
+    return x / scale
 
 
 def _grad_norm(params) -> float:
@@ -244,7 +256,14 @@ class Trainer:
         )
         self.obs_hist = torch.zeros(cfg.num_envs, HIST, obs_dim, device=self.device)
 
-        self.stats = {"r": [], "ep": [], "term": [], "done_n": []}
+        self.stats = {
+            "r": [],
+            "ep": [],
+            "term": [],
+            "done_n": [],
+            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+        }
         self.agg = {
             "wm": [],
             "err": [],
@@ -255,6 +274,7 @@ class Trainer:
             "gn_wm": [],
             "gn_pi": [],
             "gn_v": [],
+            "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
         }
         self.timing = {"collect": [], "wm": [], "imagine": [], "policy": [], "critic": []}
         self.step_acc = 0.0
@@ -274,9 +294,13 @@ class Trainer:
             mode=cfg.swanlab_mode,
         )
         self._log_f = (self.log_dir / "train_log.csv").open("w")
+        term_cols = ",".join(
+            f"sim_{n},ep_{n},imag_{n}" for n in REWARD_TERM_NAMES
+        )
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,imag_score,imag_survival,"
             "sim_score,ep_score,term_frac,it_per_s,lr,entropy,"
+            f"{term_cols},"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
@@ -315,7 +339,7 @@ class Trainer:
 
         with timed(self.device):
             start = self.sample_policy_starts()
-            pi_loss, critic_batch, imag_score, survival = self.imagine(start)
+            pi_loss, critic_batch, imag_score, survival, imag_terms = self.imagine(start)
         self.timing["imagine"].append(timed.last)
 
         with timed(self.device):
@@ -335,6 +359,8 @@ class Trainer:
         self.agg["gn_wm"].append(gn_wm)
         self.agg["gn_pi"].append(gn_pi)
         self.agg["gn_v"].append(gn_v)
+        for name, value in imag_terms.items():
+            self.agg["imag_terms"][name].append(value)
 
         if (iteration + 1) % cfg.log_every == 0:
             self._log(iteration + 1, lr)
@@ -371,12 +397,18 @@ class Trainer:
             if self.reward_norm is not None:
                 self.reward_norm.update(out["r"], out["done"])
             self.stats["r"].append(float(out["r"].mean() / MAX_STEP_REWARD))
+            for name, value in out["terms"].items():
+                self.stats["sim_terms"][name].append(_term_score(name, value.mean()))
             done = out["done"]
             if bool(done.any()):
                 length = out["ep_len"][done].float().clamp(min=1)
                 self.stats["ep"].append(
                     float((out["ep_ret"][done] / (MAX_STEP_REWARD * length)).mean())
                 )
+                for name, value in out["ep_term"].items():
+                    self.stats["ep_terms"][name].append(
+                        _term_score(name, (value[done] / length).mean())
+                    )
                 self.stats["term"].append(float(out["d"][done].float().sum()))
                 self.stats["done_n"].append(float(done.sum()))
 
@@ -493,11 +525,14 @@ class Trainer:
             goals.append(goal)
             a_prev = action
         flat = _flatten_time(states[1:])
-        reward = mdp.reward(*flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions))
+        reward, term_parts = mdp.reward(
+            *flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions), terms=True
+        )
         done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
         reward = reward.view(cfg.horizon, batch)
         done = done.view(cfg.horizon, batch)
         raw_score = reward.detach().mean() / MAX_STEP_REWARD
+        imag_terms = {name: _term_score(name, value.detach().mean()) for name, value in term_parts.items()}
         if self.reward_norm is not None:
             reward = self.reward_norm.normalize(reward)
         alive = torch.cumprod(1.0 - done, dim=0)
@@ -521,6 +556,7 @@ class Trainer:
             critic_batch,
             raw_score,
             alive[-1].detach().mean(),
+            imag_terms,
         )
 
     def update_policy(self, pi_loss: torch.Tensor) -> float:
@@ -580,6 +616,9 @@ class Trainer:
             if cfg.stochastic_actor and self.policy.log_std is not None
             else float("nan")
         )
+        sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in REWARD_TERM_NAMES}
+        ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in REWARD_TERM_NAMES}
+        imag_terms = {name: _mean(self.agg["imag_terms"][name]) for name in REWARD_TERM_NAMES}
         row = [
             iteration,
             (now - self.started) / 3600,
@@ -595,15 +634,21 @@ class Trainer:
             cfg.log_every / (now - self.logged),
             lr,
             entropy,
-            gn_wm,
-            gn_pi,
-            gn_v,
-            seconds["collect"],
-            seconds["wm"],
-            seconds["imagine"],
-            seconds["policy"],
-            seconds["critic"],
         ]
+        for name in REWARD_TERM_NAMES:
+            row.extend((sim_terms[name], ep_terms[name], imag_terms[name]))
+        row.extend(
+            (
+                gn_wm,
+                gn_pi,
+                gn_v,
+                seconds["collect"],
+                seconds["wm"],
+                seconds["imagine"],
+                seconds["policy"],
+                seconds["critic"],
+            )
+        )
         assert self._log_f is not None
         self._log_f.write(",".join(f"{x:.6g}" for x in row) + "\n")
         self._log_f.flush()
@@ -628,24 +673,52 @@ class Trainer:
             "time/policy_s": seconds["policy"],
             "time/critic_s": seconds["critic"],
         }
+        for name in REWARD_TERM_NAMES:
+            metrics[f"score/sim_{name}"] = sim_terms[name]
+            metrics[f"score/ep_{name}"] = ep_terms[name]
+            metrics[f"score/imag_{name}"] = imag_terms[name]
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
         if self.reward_norm is not None:
             metrics["train/reward_scale"] = float(self.reward_norm.scale())
         swanlab.log(metrics, step=iteration)
         ent_s = f" H {entropy:.3f} |" if math.isfinite(entropy) else ""
+        track = " ".join(
+            f"{n[0]}{sim_terms[n]:.2f}"
+            for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
+        )
         print(
             f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
-            f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} |{ent_s} {row[11]:.2f} it/s | "
+            f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | "
+            f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
+            f"{ent_s} {row[11]:.2f} it/s | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"collect {seconds['collect']:.3f}s wm {seconds['wm']:.3f}s "
             f"imagine {seconds['imagine']:.3f}s policy {seconds['policy']:.3f}s critic {seconds['critic']:.3f}s",
             flush=True,
         )
         self.logged = now
-        self.stats = {"r": [], "ep": [], "term": [], "done_n": []}
-        self.agg = {key: [] for key in self.agg}
+        self.stats = {
+            "r": [],
+            "ep": [],
+            "term": [],
+            "done_n": [],
+            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+        }
+        self.agg = {
+            "wm": [],
+            "err": [],
+            "pi": [],
+            "v": [],
+            "score": [],
+            "surv": [],
+            "gn_wm": [],
+            "gn_pi": [],
+            "gn_v": [],
+            "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
+        }
         self.timing = {key: [] for key in self.timing}
 
     def save_checkpoint(self, iteration: int) -> None:
