@@ -96,9 +96,21 @@ def lr_at(iteration: int, base: float, decay_iters: int) -> float:
     return base * (0.03 + 0.97 * cosine)
 
 
-def _set_grad(module: nn.Module, enabled: bool) -> None:
-    for param in module.parameters():
-        param.requires_grad_(enabled)
+@contextmanager
+def hold_out_net(network: nn.Module):
+    """Hold ``network`` params out of the graph (TorchRL-style).
+
+    Gradients still flow through the module w.r.t. its *inputs*, so the policy
+    can BPTT through WM dynamics / critic ∂V/∂s without updating θ_WM / θ_V.
+    """
+    mode = next((p.requires_grad for p in network.parameters()), True)
+    try:
+        if mode:
+            network.requires_grad_(False)
+        yield
+    finally:
+        if mode:
+            network.requires_grad_(True)
 
 
 def _stack(xs: list[torch.Tensor]) -> torch.Tensor:
@@ -113,17 +125,25 @@ def _unflatten_time(flat: tuple, steps: int) -> tuple:
     return tuple(t.view(steps, -1, t.shape[-1]).reshape(-1, t.shape[-1]) for t in flat)
 
 
-def _mean(xs: list[float]) -> float:
-    return sum(xs) / max(len(xs), 1)
+def _mean(xs: list) -> float:
+    """Host mean. CUDA tensors are reduced on-device and synced once here (log time)."""
+    if not xs:
+        return 0.0
+    if isinstance(xs[0], torch.Tensor):
+        return float(torch.stack([x.detach().reshape(()) for x in xs]).mean())
+    return sum(xs) / len(xs)
 
 
-def _term_score(name: str, value: torch.Tensor | float) -> float:
-    """Normalize a reward term to a score. Tracking ∈ [0, 1]; penalties are negative means / dt."""
+def _term_score(name: str, value: torch.Tensor | float) -> torch.Tensor | float:
+    """Normalize a reward term to a score. Tracking ∈ [0, 1]; penalties are negative means / dt.
+
+    Keeps ``torch.Tensor`` inputs on-device (no sync). Callers that need a Python
+    float should reduce via ``_mean`` at log time.
+    """
     scale = REWARD_TERM_WEIGHT[name] * CONTROL_DT
-    x = float(value)
     if name in ("action_rate", "joint_limit"):
-        return x / CONTROL_DT
-    return x / scale
+        return value / CONTROL_DT
+    return value / scale
 
 
 def _grad_norm(params) -> float:
@@ -131,6 +151,14 @@ def _grad_norm(params) -> float:
     if not grads:
         return 0.0
     return float(nn.utils.get_total_norm(grads))
+
+
+def _grads_norm(grads: list[torch.Tensor | None]) -> float:
+    """Total norm of an ``autograd.grad`` tuple (skips unused ``None`` slots)."""
+    used = [g.detach() for g in grads if g is not None]
+    if not used:
+        return 0.0
+    return float(nn.utils.get_total_norm(used))
 
 
 def _clip_grads(params, max_norm: float | None, max_value: float | None = None) -> float:
@@ -275,6 +303,8 @@ class Trainer:
             "gn_pi": [],
             "gn_v": [],
             "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
+            "reward_grad_boot": [],
         }
         self.timing = {"collect": [], "wm": [], "imagine": [], "policy": [], "critic": []}
         self.step_acc = 0.0
@@ -297,10 +327,12 @@ class Trainer:
         term_cols = ",".join(
             f"sim_{n},ep_{n},imag_{n}" for n in REWARD_TERM_NAMES
         )
+        grad_r_cols = ",".join(f"grad_r_{n}" for n in REWARD_TERM_NAMES)
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,imag_score,imag_survival,"
             "sim_score,ep_score,term_frac,it_per_s,lr,entropy,"
             f"{term_cols},"
+            f"{grad_r_cols},grad_r_boot,"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
@@ -337,25 +369,32 @@ class Trainer:
             wm_loss, err8, gn_wm = self.update_world_model()
         self.timing["wm"].append(timed.last)
 
-        with timed(self.device):
-            start = self.sample_policy_starts()
-            pi_loss, critic_batch, imag_score, survival, imag_terms = self.imagine(start)
-        self.timing["imagine"].append(timed.last)
+        # Freeze WM/V params through imagine + policy backward (not torch.no_grad:
+        # π must still differentiate through dynamics and ∂V/∂s).
+        diagnose_reward = (iteration + 1) % cfg.log_every == 0
+        with hold_out_net(self.wm), hold_out_net(self.critic):
+            with timed(self.device):
+                start = self.sample_policy_starts()
+                pi_loss, critic_batch, imag_score, survival, imag_terms, term_losses = self.imagine(
+                    start
+                )
+            self.timing["imagine"].append(timed.last)
 
-        with timed(self.device):
-            gn_pi = self.update_policy(pi_loss)
-        self.timing["policy"].append(timed.last)
+            with timed(self.device):
+                gn_pi = self.update_policy(pi_loss, term_losses, diagnose_reward=diagnose_reward)
+            self.timing["policy"].append(timed.last)
 
         with timed(self.device):
             v_loss, gn_v = self.update_critic(critic_batch)
         self.timing["critic"].append(timed.last)
 
-        self.agg["wm"].append(float(wm_loss.detach()))
-        self.agg["err"].append(float(err8.detach()))
-        self.agg["pi"].append(float(pi_loss.detach()))
-        self.agg["v"].append(float(v_loss))
-        self.agg["score"].append(float(imag_score))
-        self.agg["surv"].append(float(survival))
+        # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
+        self.agg["wm"].append(wm_loss.detach())
+        self.agg["err"].append(err8.detach())
+        self.agg["pi"].append(pi_loss.detach())
+        self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
+        self.agg["score"].append(imag_score.detach() if isinstance(imag_score, torch.Tensor) else imag_score)
+        self.agg["surv"].append(survival.detach() if isinstance(survival, torch.Tensor) else survival)
         self.agg["gn_wm"].append(gn_wm)
         self.agg["gn_pi"].append(gn_pi)
         self.agg["gn_v"].append(gn_v)
@@ -396,19 +435,21 @@ class Trainer:
             self.buffer.add(out)
             if self.reward_norm is not None:
                 self.reward_norm.update(out["r"], out["done"])
-            self.stats["r"].append(float(out["r"].mean() / MAX_STEP_REWARD))
+            self.stats["r"].append((out["r"].mean() / MAX_STEP_REWARD).detach())
             for name, value in out["terms"].items():
-                self.stats["sim_terms"][name].append(_term_score(name, value.mean()))
+                self.stats["sim_terms"][name].append(_term_score(name, value.mean().detach()))
             done = out["done"]
-            if bool(done.any()):
+            # One intentional sync for the Python branch.
+            if bool(done.any().item()):
                 length = out["ep_len"][done].float().clamp(min=1)
                 self.stats["ep"].append(
-                    float((out["ep_ret"][done] / (MAX_STEP_REWARD * length)).mean())
+                    (out["ep_ret"][done] / (MAX_STEP_REWARD * length)).mean().detach()
                 )
                 for name, value in out["ep_term"].items():
                     self.stats["ep_terms"][name].append(
-                        _term_score(name, (value[done] / length).mean())
+                        _term_score(name, (value[done] / length).mean().detach())
                     )
+                # Already synced above; host floats are fine for rare episode counts.
                 self.stats["term"].append(float(out["d"][done].float().sum()))
                 self.stats["done_n"].append(float(done.sum()))
 
@@ -504,8 +545,6 @@ class Trainer:
         xi_n = normalize_xi(xi)
         frame = start["f"]
         goal = mdp.motion.goal(frame, GOAL_FRAMES)
-        _set_grad(self.wm, False)
-        _set_grad(self.critic, False)
         states = [(p, quat, v, w, q, qd)]
         frames = [frame]
         goals = [goal]
@@ -533,8 +572,10 @@ class Trainer:
         done = done.view(cfg.horizon, batch)
         raw_score = reward.detach().mean() / MAX_STEP_REWARD
         imag_terms = {name: _term_score(name, value.detach().mean()) for name, value in term_parts.items()}
+        term_r = {name: value.view(cfg.horizon, batch) for name, value in term_parts.items()}
         if self.reward_norm is not None:
             reward = self.reward_norm.normalize(reward)
+            term_r = {name: self.reward_norm.normalize(value) for name, value in term_r.items()}
         alive = torch.cumprod(1.0 - done, dim=0)
         survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
         discount = cfg.gamma ** torch.arange(cfg.horizon, device=device, dtype=torch.float32)
@@ -542,6 +583,12 @@ class Trainer:
         bootstrap = cfg.gamma**cfg.horizon * alive[-1] * self.critic(
             self.norms.critic(invariant_features(*states[-1]), goals[-1], xi_n)
         )
+        # Per-term losses share discount/survival with the total; L = Σ_k L_k + L_boot.
+        term_losses = {
+            name: -(discount[:, None] * survival * value).sum(0).mean()
+            for name, value in term_r.items()
+        }
+        term_losses["bootstrap"] = -bootstrap.mean()
         policy_loss = -(returns + bootstrap).mean()
         critic_batch = {
             "states": tuple(t.detach() for t in _flatten_time(states)),
@@ -557,17 +604,33 @@ class Trainer:
             raw_score,
             alive[-1].detach().mean(),
             imag_terms,
+            term_losses,
         )
 
-    def update_policy(self, pi_loss: torch.Tensor) -> float:
+    def update_policy(
+        self,
+        pi_loss: torch.Tensor,
+        term_losses: dict[str, torch.Tensor] | None = None,
+        diagnose_reward: bool = False,
+    ) -> float:
+        """Policy step. On log iterations, also measure ||∇_θ L_k|| per reward term."""
         cfg = self.cfg
+        params = [p for p in self.policy.parameters() if p.requires_grad]
+        if diagnose_reward and term_losses is not None:
+            for name in REWARD_TERM_NAMES:
+                grads = torch.autograd.grad(
+                    term_losses[name], params, retain_graph=True, allow_unused=True
+                )
+                self.agg["reward_grads"][name].append(_grads_norm(list(grads)))
+            boot_grads = torch.autograd.grad(
+                term_losses["bootstrap"], params, retain_graph=True, allow_unused=True
+            )
+            self.agg["reward_grad_boot"].append(_grads_norm(list(boot_grads)))
         self.opt_pi.zero_grad(set_to_none=True)
         pi_loss.backward()
-        grad_norm = _clip_grads(self.policy.parameters(), cfg.grad_clip_norm, cfg.grad_clip_value)
+        grad_norm = _clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_value)
         if math.isfinite(grad_norm):
             self.opt_pi.step()
-        _set_grad(self.wm, True)
-        _set_grad(self.critic, True)
         return grad_norm
 
     def update_critic(self, batch: dict) -> tuple[torch.Tensor, float]:
@@ -619,6 +682,8 @@ class Trainer:
         sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in REWARD_TERM_NAMES}
         ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in REWARD_TERM_NAMES}
         imag_terms = {name: _mean(self.agg["imag_terms"][name]) for name in REWARD_TERM_NAMES}
+        reward_grads = {name: _mean(self.agg["reward_grads"][name]) for name in REWARD_TERM_NAMES}
+        reward_grad_boot = _mean(self.agg["reward_grad_boot"])
         row = [
             iteration,
             (now - self.started) / 3600,
@@ -637,6 +702,9 @@ class Trainer:
         ]
         for name in REWARD_TERM_NAMES:
             row.extend((sim_terms[name], ep_terms[name], imag_terms[name]))
+        for name in REWARD_TERM_NAMES:
+            row.append(reward_grads[name])
+        row.append(reward_grad_boot)
         row.extend(
             (
                 gn_wm,
@@ -677,6 +745,8 @@ class Trainer:
             metrics[f"score/sim_{name}"] = sim_terms[name]
             metrics[f"score/ep_{name}"] = ep_terms[name]
             metrics[f"score/imag_{name}"] = imag_terms[name]
+            metrics[f"grad/reward_{name}"] = reward_grads[name]
+        metrics["grad/reward_bootstrap"] = reward_grad_boot
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
         if self.reward_norm is not None:
@@ -687,6 +757,12 @@ class Trainer:
             f"{n[0]}{sim_terms[n]:.2f}"
             for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
         )
+        # Share of Σ_k ||∇L_k|| (bootstrap excluded) — flags saturated exp terms (~0).
+        grad_sum = sum(reward_grads.values()) + 1e-12
+        grad_share = " ".join(
+            f"{n[:3]}{reward_grads[n] / grad_sum:.2f}"
+            for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
+        )
         print(
             f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
@@ -694,6 +770,7 @@ class Trainer:
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
             f"{ent_s} {row[11]:.2f} it/s | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
+            f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
             f"collect {seconds['collect']:.3f}s wm {seconds['wm']:.3f}s "
             f"imagine {seconds['imagine']:.3f}s policy {seconds['policy']:.3f}s critic {seconds['critic']:.3f}s",
             flush=True,
@@ -718,6 +795,8 @@ class Trainer:
             "gn_pi": [],
             "gn_v": [],
             "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
+            "reward_grad_boot": [],
         }
         self.timing = {key: [] for key in self.timing}
 

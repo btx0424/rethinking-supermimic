@@ -172,7 +172,11 @@ class MDP:
         if "anchor_ori" in self.obs_terms:
             if frame is None:
                 raise ValueError("The anchor_ori observation needs the reference frame.")
-            robot_quat = self.bodies(p, quat, v, w, q, qd)[1][..., self.anchor, :]
+            # Pelvis is the free-joint state — no FK. Torso (default) needs one.
+            if self.anchor == self.kin.pelvis_index:
+                robot_quat = quat
+            else:
+                robot_quat = self.bodies(p, quat, v, w, q, qd)[1][..., self.anchor, :]
             ref_quat = self.motion.body_quat[frame][..., self.anchor, :]
             relative = quat_mul(quat_inv(robot_quat), ref_quat)
             parts["anchor_ori"] = mat_to_6d(quat_to_mat(relative))
