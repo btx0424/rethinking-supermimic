@@ -75,6 +75,7 @@ def _setup(batch: int, device: torch.device):
         GOAL_DIM,
         HIST,
         INV_DIM,
+        PRIV_DIM,
         STATE_DIM,
         XI_DIM,
         MDP,
@@ -108,7 +109,7 @@ def _setup(batch: int, device: torch.device):
     )
     policy = Policy(mdp.obs_dim, GOAL_DIM, HIST).to(device)
     wm = WorldModel().to(device)
-    critic = Critic(INV_DIM + GOAL_DIM + XI_DIM).to(device)
+    critic = Critic(INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM).to(device)
     norms = InputNorms(mdp.obs_dim).to(device)
     with torch.no_grad():
         wm.net.head.weight.normal_(0, 0.01)
@@ -221,7 +222,12 @@ def _loss_from_step(step, bundle, horizon: int):
     discount = 0.99 ** torch.arange(horizon, device=device)
     returns = (discount[:, None] * survival * reward).sum(0)
     bootstrap = (0.99**horizon) * alive[-1] * critic(
-        norms.critic(invariant_features(*states[-1]), goals[-1], xi_n)
+        norms.critic(
+            invariant_features(*states[-1]),
+            goals[-1],
+            xi_n,
+            mdp.privileged(*states[-1], frames[-1]),
+        )
     )
     return -(returns + bootstrap).mean()
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .kinematics import TorchKinematics
+from .kinematics import TRACKED_BODIES, TorchKinematics
 from .math_utils import (
     mat_to_6d,
     quat_apply,
@@ -22,6 +22,9 @@ NUM_J = 29
 XI_DIM = 1 + NUM_J + 3
 INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
 STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J
+# Critic-only tracking errors: joint position, heading-frame anchored body position,
+# heading-frame root position, 6D root orientation.
+PRIV_DIM = NUM_J + len(TRACKED_BODIES) * 3 + 3 + 6
 HIST = 10
 GOAL_FRAMES = 10
 GOAL_DIM = GOAL_PER_FRAME * GOAL_FRAMES
@@ -355,8 +358,41 @@ class MDP:
         tilt = (g_ref[..., 2] - g_robot[..., 2]).abs()
         return height, tilt
 
-    def critic_input(self, p, quat, v, w, q, qd, goal, xi) -> torch.Tensor:
-        return torch.cat((invariant_features(p, quat, v, w, q, qd), goal, normalize_xi(xi)), dim=-1)
+    def privileged(self, p, quat, v, w, q, qd, frame) -> torch.Tensor:
+        """Tracking errors the policy does not observe.
+
+        Joint position error, anchored body-position error and root-position error
+        in the robot heading frame, and the 6D reference-root orientation in the
+        robot root frame. The anchor matches the reward.
+        """
+        body_p, body_quat, _, _ = self.bodies(p, quat, v, w, q, qd)
+        anchored_p, _ = _anchor_relative(
+            body_p, body_quat, self.motion.body_p[frame], self.motion.body_quat[frame], self.anchor
+        )
+        yaw = yaw_quat(quat)
+        body_error = quat_apply_inverse(yaw.unsqueeze(-2), anchored_p - body_p).flatten(-2)
+        root_error = quat_apply_inverse(yaw, self.motion.root_p[frame] - p)
+        relative = quat_mul(quat_inv(quat), self.motion.root_quat[frame])
+        return torch.cat(
+            (
+                self.motion.q[frame] - q,
+                body_error,
+                root_error,
+                mat_to_6d(quat_to_mat(relative)),
+            ),
+            dim=-1,
+        )
+
+    def critic_input(self, p, quat, v, w, q, qd, goal, xi, frame) -> torch.Tensor:
+        return torch.cat(
+            (
+                invariant_features(p, quat, v, w, q, qd),
+                goal,
+                normalize_xi(xi),
+                self.privileged(p, quat, v, w, q, qd, frame),
+            ),
+            dim=-1,
+        )
 
 
 def _anchor_relative(robot_p, robot_quat, ref_p, ref_quat, anchor: int):

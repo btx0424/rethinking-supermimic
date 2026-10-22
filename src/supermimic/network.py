@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from .math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
-from .mdp import GOAL_DIM, INV_DIM, NUM_J, XI_DIM, invariant_features
+from .mdp import GOAL_DIM, INV_DIM, NUM_J, PRIV_DIM, XI_DIM, invariant_features
 
 # Set by the trainer. None keeps fp32. bf16 covers the MLP GEMMs only; callers
 # get fp32 back so quaternion integration stays in fp32.
@@ -94,12 +94,22 @@ class InputNorms(nn.Module):
         self.goal = RunningNorm(GOAL_DIM)
         self.action = RunningNorm(NUM_J)
         self.xi = RunningNorm(XI_DIM)
+        self.priv = RunningNorm(PRIV_DIM)
 
     def wm(self, inv: torch.Tensor, action: torch.Tensor, xi_n: torch.Tensor) -> torch.Tensor:
         return torch.cat((self.state(inv), self.action(action), self.xi(xi_n)), dim=-1)
 
-    def critic(self, inv: torch.Tensor, goal: torch.Tensor, xi_n: torch.Tensor) -> torch.Tensor:
-        return torch.cat((self.state(inv), self.goal(goal), self.xi(xi_n)), dim=-1)
+    def critic(
+        self,
+        inv: torch.Tensor,
+        goal: torch.Tensor,
+        xi_n: torch.Tensor,
+        priv: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.cat(
+            (self.state(inv), self.goal(goal), self.xi(xi_n), self.priv(priv)),
+            dim=-1,
+        )
 
     def update(self, inv: torch.Tensor, obs: torch.Tensor, goal: torch.Tensor, action: torch.Tensor, xi_n: torch.Tensor) -> None:
         self.state.update(inv)
@@ -151,15 +161,34 @@ class WorldModel(nn.Module):
         return p1, quat1, v1, w1, q + dq, qd + dqd
 
 
+# Table A.4 encoder and decoder widths. Depth is the length of the list.
+PAPER_POLICY_HIDDEN = (2048, 1024, 512, 256)
+
+
+def policy_widths(saved: dict, key: str) -> list[int]:
+    """Read encoder or decoder widths from a checkpoint config, with the paper default."""
+    return [int(width) for width in saved.get(key, PAPER_POLICY_HIDDEN)]
+
+
 class Policy(nn.Module):
     """Deterministic encoder-decoder. ``stochastic`` adds a state-independent Gaussian."""
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, stochastic: bool = False):
+    def __init__(
+        self,
+        obs_dim: int,
+        goal_dim: int,
+        hist: int = 10,
+        z_dim: int = 32,
+        stochastic: bool = False,
+        encoder_hidden: list[int] | tuple[int, ...] = PAPER_POLICY_HIDDEN,
+        decoder_hidden: list[int] | tuple[int, ...] = PAPER_POLICY_HIDDEN,
+        norm: str = "none",
+    ):
         super().__init__()
         self.hist = hist
         self.stochastic = stochastic
-        self.encoder = MLP(goal_dim, [2048, 1024, 512, 256], z_dim)
-        self.decoder = MLP(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
+        self.encoder = MLP(goal_dim, list(encoder_hidden), z_dim, norm)
+        self.decoder = MLP(z_dim + obs_dim * hist, list(decoder_hidden), NUM_J, norm)
         nn.init.zeros_(self.decoder.head.bias)
         with torch.no_grad():
             self.decoder.head.weight.mul_(0.01)
@@ -180,9 +209,9 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int):
+    def __init__(self, in_dim: int, norm: str = "layer"):
         super().__init__()
-        self.net = MLP(in_dim, [256, 128], 1)
+        self.net = MLP(in_dim, [512, 256, 256], 1, norm=norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)

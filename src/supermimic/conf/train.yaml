@@ -1,4 +1,5 @@
 defaults:
+  - actor: deep
   - _self_
 
 hydra:
@@ -48,7 +49,7 @@ wm_norm: none
 wm_residual: false
 stochastic_actor: false
 # Grad clipping. null / <=0 disables. Norms always logged (grad/wm, grad/pi, grad/v).
-grad_clip_norm: null
+grad_clip_norm: 1.0
 grad_clip_value: null  # policy only; null disables
 # Running return-based reward scale for policy/critic (FlashSAC-style). Off by default.
 # G_max is MAX_STEP_REWARD/(1-γ) from the MDP, not a hyperparameter.

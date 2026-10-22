@@ -19,6 +19,7 @@ from .mdp import (
     GOAL_FRAMES,
     HIST,
     INV_DIM,
+    PRIV_DIM,
     NUM_J,
     REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
@@ -55,6 +56,12 @@ class TrainConfig:
     wm_norm: str = "none"
     wm_residual: bool = False
     stochastic_actor: bool = False
+    # Encoder and decoder widths. Depth is the list length. Paper Table A.4 is four layers.
+    policy_z_dim: int = 32
+    policy_encoder: tuple[int, ...] = (2048, 1024, 512, 256)
+    policy_decoder: tuple[int, ...] = (2048, 1024, 512, 256)
+    # Encoder and decoder MLP norm: none, layer, or rms.
+    policy_norm: str = "none"
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -400,7 +407,12 @@ def imagine_horizon(
     step_return = weighted * reward
     returns = step_return.sum(0)
     bootstrap = gamma**horizon * alive[-1] * critic(
-        norms.critic(invariant_features(*states[-1]), goals[-1], xi_n)
+        norms.critic(
+            invariant_features(*states[-1]),
+            goals[-1],
+            xi_n,
+            mdp.privileged(*states[-1], frames[-1]),
+        )
     )
     term_loss = -(weighted * term_r).sum(dim=1).mean(dim=-1)
     policy_loss = -(returns + bootstrap).mean()
@@ -473,8 +485,17 @@ class Trainer:
         else:
             self._wm_window = world_model_window
             self._imagine_step = imagine_step
-        self.policy = Policy(obs_dim, GOAL_DIM, HIST, stochastic=cfg.stochastic_actor).to(self.device)
-        self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM).to(self.device)
+        self.policy = Policy(
+            obs_dim,
+            GOAL_DIM,
+            HIST,
+            z_dim=cfg.policy_z_dim,
+            stochastic=cfg.stochastic_actor,
+            encoder_hidden=cfg.policy_encoder,
+            decoder_hidden=cfg.policy_decoder,
+            norm=cfg.policy_norm,
+        ).to(self.device)
+        self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
         self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
         self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
@@ -991,8 +1012,10 @@ class Trainer:
         cfg = self.cfg
         horizon, n = batch["reward"].shape
         flat = _unflatten_time(batch["states"], horizon + 1)
+        priv = self.sim.mdp.privileged(*flat, batch["frames"])
+        self.norms.priv.update(priv.detach())
         features = self.norms.critic(
-            invariant_features(*flat), batch["goals"], normalize_xi(batch["xi"])
+            invariant_features(*flat), batch["goals"], normalize_xi(batch["xi"]), priv
         )
         with torch.no_grad():
             values = self.critic(features).view(horizon + 1, n)
@@ -1196,7 +1219,12 @@ class Trainer:
             if key not in ckpt:
                 absent.append(key)
                 continue
-            missing, unexpected = module.load_state_dict(ckpt[key], strict=False)
+            try:
+                missing, unexpected = module.load_state_dict(ckpt[key], strict=False)
+            except (ValueError, RuntimeError) as exc:
+                absent.append(key)
+                print(f"resume skip {key}: {exc}", flush=True)
+                continue
             loaded.append(key)
             if missing or unexpected:
                 print(f"resume {key}: missing={list(missing)} unexpected={list(unexpected)}", flush=True)

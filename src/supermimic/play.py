@@ -16,7 +16,7 @@ from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 from .kinematics import compile_g1, make_kinematics
 from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
-from .network import InputNorms, Policy
+from .network import InputNorms, Policy, policy_widths
 
 # Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
 _REF_RGB = (40, 120, 255)
@@ -148,7 +148,11 @@ def play(
             sim.mdp.obs_dim,
             GOAL_DIM,
             HIST,
+            z_dim=int(saved_cfg.get("policy_z_dim", 32)),
             stochastic=bool(saved_cfg.get("stochastic_actor", False)),
+            encoder_hidden=policy_widths(saved_cfg, "policy_encoder"),
+            decoder_hidden=policy_widths(saved_cfg, "policy_decoder"),
+            norm=str(saved_cfg.get("policy_norm", "none")),
         ).to(device)
         policy.load_state_dict(saved["pi"])
         policy.eval()

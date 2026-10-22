@@ -1,0 +1,6 @@
+# Paper Table A.4. Select with `actor=deep` (the default).
+z_dim: 32
+encoder: [2048, 1024, 512, 256]
+decoder: [2048, 1024, 512, 256]
+# none | layer | rms. Applied to both the encoder and the decoder.
+norm: layer
