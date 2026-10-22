@@ -22,8 +22,17 @@ The 40 LAFAN1 clips are read from `aa-projects/aa-bfm/data/lafan1/raw/g1` (30 Hz
 
 ```bash
 PYTHONPATH=src python -m supermimic.train
-PYTHONPATH=src python -m supermimic.eval --ckpt logs/lafan1/ckpt_002000.pt
+PYTHONPATH=src python -m supermimic.eval --ckpt logs/lafan1/<timestamp>/ckpt_002000.pt
 ```
+
+Hydra writes each run under `logs/<swanlab.experiment>/<timestamp>/` (ckpts, `train_log.csv`, `config.yaml`).
+
+```bash
+PYTHONPATH=src python -m supermimic.play
+PYTHONPATH=src python -m supermimic.play --ckpt logs/lafan1/<timestamp>/last.pt
+```
+
+`play` opens a Viser page (default http://localhost:8080) with a ground plane to scrub LAFAN1 clips. With `--ckpt`, the solid robot is the policy and a translucent blue ghost is the reference.
 
 Hydra selects the policy observation and the anchor. The default observation is Table A.1 and the default anchor is the torso. For the public reproduction's choices:
 

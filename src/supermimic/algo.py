@@ -28,6 +28,7 @@ from .mdp import (
     unflatten_state,
 )
 from .network import Critic, InputNorms, MLP, Policy, WorldModel
+from .reward_norm import RewardNormalizer
 
 
 @dataclass
@@ -60,6 +61,9 @@ class TrainConfig:
     # None / <=0 disables. Grad norms are always logged.
     grad_clip_norm: float | None = None
     grad_clip_value: float | None = None  # policy only; None disables
+    # Scale policy/critic rewards by 1/max(√Var(G), G_r_max/G_max). Stats from sim collect.
+    # G_max = MAX_STEP_REWARD / (1-γ) is fixed by the MDP.
+    normalize_reward: bool = False
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
@@ -228,6 +232,16 @@ class Trainer:
         self.mse_loss = MSELoss(self.device).to(self.device)
         # Built for later experiments; WM training still uses ``mse_loss`` only.
         self.adv_loss = AdversarialLoss().to(self.device)
+        self.reward_norm = (
+            RewardNormalizer(
+                cfg.num_envs,
+                cfg.gamma,
+                g_max=MAX_STEP_REWARD / (1.0 - cfg.gamma),
+                device=self.device,
+            )
+            if cfg.normalize_reward
+            else None
+        )
         self.obs_hist = torch.zeros(cfg.num_envs, HIST, obs_dim, device=self.device)
 
         self.stats = {"r": [], "ep": [], "term": [], "done_n": []}
@@ -354,6 +368,8 @@ class Trainer:
             self.norms.action.update(executed)
             out = self.sim.step(executed)
             self.buffer.add(out)
+            if self.reward_norm is not None:
+                self.reward_norm.update(out["r"], out["done"])
             self.stats["r"].append(float(out["r"].mean() / MAX_STEP_REWARD))
             done = out["done"]
             if bool(done.any()):
@@ -481,6 +497,9 @@ class Trainer:
         done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
         reward = reward.view(cfg.horizon, batch)
         done = done.view(cfg.horizon, batch)
+        raw_score = reward.detach().mean() / MAX_STEP_REWARD
+        if self.reward_norm is not None:
+            reward = self.reward_norm.normalize(reward)
         alive = torch.cumprod(1.0 - done, dim=0)
         survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
         discount = cfg.gamma ** torch.arange(cfg.horizon, device=device, dtype=torch.float32)
@@ -500,7 +519,7 @@ class Trainer:
         return (
             policy_loss,
             critic_batch,
-            reward.detach().mean() / MAX_STEP_REWARD,
+            raw_score,
             alive[-1].detach().mean(),
         )
 
@@ -611,6 +630,8 @@ class Trainer:
         }
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
+        if self.reward_norm is not None:
+            metrics["train/reward_scale"] = float(self.reward_norm.scale())
         swanlab.log(metrics, step=iteration)
         ent_s = f" H {entropy:.3f} |" if math.isfinite(entropy) else ""
         print(
@@ -639,6 +660,8 @@ class Trainer:
             "iteration": iteration,
             "cfg": self.cfg.__dict__,
         }
+        if self.reward_norm is not None:
+            ckpt["reward_norm"] = self.reward_norm.state_dict()
         path = self.log_dir / f"ckpt_{iteration:06d}.pt"
         torch.save(ckpt, path)
         torch.save(ckpt, self.log_dir / "last.pt")

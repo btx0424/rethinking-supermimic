@@ -5,16 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import hydra
-from omegaconf import DictConfig
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
 
 from .algo import TrainConfig, run
 from .mdp import resolve_obs_terms
 
-REPO = Path(__file__).resolve().parents[2]
-
 
 @hydra.main(config_path="conf", config_name="train", version_base=None)
 def main(cfg: DictConfig) -> None:
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    OmegaConf.save(cfg, run_dir / "config.yaml")
+    print(f"log_dir={run_dir}", flush=True)
+
     terms = resolve_obs_terms([name for name, enabled in cfg.obs.items() if enabled])
     train_cfg = TrainConfig(
         num_envs=int(cfg.num_envs),
@@ -40,15 +43,16 @@ def main(cfg: DictConfig) -> None:
         obs_terms=terms,
         swanlab_project=str(cfg.swanlab.project),
         swanlab_mode=str(cfg.swanlab.mode),
-        swanlab_experiment=str(cfg.swanlab.experiment),
+        swanlab_experiment="/".join(run_dir.parts[-2:]),
         grad_clip_norm=None if cfg.grad_clip_norm is None else float(cfg.grad_clip_norm),
         grad_clip_value=None if cfg.grad_clip_value is None else float(cfg.grad_clip_value),
+        normalize_reward=bool(cfg.normalize_reward),
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),
         seed=int(cfg.seed),
     )
-    run(train_cfg, REPO / str(cfg.log_dir))
+    run(train_cfg, run_dir)
 
 
 if __name__ == "__main__":

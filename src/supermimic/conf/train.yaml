@@ -4,6 +4,11 @@ defaults:
 hydra:
   job:
     chdir: false
+  run:
+    dir: logs/${swanlab.experiment}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: logs/${swanlab.experiment}/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
 
 # Policy observation. Terms are concatenated in this order.
 # The first five are Table A.1. anchor_ori is the 6D reference orientation
@@ -41,11 +46,13 @@ stochastic_actor: false
 # Grad clipping. null / <=0 disables. Norms always logged (grad/wm, grad/pi, grad/v).
 grad_clip_norm: null
 grad_clip_value: null  # policy only; null disables
+# Running return-based reward scale for policy/critic (FlashSAC-style). Off by default.
+# G_max is MAX_STEP_REWARD/(1-γ) from the MDP, not a hyperparameter.
+normalize_reward: false
 device: cuda
 log_every: 50
 ckpt_every: 2000
 seed: 0
-log_dir: logs/lafan1
 
 swanlab:
   project: rethinking-supermimic
