@@ -56,6 +56,8 @@ normalize_reward: false
 # torch.compile the world-model window and one imagination step (mode=default).
 # false runs both eager.
 compile: true
+# MLP GEMMs in bf16; state integration stays fp32. none is fp32.
+amp: bf16
 # Reward FK. warp (default) or torch.
 fk: warp
 # Weight of the LSGAN generator loss added to the world-model MSE. 0 disables it.

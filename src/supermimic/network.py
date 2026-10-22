@@ -14,6 +14,10 @@ import torch.nn as nn
 from .math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
 from .mdp import GOAL_DIM, INV_DIM, NUM_J, XI_DIM, invariant_features
 
+# Set by the trainer. None keeps fp32. bf16 covers the MLP GEMMs only; callers
+# get fp32 back so quaternion integration stays in fp32.
+AMP_DTYPE: torch.dtype | None = None
+
 
 def _norm(kind: str, dim: int) -> nn.Module:
     if kind == "none":
@@ -117,7 +121,10 @@ class MLP(nn.Module):
         self.head = nn.Linear(din if hidden else inp, out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.blocks(x))
+        if AMP_DTYPE is None or x.device.type == "cpu":
+            return self.head(self.blocks(x))
+        with torch.autocast(x.device.type, dtype=AMP_DTYPE):
+            return self.head(self.blocks(x)).float()
 
 
 class WorldModel(nn.Module):

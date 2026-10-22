@@ -29,6 +29,7 @@ from .mdp import (
     normalize_xi,
     unflatten_state,
 )
+from . import network
 from .network import Critic, InputNorms, MLP, Policy, WorldModel
 from .reward_norm import RewardNormalizer
 
@@ -70,6 +71,8 @@ class TrainConfig:
     normalize_reward: bool = False
     # torch.compile the world-model window and one imagination step. False runs both eager.
     compile: bool = True
+    # MLP matmuls. ``bf16`` casts back to fp32 before integration. ``none`` is fp32.
+    amp: str = "bf16"
     # Reward FK. ``warp`` (default) or ``torch``.
     fk: str = "warp"
     # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
@@ -433,9 +436,18 @@ class Trainer:
         self.device = cfg.device
 
         torch.manual_seed(cfg.seed)
-        torch.backends.cuda.matmul.allow_tf32 = True
+        if cfg.amp not in ("none", "bf16"):
+            raise ValueError(f"amp must be 'none' or 'bf16', got {cfg.amp!r}")
+        network.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
+        # bf16 GEMMs do not use TF32. Compiled graphs donate buffers, which forbids
+        # the retain_graph backwards used by the reward-grad diagnostic.
+        torch.backends.cuda.matmul.allow_tf32 = cfg.amp == "none"
         torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("high" if cfg.amp == "none" else "highest")
+        if cfg.compile:
+            import torch._functorch.config as functorch_config
+
+            functorch_config.donated_buffer = False
 
         self.motion = MotionLib.load(device=self.device)
         model, names = compile_g1()

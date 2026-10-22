@@ -49,6 +49,7 @@ def main(cfg: DictConfig) -> None:
         grad_clip_value=None if cfg.grad_clip_value is None else float(cfg.grad_clip_value),
         normalize_reward=bool(cfg.normalize_reward),
         compile=bool(cfg.compile),
+        amp=str(cfg.amp),
         fk=str(cfg.fk),
         adv_coef=float(cfg.adv_coef),
         device=str(cfg.device),
