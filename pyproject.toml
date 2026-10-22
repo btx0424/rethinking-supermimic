@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rethinking-supermimic"
+version = "0.1.0"
+description = "SuperMimic motion tracking with a differentiable world model on mjlab."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mjlab>=1.6.0",
+    # Default PyPI torch 2.14 and warp-lang 1.18 wheels are CUDA 13 builds
+    # (driver >= 580). This machine's driver is 12.8, so use the CUDA 12.6
+    # torch index and Warp's +cu12 wheel. Those builds also run on CUDA 13 drivers.
+    "torch>=2.7.0",
+    "torchvision",
+    "warp-lang==1.18.0+cu12",
+]
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+warp-lang = { url = "https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0%2Bcu12-py3-none-manylinux_2_28_x86_64.whl" }
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
