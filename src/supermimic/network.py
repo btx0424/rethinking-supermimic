@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
-from .mdp import GOAL_DIM, INV_DIM, NUM_J, OBS_DIM, XI_DIM, invariant_features
+from .mdp import GOAL_DIM, INV_DIM, NUM_J, XI_DIM, invariant_features
 
 
 def _norm(kind: str, dim: int) -> nn.Module:
@@ -81,10 +81,10 @@ class InputNorms(nn.Module):
     is the world model's, and ξ is shared by the world model and the critic.
     """
 
-    def __init__(self):
+    def __init__(self, obs_dim: int):
         super().__init__()
         self.state = RunningNorm(INV_DIM)
-        self.obs = RunningNorm(OBS_DIM)
+        self.obs = RunningNorm(obs_dim)
         self.goal = RunningNorm(GOAL_DIM)
         self.action = RunningNorm(NUM_J)
         self.xi = RunningNorm(XI_DIM)

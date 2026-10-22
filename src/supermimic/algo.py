@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
+import swanlab
 import torch
 import torch.nn as nn
 
@@ -15,7 +18,6 @@ from .mdp import (
     HIST,
     INV_DIM,
     MAX_STEP_REWARD,
-    OBS_DIM,
     XI_DIM,
     local_state_error,
     nominal_error,
@@ -47,10 +49,32 @@ class TrainConfig:
     wm_norm: str = "none"
     wm_residual: bool = False
     stochastic_actor: bool = False
+    anchor: str = "torso"
+    obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
+    swanlab_project: str = "rethinking-supermimic"
+    swanlab_mode: str = "offline"
+    swanlab_experiment: str = "lafan1"
     device: str = "cuda"
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
+
+
+@contextmanager
+def timed(device: str):
+    """Wall time of a block, after the GPU has finished the work inside it."""
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+    timed.last = time.perf_counter() - start
+
+
+timed.last = 0.0
 
 
 def lr_at(iteration: int, base: float, decay_iters: int) -> float:
@@ -60,11 +84,11 @@ def lr_at(iteration: int, base: float, decay_iters: int) -> float:
     return base * (0.03 + 0.97 * cosine)
 
 
-def build_models(cfg: TrainConfig, device: str) -> tuple[WorldModel, Policy, Critic, InputNorms]:
+def build_models(cfg: TrainConfig, device: str, obs_dim: int) -> tuple[WorldModel, Policy, Critic, InputNorms]:
     wm = WorldModel(cfg.wm_norm, cfg.wm_residual).to(device)
-    policy = Policy(OBS_DIM, GOAL_DIM, HIST, stochastic=cfg.stochastic_actor).to(device)
+    policy = Policy(obs_dim, GOAL_DIM, HIST, stochastic=cfg.stochastic_actor).to(device)
     critic = Critic(INV_DIM + GOAL_DIM + XI_DIM).to(device)
-    norms = InputNorms().to(device)
+    norms = InputNorms(obs_dim).to(device)
     return wm, policy, critic, norms
 
 
@@ -102,6 +126,7 @@ def imagine(wm, policy, critic, mdp, start, cfg: TrainConfig, norms: InputNorms)
         qd.reshape(hist_n, -1),
         start["hist_a_prev"].reshape(hist_n, -1),
         start["hist_xi"].reshape(hist_n, -1),
+        start["hist_f"].reshape(hist_n),
     )
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
     p, quat, v, w, q, qd = unflatten_state(start["s"])
@@ -124,7 +149,7 @@ def imagine(wm, policy, critic, mdp, start, cfg: TrainConfig, norms: InputNorms)
         p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
         frame = frame + 1
         goal = mdp.motion.goal(frame, GOAL_FRAMES)
-        obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi))
+        obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
         obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
         states.append((p, quat, v, w, q, qd))
         frames.append(frame)
@@ -231,26 +256,42 @@ def run(cfg: TrainConfig, log_dir) -> None:
     motion = MotionLib.load(device=device)
     model, names = compile_g1()
     kin = TorchKinematics(model, names)
-    sim = TrackingSim(cfg.num_envs, motion, kin, device, gamma=cfg.gamma)
-    wm, policy, critic, norms = build_models(cfg, device)
+    sim = TrackingSim(
+        cfg.num_envs,
+        motion,
+        kin,
+        device,
+        gamma=cfg.gamma,
+        anchor=cfg.anchor,
+        obs_terms=cfg.obs_terms,
+    )
+    wm, policy, critic, norms = build_models(cfg, device, sim.mdp.obs_dim)
     opt_wm = torch.optim.Adam(wm.parameters(), lr=cfg.lr)
     opt_pi = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
     opt_v = torch.optim.Adam(critic.parameters(), lr=cfg.lr)
     buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, device)
     nominal = nominal_error(torch.device(device))
-    obs_hist = torch.zeros(cfg.num_envs, HIST, OBS_DIM, device=device)
+    obs_hist = torch.zeros(cfg.num_envs, HIST, sim.mdp.obs_dim, device=device)
+    logged_cfg = {key: list(value) if isinstance(value, tuple) else value for key, value in cfg.__dict__.items()}
+    swanlab.init(
+        project=cfg.swanlab_project,
+        name=cfg.swanlab_experiment or None,
+        config={**logged_cfg, "obs_dim": sim.mdp.obs_dim, "anchor_body": kin.anchor_name},
+        mode=cfg.swanlab_mode,
+    )
     log_path = log_dir / "train_log.csv"
     log_f = log_path.open("w")
     log_f.write(
         "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,imag_score,imag_survival,"
-        "sim_score,ep_score,term_frac,it_per_s,lr\n"
+        "sim_score,ep_score,term_frac,it_per_s,lr,"
+        "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
     )
 
     def collect(n_steps: int, stats: dict) -> None:
         nonlocal obs_hist
         for _ in range(n_steps):
             p, quat, v, w, q, qd = sim.state()
-            obs = sim.mdp.add_noise(sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi))
+            obs = sim.mdp.add_noise(sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi, sim.f))
             fresh = sim.ep_step == 0
             obs_hist = torch.where(
                 fresh[:, None, None],
@@ -282,6 +323,7 @@ def run(cfg: TrainConfig, log_dir) -> None:
     started = time.time()
     logged = time.time()
     agg = {"wm": [], "err": [], "pi": [], "v": [], "score": [], "surv": []}
+    timing = {"collect": [], "wm": [], "imagine": [], "policy": [], "critic": []}
     for iteration in range(cfg.iterations):
         lr = lr_at(iteration, cfg.lr, cfg.lr_decay_iters)
         for opt in (opt_wm, opt_pi, opt_v):
@@ -290,28 +332,40 @@ def run(cfg: TrainConfig, log_dir) -> None:
         step_acc += 1.0 / cfg.utd
         n_steps = int(step_acc)
         step_acc -= n_steps
-        collect(n_steps, stats)
+        with timed(device):
+            collect(n_steps, stats)
+        timing["collect"].append(timed.last)
         if buffer.filled < cfg.wm_window:
+            for key in ("wm", "imagine", "policy", "critic"):
+                timing[key].append(0.0)
             continue
-        wm_loss = err8 = None
-        for _ in range(cfg.wm_batches):
-            batch = buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
-            wm_loss, err8 = world_model_loss(wm, batch, nominal, norms)
-            opt_wm.zero_grad(set_to_none=True)
-            wm_loss.backward()
-            nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-            opt_wm.step()
-        start = sample_policy_starts(buffer, sim.mdp, cfg)
-        pi_loss, critic_batch, imag_score, survival = imagine(wm, policy, critic, sim.mdp, start, cfg, norms)
-        opt_pi.zero_grad(set_to_none=True)
-        pi_loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        nn.utils.clip_grad_value_(policy.parameters(), 0.1)
-        if torch.isfinite(grad_norm):
-            opt_pi.step()
-        _set_grad(wm, True)
-        _set_grad(critic, True)
-        v_loss = fit_critic(critic, opt_v, critic_batch, cfg, norms)
+        with timed(device):
+            wm_loss = err8 = None
+            for _ in range(cfg.wm_batches):
+                batch = buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
+                wm_loss, err8 = world_model_loss(wm, batch, nominal, norms)
+                opt_wm.zero_grad(set_to_none=True)
+                wm_loss.backward()
+                nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
+                opt_wm.step()
+        timing["wm"].append(timed.last)
+        with timed(device):
+            start = sample_policy_starts(buffer, sim.mdp, cfg)
+            pi_loss, critic_batch, imag_score, survival = imagine(wm, policy, critic, sim.mdp, start, cfg, norms)
+        timing["imagine"].append(timed.last)
+        with timed(device):
+            opt_pi.zero_grad(set_to_none=True)
+            pi_loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            nn.utils.clip_grad_value_(policy.parameters(), 0.1)
+            if torch.isfinite(grad_norm):
+                opt_pi.step()
+            _set_grad(wm, True)
+            _set_grad(critic, True)
+        timing["policy"].append(timed.last)
+        with timed(device):
+            v_loss = fit_critic(critic, opt_v, critic_batch, cfg, norms)
+        timing["critic"].append(timed.last)
         agg["wm"].append(float(wm_loss.detach()))
         agg["err"].append(float(err8.detach()))
         agg["pi"].append(float(pi_loss.detach()))
@@ -324,6 +378,7 @@ def run(cfg: TrainConfig, log_dir) -> None:
 
             now = time.time()
             term = sum(stats["term"]) / max(sum(stats["done_n"]), 1.0)
+            seconds = {key: mean(timing[key]) for key in timing}
             row = [
                 iteration + 1,
                 (now - started) / 3600,
@@ -338,18 +393,47 @@ def run(cfg: TrainConfig, log_dir) -> None:
                 term,
                 cfg.log_every / (now - logged),
                 lr,
+                seconds["collect"],
+                seconds["wm"],
+                seconds["imagine"],
+                seconds["policy"],
+                seconds["critic"],
             ]
             log_f.write(",".join(f"{x:.6g}" for x in row) + "\n")
             log_f.flush()
+            swanlab.log(
+                {
+                    "train/wm_loss": row[2],
+                    "train/wm_err8": row[3],
+                    "train/pi_loss": row[4],
+                    "train/v_loss": row[5],
+                    "train/imag_score": row[6],
+                    "train/imag_survival": row[7],
+                    "train/sim_score": row[8],
+                    "train/ep_score": row[9],
+                    "train/term_frac": term,
+                    "train/it_per_s": row[11],
+                    "train/lr": lr,
+                    "time/collect_s": seconds["collect"],
+                    "time/wm_s": seconds["wm"],
+                    "time/imagine_s": seconds["imagine"],
+                    "time/policy_s": seconds["policy"],
+                    "time/critic_s": seconds["critic"],
+                },
+                step=iteration + 1,
+            )
             print(
                 f"it {iteration + 1} | {row[1]:.3f} h | wm {row[2]:.4f} e8 {row[3]:.4f} | "
                 f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
-                f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | {row[11]:.2f} it/s",
+                f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | {row[11]:.2f} it/s | "
+                f"collect {seconds['collect']:.3f}s wm {seconds['wm']:.3f}s "
+                f"imagine {seconds['imagine']:.3f}s policy {seconds['policy']:.3f}s critic {seconds['critic']:.3f}s",
                 flush=True,
             )
             logged = now
             stats = {"r": [], "ep": [], "term": [], "done_n": []}
             agg = {key: [] for key in agg}
+            timing = {key: [] for key in timing}
         if (iteration + 1) % cfg.ckpt_every == 0 or iteration + 1 == cfg.iterations:
             ckpt = {
                 "wm": wm.state_dict(),
@@ -365,4 +449,5 @@ def run(cfg: TrainConfig, log_dir) -> None:
             path = log_dir / f"ckpt_{iteration + 1:06d}.pt"
             torch.save(ckpt, path)
             torch.save(ckpt, log_dir / "last.pt")
+    swanlab.finish()
     log_f.close()

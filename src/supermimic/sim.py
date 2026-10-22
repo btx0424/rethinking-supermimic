@@ -13,7 +13,7 @@ from mjlab.utils.string import resolve_expr
 
 from .kinematics import TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MAX_STEP_REWARD, MDP, flatten_state
+from .mdp import MAX_STEP_REWARD, MDP, PAPER_OBS_TERMS, flatten_state
 from .motion import BIN_FRAMES, MotionLib
 
 DECIMATION = 4
@@ -30,6 +30,8 @@ class TrackingSim:
         gamma: float = 0.99,
         eval_mode: bool = False,
         reset_noise: bool = True,
+        anchor: str = "torso",
+        obs_terms: tuple[str, ...] | None = None,
     ):
         self.device = device
         self.motion = motion
@@ -37,6 +39,7 @@ class TrackingSim:
         self.gamma = gamma
         self.eval_mode = eval_mode
         self.reset_noise = reset_noise and not eval_mode
+        kin.set_anchor(anchor)
         self.max_steps = 10**9 if eval_mode else MAX_EPISODE_STEPS
         scene_cfg = SceneCfg(
             num_envs=num_envs,
@@ -68,7 +71,14 @@ class TrackingSim:
         limits = self.robot.data.soft_joint_pos_limits
         if limits.ndim == 3:
             limits = limits[0]
-        self.mdp = MDP(kin, motion, self.default_q, limits[:, 0].clone(), limits[:, 1].clone())
+        self.mdp = MDP(
+            kin,
+            motion,
+            self.default_q,
+            limits[:, 0].clone(),
+            limits[:, 1].clone(),
+            obs_terms=PAPER_OBS_TERMS if obs_terms is None else obs_terms,
+        )
         scale = resolve_expr(G1_ACTION_SCALE, tuple(self.robot.joint_names))
         if any(value is None for value in scale):
             missing = [name for name, value in zip(self.robot.joint_names, scale) if value is None]

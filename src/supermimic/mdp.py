@@ -19,7 +19,6 @@ from .math_utils import (
 from .motion import CONTROL_DT, GOAL_PER_FRAME, MotionLib
 
 NUM_J = 29
-OBS_DIM = NUM_J + NUM_J + 3 + 3 + NUM_J
 XI_DIM = 1 + NUM_J + 3
 INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
 STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J
@@ -27,6 +26,16 @@ HIST = 10
 GOAL_FRAMES = 10
 GOAL_DIM = GOAL_PER_FRAME * GOAL_FRAMES
 GRAVITY = (0.0, 0.0, -1.0)
+# (name, dimension, uniform noise half-width). Order is the observation layout.
+OBS_SPEC = (
+    ("joint_pos", NUM_J, 0.01),
+    ("joint_vel", NUM_J, 0.5),
+    ("base_ang_vel", 3, 0.2),
+    ("projected_gravity", 3, 0.05),
+    ("last_action", NUM_J, 0.0),
+    ("anchor_ori", 6, 0.05),
+)
+PAPER_OBS_TERMS = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
 # Per-component scale of a state error. Eq. 1 is an unweighted square, which is
 # dominated by whichever unit is largest; these nominal errors balance the six
 # groups and are the normalizer for the logged 8-step prediction error.
@@ -40,15 +49,17 @@ NOMINAL_ERROR = (
 )
 MAX_STEP_REWARD = (4.0 * 1.0 + 2.0 * 0.5) * CONTROL_DT
 
-OBS_NOISE = torch.cat(
-    (
-        torch.full((NUM_J,), 0.01),
-        torch.full((NUM_J,), 0.5),
-        torch.full((3,), 0.2),
-        torch.full((3,), 0.05),
-        torch.zeros(NUM_J),
-    )
-)
+
+def resolve_obs_terms(terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    known = {name: (dim, noise) for name, dim, noise in OBS_SPEC}
+    chosen = tuple(terms)
+    unknown = [name for name in chosen if name not in known]
+    if unknown:
+        raise ValueError(f"Unknown observation terms {unknown}. Known: {tuple(known)}.")
+    if not chosen:
+        raise ValueError("At least one observation term is required.")
+    # Keep the spec order so the layout does not depend on config key order.
+    return tuple(name for name, _, _ in OBS_SPEC if name in chosen)
 
 
 def nominal_error(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -120,6 +131,7 @@ class MDP:
         default_q: torch.Tensor,
         soft_lo: torch.Tensor,
         soft_hi: torch.Tensor,
+        obs_terms: tuple[str, ...] = PAPER_OBS_TERMS,
     ):
         self.kin = kin
         self.motion = motion
@@ -127,16 +139,32 @@ class MDP:
         self.soft_lo = soft_lo
         self.soft_hi = soft_hi
         self.anchor = kin.anchor_index
-        self.noise = OBS_NOISE.to(default_q.device)
+        self.obs_terms = resolve_obs_terms(obs_terms)
+        spec = {name: (dim, noise) for name, dim, noise in OBS_SPEC}
+        self.obs_dim = sum(spec[name][0] for name in self.obs_terms)
+        self.noise = torch.cat(
+            [torch.full((spec[name][0],), spec[name][1], device=default_q.device) for name in self.obs_terms]
+        )
         self.gravity = default_q.new_tensor(GRAVITY)
 
-    def obs(self, p, quat, v, w, q, qd, a_prev, xi) -> torch.Tensor:
+    def obs(self, p, quat, v, w, q, qd, a_prev, xi, frame=None) -> torch.Tensor:
         """Noise-free proprioception. ``xi`` supplies the encoder offset."""
-        del v  # linear velocity is not in the observation.
         measured = q + xi[..., 1:30]
-        omega = quat_apply_inverse(quat, w)
-        gravity = quat_apply_inverse(quat, self.gravity.expand_as(w))
-        return torch.cat((measured - self.default_q, qd, omega, gravity, a_prev), dim=-1)
+        parts = {
+            "joint_pos": measured - self.default_q,
+            "joint_vel": qd,
+            "base_ang_vel": quat_apply_inverse(quat, w),
+            "projected_gravity": quat_apply_inverse(quat, self.gravity.expand_as(w)),
+            "last_action": a_prev,
+        }
+        if "anchor_ori" in self.obs_terms:
+            if frame is None:
+                raise ValueError("The anchor_ori observation needs the reference frame.")
+            robot_quat = self.bodies(p, quat, v, w, q, qd)[1][..., self.anchor, :]
+            ref_quat = self.motion.body_quat[frame][..., self.anchor, :]
+            relative = quat_mul(quat_inv(robot_quat), ref_quat)
+            parts["anchor_ori"] = mat_to_6d(quat_to_mat(relative))
+        return torch.cat([parts[name] for name in self.obs_terms], dim=-1)
 
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
         return obs + (2.0 * torch.rand_like(obs) - 1.0) * self.noise

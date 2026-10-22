@@ -53,18 +53,20 @@ class ReplayBuffer:
         while sum(t.shape[0] for t in got_t) < batch and guard < 40:
             guard += 1
             need = batch - sum(t.shape[0] for t in got_t)
-            time, env = self._time_env(need * 4)
+            # Draw only starts that leave k in-range steps. Gathering first and
+            # rejecting afterwards indexes past the buffer while it is still filling.
             if self.filled < self.capacity:
-                ok_range = time + k <= self.filled
+                time = torch.randint(0, self.filled - k + 1, (need * 4,), device=self.device)
                 idx = time[:, None] + torch.arange(k, device=self.device)
             else:
-                ok_range = torch.ones(time.shape[0], dtype=torch.bool, device=self.device)
+                time = torch.randint(0, self.capacity, (need * 4,), device=self.device)
                 idx = (time[:, None] + torch.arange(k, device=self.device)) % self.capacity
+            env = torch.randint(0, self.num_envs, (time.shape[0],), device=self.device)
             steps = self.step[idx, env[:, None]]
             eps = self.ep[idx, env[:, None]]
             continuous = (steps[:, 1:] == steps[:, :1] + torch.arange(1, k, device=self.device)).all(-1)
             same = (eps == eps[:, :1]).all(-1)
-            take = (ok_range & continuous & same).nonzero(as_tuple=False).flatten()[:need]
+            take = (continuous & same).nonzero(as_tuple=False).flatten()[:need]
             got_t.append(time[take])
             got_e.append(env[take])
         time = torch.cat(got_t)
@@ -110,4 +112,5 @@ class ReplayBuffer:
             "hist_s": self.s[raw, env[:, None]],
             "hist_a_prev": self.a_prev[raw, env[:, None]],
             "hist_xi": self.xi[raw, env[:, None]],
+            "hist_f": self.f[raw, env[:, None]],
         }

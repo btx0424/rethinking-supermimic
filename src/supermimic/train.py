@@ -2,39 +2,51 @@
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
+import hydra
+from omegaconf import DictConfig
+
 from .algo import TrainConfig, run
+from .mdp import resolve_obs_terms
 
-LOG_ROOT = Path(__file__).resolve().parents[2] / "logs"
+REPO = Path(__file__).resolve().parents[2]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--num-envs", type=int, default=4096)
-    parser.add_argument("--iterations", type=int, default=320_000)
-    parser.add_argument("--log-dir", type=Path, default=LOG_ROOT / "lafan1")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--wm-norm", choices=("none", "layer", "rms"), default="none")
-    parser.add_argument("--wm-residual", action="store_true")
-    parser.add_argument("--stochastic-actor", action="store_true")
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--horizon", type=int, default=32)
-    args = parser.parse_args()
-    cfg = TrainConfig(
-        num_envs=args.num_envs,
-        iterations=args.iterations,
-        device=args.device,
-        seed=args.seed,
-        wm_norm=args.wm_norm,
-        wm_residual=args.wm_residual,
-        stochastic_actor=args.stochastic_actor,
-        lr=args.lr,
-        horizon=args.horizon,
+@hydra.main(config_path="conf", config_name="train", version_base=None)
+def main(cfg: DictConfig) -> None:
+    terms = resolve_obs_terms([name for name, enabled in cfg.obs.items() if enabled])
+    train_cfg = TrainConfig(
+        num_envs=int(cfg.num_envs),
+        iterations=int(cfg.iterations),
+        buffer_steps=int(cfg.buffer_steps),
+        utd=float(cfg.utd),
+        horizon=int(cfg.horizon),
+        wm_window=int(cfg.wm_window),
+        wm_batches=int(cfg.wm_batches),
+        wm_batch=int(cfg.wm_batch),
+        pi_batch=int(cfg.pi_batch),
+        lr=float(cfg.lr),
+        gamma=float(cfg.gamma),
+        lam=float(cfg.lam),
+        action_noise=float(cfg.action_noise),
+        critic_epochs=int(cfg.critic_epochs),
+        critic_minibatches=int(cfg.critic_minibatches),
+        lr_decay_iters=int(cfg.lr_decay_iters),
+        wm_norm=str(cfg.wm_norm),
+        wm_residual=bool(cfg.wm_residual),
+        stochastic_actor=bool(cfg.stochastic_actor),
+        anchor=str(cfg.anchor),
+        obs_terms=terms,
+        swanlab_project=str(cfg.swanlab.project),
+        swanlab_mode=str(cfg.swanlab.mode),
+        swanlab_experiment=str(cfg.swanlab.experiment),
+        device=str(cfg.device),
+        log_every=int(cfg.log_every),
+        ckpt_every=int(cfg.ckpt_every),
+        seed=int(cfg.seed),
     )
-    run(cfg, args.log_dir)
+    run(train_cfg, REPO / str(cfg.log_dir))
 
 
 if __name__ == "__main__":

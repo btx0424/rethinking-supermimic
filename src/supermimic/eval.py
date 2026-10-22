@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from .kinematics import TorchKinematics, compile_g1
-from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, MAX_STEP_REWARD, OBS_DIM
+from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, MAX_STEP_REWARD, PAPER_OBS_TERMS
 from .motion import MotionLib
 from .network import InputNorms, Policy
 from .sim import TrackingSim
@@ -20,29 +20,37 @@ def evaluate(ckpt: Path, device: str) -> None:
     model, names = compile_g1()
     kin = TorchKinematics(model, names)
     n = motion.num_clips
-    sim = TrackingSim(n, motion, kin, device, eval_mode=True, reset_noise=False)
-    frames = motion.clip_start.clone()
-    sim.reset(torch.arange(n, device=device), frames)
     saved = torch.load(ckpt, map_location=device, weights_only=False)
-    cfg_dict = saved.get("cfg", {})
+    saved_cfg = saved.get("cfg", {})
+    kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
+    sim = TrackingSim(
+        n,
+        motion,
+        kin,
+        device,
+        eval_mode=True,
+        reset_noise=False,
+        anchor=str(saved_cfg.get("anchor", "torso")),
+        obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
+    )
     policy = Policy(
-        OBS_DIM,
+        sim.mdp.obs_dim,
         GOAL_DIM,
         HIST,
-        stochastic=bool(cfg_dict.get("stochastic_actor", False)),
+        stochastic=bool(saved_cfg.get("stochastic_actor", False)),
     ).to(device)
     policy.load_state_dict(saved["pi"])
-    norms = InputNorms().to(device)
+    norms = InputNorms(sim.mdp.obs_dim).to(device)
     norms.load_state_dict(saved["norms"])
     policy.eval()
-    obs_hist = torch.zeros(n, HIST, OBS_DIM, device=device)
+    obs_hist = torch.zeros(n, HIST, sim.mdp.obs_dim, device=device)
     alive = torch.ones(n, dtype=torch.bool, device=device)
     returns = torch.zeros(n, device=device)
     failed = torch.zeros(n, dtype=torch.bool, device=device)
     lengths = (motion.clip_end - motion.clip_start - 1).clamp(min=1)
     while bool(alive.any()):
         p, quat, v, w, q, qd = sim.state()
-        obs = sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi)
+        obs = sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi, sim.f)
         fresh = sim.ep_step == 0
         obs_hist = torch.where(
             fresh[:, None, None],

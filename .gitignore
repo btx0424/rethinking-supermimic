@@ -12,3 +12,7 @@ wheels/
 # Generated motion cache and training logs
 data/
 logs/
+swanlog/
+
+# hydra
+outputs/

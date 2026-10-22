@@ -10,23 +10,48 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "mjlab>=1.6.0",
-    # Default PyPI torch 2.14 and warp-lang 1.18 wheels are CUDA 13 builds
-    # (driver >= 580). This machine's driver is 12.8, so use the CUDA 12.6
-    # torch index and Warp's +cu12 wheel. Those builds also run on CUDA 13 drivers.
+    "torch>=2.7.0",
+    "torchvision",
+    "warp-lang>=1.14.0",
+]
+
+[project.optional-dependencies]
+# PyPI torch 2.14 and warp-lang 1.18 are CUDA 13 builds (driver >= 580).
+# uv sync --no-default-groups --extra cu13
+cu13 = [
+    "torch>=2.7.0",
+    "torchvision",
+    "warp-lang==1.18.0",
+]
+
+[dependency-groups]
+# CUDA 12.6 torch and Warp's +cu12 wheel. Default, for the driver 12.8 machine.
+# uv sync
+cu12 = [
     "torch>=2.7.0",
     "torchvision",
     "warp-lang==1.18.0+cu12",
 ]
 
 [tool.uv]
+default-groups = ["cu12"]
+conflicts = [
+    [{ group = "cu12" }, { extra = "cu13" }],
+]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-warp-lang = { url = "https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0%2Bcu12-py3-none-manylinux_2_28_x86_64.whl" }
+torch = [
+    { index = "pytorch-cu126", group = "cu12" },
+]
+torchvision = [
+    { index = "pytorch-cu126", group = "cu12" },
+]
+warp-lang = [
+    { url = "https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0%2Bcu12-py3-none-manylinux_2_28_x86_64.whl", group = "cu12" },
+]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

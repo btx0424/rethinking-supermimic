@@ -50,6 +50,7 @@ class TorchKinematics:
         self.tracked_ids = [name_to_body[name] for name in TRACKED_BODIES]
         self.anchor_index = TRACKED_BODIES.index("torso_link")
         self.pelvis_index = TRACKED_BODIES.index("pelvis")
+        self.anchor_name = "torso"
 
         qpos_adr = {}
         dof_adr = {}
@@ -100,6 +101,14 @@ class TorchKinematics:
             )
         self._bodies = bodies
         self._device_cache: dict[tuple[str, torch.dtype], dict[str, torch.Tensor]] = {}
+
+    def set_anchor(self, name: str) -> None:
+        """Reward and anchor-orientation body. ``torso`` or ``pelvis``."""
+        links = {"torso": "torso_link", "pelvis": "pelvis"}
+        if name not in links:
+            raise ValueError(f"Anchor must be one of {tuple(links)}, got {name!r}.")
+        self.anchor_index = self.body_names.index(links[name])
+        self.anchor_name = name
 
     def _buffers(self, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
         key = (str(device), dtype)
