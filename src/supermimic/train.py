@@ -41,6 +41,8 @@ def main(cfg: DictConfig) -> None:
         swanlab_project=str(cfg.swanlab.project),
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment=str(cfg.swanlab.experiment),
+        grad_clip_norm=None if cfg.grad_clip_norm is None else float(cfg.grad_clip_norm),
+        grad_clip_value=None if cfg.grad_clip_value is None else float(cfg.grad_clip_value),
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),

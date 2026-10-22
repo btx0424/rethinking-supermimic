@@ -6,6 +6,8 @@ residual blocks, and a state-independent Gaussian actor.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -162,6 +164,12 @@ class Policy(nn.Module):
         if self.log_std is not None and not deterministic:
             return mean + self.log_std.exp() * torch.randn_like(mean)
         return mean
+
+    def entropy(self) -> torch.Tensor:
+        """Entropy of the state-independent diagonal Gaussian (sum over action dims)."""
+        if self.log_std is None:
+            raise RuntimeError("Entropy is only defined for the stochastic actor.")
+        return (self.log_std + 0.5 * (1.0 + math.log(2.0 * math.pi))).sum()
 
 
 class Critic(nn.Module):
