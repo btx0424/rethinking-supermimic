@@ -19,10 +19,14 @@ obs:
   base_ang_vel: true
   projected_gravity: true
   last_action: true
+  # Extra FK every obs step (collect + imagined BPTT). Keep off unless you need it.
   anchor_ori: true
 
 # Reward anchor and the body used by obs.anchor_ori. torso or pelvis.
-anchor: torso
+anchor: pelvis
+# Tracking kernel only. Action-rate and joint-limit stay the paper penalties.
+# gaussian | cauchy | gaussian_linear.
+reward_style: gaussian
 
 num_envs: 4096
 iterations: 320000
@@ -49,10 +53,18 @@ grad_clip_value: null  # policy only; null disables
 # Running return-based reward scale for policy/critic (FlashSAC-style). Off by default.
 # G_max is MAX_STEP_REWARD/(1-γ) from the MDP, not a hyperparameter.
 normalize_reward: false
+# torch.compile the world-model window and the imagination horizon.
+# The first call of each graph takes a few minutes. false runs them eager.
+compile: true
+# Weight of the LSGAN generator loss added to the world-model MSE. 0 disables it.
+adv_coef: 0.0
 device: cuda
 log_every: 50
 ckpt_every: 2000
 seed: 0
+# Path to a checkpoint to continue from. null starts fresh.
+# Older checkpoints may omit modules (disc, reward_norm, …); those stay at init.
+resume: null
 
 swanlab:
   project: rethinking-supermimic

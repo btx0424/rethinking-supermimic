@@ -47,19 +47,120 @@ NOMINAL_ERROR = (
     (NUM_J, 0.5),
     (NUM_J, 5.0),
 )
-MAX_STEP_REWARD = (4.0 * 1.0 + 2.0 * 0.5) * CONTROL_DT
-# Positive tracking weights (before dt). Penalties are logged as raw means.
-REWARD_TERM_WEIGHT = {
-    "body_pos": 1.0,
-    "body_ori": 1.0,
+# Tracking kernels. Action-rate and joint-limit stay the paper penalties in every style:
+# ``-w · feature · dt`` (feature is already a square / a ReLU sum, so no saturation).
+# ``gaussian``: paper ``exp(-error²/σ²)``.
+# ``cauchy``: ``1/(1+error²/σ²)``.
+# ``gaussian_linear``: Gaussian near 0 plus a smooth linear-in-error tail (can go negative).
+REWARD_STYLES = ("gaussian", "cauchy", "gaussian_linear")
+# Asymptotic |∂k/∂x| = LINEAR_ALPHA / σ. The linear regime starts near LINEAR_WIDTH·σ.
+LINEAR_ALPHA = 0.25
+LINEAR_WIDTH = 4.0
+REWARD_TERM_NAMES = (
+    "body_pos",
+    "body_ori",
+    "body_lin_vel",
+    "body_ang_vel",
+    "root_pos",
+    "root_ori",
+    "action_rate",
+    "joint_limit",
+)
+# Shared length-scales (σ). Tracking uses the paper values; regularizers are style-specific uses.
+REWARD_TERM_SCALE = {
+    "body_pos": 0.3,
+    "body_ori": 0.4,
     "body_lin_vel": 1.0,
-    "body_ang_vel": 1.0,
-    "root_pos": 0.5,
-    "root_ori": 0.5,
-    "action_rate": 0.1,
-    "joint_limit": 2.0,
+    "body_ang_vel": 3.14,
+    "root_pos": 0.3,
+    "root_ori": 0.4,
+    "action_rate": 1.0,
+    "joint_limit": 0.1,
 }
-REWARD_TERM_NAMES = tuple(REWARD_TERM_WEIGHT)
+# Peak |weight| before ×dt. Tracking weights match the paper; cauchy joint_limit is a bonus.
+REWARD_TERM_WEIGHT = {
+    "gaussian": {
+        "body_pos": 1.0,
+        "body_ori": 1.0,
+        "body_lin_vel": 1.0,
+        "body_ang_vel": 1.0,
+        "root_pos": 0.5,
+        "root_ori": 0.5,
+        "action_rate": 0.1,
+        "joint_limit": 2.0,
+    },
+    "cauchy": {
+        "body_pos": 1.0,
+        "body_ori": 1.0,
+        "body_lin_vel": 1.0,
+        "body_ang_vel": 1.0,
+        "root_pos": 0.5,
+        "root_ori": 0.5,
+        "action_rate": 0.1,
+        "joint_limit": 0.5,
+    },
+    "gaussian_linear": {
+        "body_pos": 1.0,
+        "body_ori": 1.0,
+        "body_lin_vel": 1.0,
+        "body_ang_vel": 1.0,
+        "root_pos": 0.5,
+        "root_ori": 0.5,
+        "action_rate": 0.1,
+        "joint_limit": 0.5,
+    },
+}
+
+
+def resolve_reward_style(style: str) -> str:
+    if style not in REWARD_STYLES:
+        raise ValueError(f"Unknown reward style {style!r}. Known: {REWARD_STYLES}.")
+    return style
+
+
+def max_step_reward(style: str = "gaussian") -> float:
+    """Upper bound on the positive tracking reward (penalties are ≤ 0 in every style)."""
+    resolve_reward_style(style)
+    weights = REWARD_TERM_WEIGHT[style]
+    return sum(weights[name] for name in REWARD_TERM_NAMES if name not in ("action_rate", "joint_limit")) * CONTROL_DT
+
+
+# Default = paper Gaussian (backward-compatible import site).
+MAX_STEP_REWARD = max_step_reward("gaussian")
+
+
+def gaussian_kernel(error_sq: torch.Tensor, scale: float) -> torch.Tensor:
+    """Paper kernel ``exp(-error² / σ²)``. ``error_sq`` is already ``error²``."""
+    return torch.exp(-error_sq / (scale * scale))
+
+
+def cauchy_kernel(error_sq: torch.Tensor, scale: float) -> torch.Tensor:
+    """Heavy-tailed kernel ``1 / (1 + error² / σ²)``. ``error_sq`` is already ``error²``.
+
+    C∞ for ``error² ≥ 0``. Peak 1 at 0; algebraic tails (no exp dead-zone).
+    ``|∂k/∂(error²)|`` peaks at 0 (``1/σ²``) and decays as ``O(error⁻⁴)``.
+    """
+    return 1.0 / (1.0 + error_sq / (scale * scale))
+
+
+def gaussian_linear_kernel(error_sq: torch.Tensor, scale: float) -> torch.Tensor:
+    """Gaussian plus a hyperbolic term that is linear in the raw error ``x = √(error²)``.
+
+    ``k = exp(-x²/σ²) - β (√(1 + (x/δ)²) - 1)`` with ``δ = LINEAR_WIDTH·σ`` and
+    ``β = LINEAR_ALPHA·LINEAR_WIDTH``. C∞, ``k(0) = 1``, ``k'(0) = 0`` (matches the
+    Gaussian to first order). ``k'(x) → -LINEAR_ALPHA/σ``, so the tail does not
+    saturate; it becomes negative past a finite error.
+    """
+    delta = LINEAR_WIDTH * scale
+    beta = LINEAR_ALPHA * LINEAR_WIDTH
+    gauss = torch.exp(-error_sq / (scale * scale))
+    tail = beta * (torch.sqrt(1.0 + error_sq / (delta * delta)) - 1.0)
+    return gauss - tail
+
+
+def hard_joint_violation(q: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    """Paper joint-limit penalty feature ``(relu(q-hi)+relu(lo-q)).sum(-1)``."""
+    return (torch.relu(q - hi) + torch.relu(lo - q)).sum(-1)
 
 
 def resolve_obs_terms(terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -144,6 +245,7 @@ class MDP:
         soft_lo: torch.Tensor,
         soft_hi: torch.Tensor,
         obs_terms: tuple[str, ...] = PAPER_OBS_TERMS,
+        reward_style: str = "gaussian",
     ):
         self.kin = kin
         self.motion = motion
@@ -152,6 +254,9 @@ class MDP:
         self.soft_hi = soft_hi
         self.anchor = kin.anchor_index
         self.obs_terms = resolve_obs_terms(obs_terms)
+        self.reward_style = resolve_reward_style(reward_style)
+        self.term_weight = REWARD_TERM_WEIGHT[self.reward_style]
+        self.max_step_reward = max_step_reward(self.reward_style)
         spec = {name: (dim, noise) for name, dim, noise in OBS_SPEC}
         self.obs_dim = sum(spec[name][0] for name in self.obs_terms)
         self.noise = torch.cat(
@@ -189,29 +294,39 @@ class MDP:
         return self.kin.forward(p, quat, v, w, q, qd)
 
     def reward(self, p, quat, v, w, q, qd, frame, action, a_prev, terms: bool = False):
-        """Per-step reward (×dt). With ``terms=True``, also return a name→tensor dict that sums to it."""
+        """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
+
+        Action-rate and joint-limit are always the paper penalties
+        ``-w · ||Δa||² · dt`` and ``-w · relu_violation · dt``.
+
+        With ``terms=True``, also return a name→tensor dict that sums to the reward.
+        """
         body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
         ref_p = self.motion.body_p[frame]
         ref_quat = self.motion.body_quat[frame]
         ref_pos, ref_ori = _anchor_relative(body_p, body_quat, ref_p, ref_quat, self.anchor)
-        e_pos = (ref_pos - body_p).square().sum(-1).mean(-1)
-        e_ori = quat_error_angle(ref_ori, body_quat).square().mean(-1)
-        e_lv = (self.motion.body_v[frame] - body_v).square().sum(-1).mean(-1)
-        e_av = (self.motion.body_w[frame] - body_w).square().sum(-1).mean(-1)
-        e_rp = (self.motion.root_p[frame] - p).square().sum(-1)
-        e_ro = quat_error_angle(self.motion.root_quat[frame], quat).square()
-        action_rate = (action - a_prev).square().sum(-1)
-        joint_limit = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        parts = {
-            "body_pos": torch.exp(-e_pos / 0.3**2) * CONTROL_DT,
-            "body_ori": torch.exp(-e_ori / 0.4**2) * CONTROL_DT,
-            "body_lin_vel": torch.exp(-e_lv / 1.0**2) * CONTROL_DT,
-            "body_ang_vel": torch.exp(-e_av / 3.14**2) * CONTROL_DT,
-            "root_pos": 0.5 * torch.exp(-e_rp / 0.3**2) * CONTROL_DT,
-            "root_ori": 0.5 * torch.exp(-e_ro / 0.4**2) * CONTROL_DT,
-            "action_rate": -0.1 * action_rate * CONTROL_DT,
-            "joint_limit": -2.0 * joint_limit * CONTROL_DT,
+        if self.reward_style == "cauchy":
+            kernel = cauchy_kernel
+        elif self.reward_style == "gaussian_linear":
+            kernel = gaussian_linear_kernel
+        else:
+            kernel = gaussian_kernel
+        errors = {
+            "body_pos": (ref_pos - body_p).square().sum(-1).mean(-1),
+            "body_ori": quat_error_angle(ref_ori, body_quat).square().mean(-1),
+            "body_lin_vel": (self.motion.body_v[frame] - body_v).square().sum(-1).mean(-1),
+            "body_ang_vel": (self.motion.body_w[frame] - body_w).square().sum(-1).mean(-1),
+            "root_pos": (self.motion.root_p[frame] - p).square().sum(-1),
+            "root_ori": quat_error_angle(self.motion.root_quat[frame], quat).square(),
         }
+        w = self.term_weight
+        s = REWARD_TERM_SCALE
+        pen = REWARD_TERM_WEIGHT["gaussian"]
+        parts = {
+            name: w[name] * kernel(errors[name], s[name]) * CONTROL_DT for name in errors
+        }
+        parts["action_rate"] = -pen["action_rate"] * (action - a_prev).square().sum(-1) * CONTROL_DT
+        parts["joint_limit"] = -pen["joint_limit"] * hard_joint_violation(q, self.soft_lo, self.soft_hi) * CONTROL_DT
         reward = parts["body_pos"]
         for name in REWARD_TERM_NAMES[1:]:
             reward = reward + parts[name]

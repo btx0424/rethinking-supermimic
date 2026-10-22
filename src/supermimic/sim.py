@@ -13,7 +13,7 @@ from mjlab.utils.string import resolve_expr
 
 from .kinematics import TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MAX_STEP_REWARD, MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state
+from .mdp import MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
 from .motion import BIN_FRAMES, MotionLib
 
 DECIMATION = 4
@@ -32,6 +32,7 @@ class TrackingSim:
         reset_noise: bool = True,
         anchor: str = "torso",
         obs_terms: tuple[str, ...] | None = None,
+        reward_style: str = "gaussian",
     ):
         self.device = device
         self.motion = motion
@@ -39,6 +40,7 @@ class TrackingSim:
         self.gamma = gamma
         self.eval_mode = eval_mode
         self.reset_noise = reset_noise and not eval_mode
+        self.reward_style = reward_style
         kin.set_anchor(anchor)
         self.max_steps = 10**9 if eval_mode else MAX_EPISODE_STEPS
         scene_cfg = SceneCfg(
@@ -78,6 +80,7 @@ class TrackingSim:
             limits[:, 0].clone(),
             limits[:, 1].clone(),
             obs_terms=PAPER_OBS_TERMS if obs_terms is None else obs_terms,
+            reward_style=reward_style,
         )
         scale = resolve_expr(G1_ACTION_SCALE, tuple(self.robot.joint_names))
         if any(value is None for value in scale):
@@ -93,7 +96,7 @@ class TrackingSim:
         self._terrain_ids = self.scene["terrain"].indexing.geom_ids
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
         self._default_ipos = self.sim.get_default_field("body_ipos").clone()
-        self.G_max = MAX_STEP_REWARD / (1.0 - gamma)
+        self.G_max = max_step_reward(reward_style) / (1.0 - gamma)
         self.bin_G = torch.zeros(motion.num_bins, device=device)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=device)
         n = num_envs

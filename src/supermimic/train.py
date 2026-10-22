@@ -41,16 +41,20 @@ def main(cfg: DictConfig) -> None:
         stochastic_actor=bool(cfg.stochastic_actor),
         anchor=str(cfg.anchor),
         obs_terms=terms,
+        reward_style=str(cfg.reward_style),
         swanlab_project=str(cfg.swanlab.project),
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment="/".join(run_dir.parts[-2:]),
         grad_clip_norm=None if cfg.grad_clip_norm is None else float(cfg.grad_clip_norm),
         grad_clip_value=None if cfg.grad_clip_value is None else float(cfg.grad_clip_value),
         normalize_reward=bool(cfg.normalize_reward),
+        compile=bool(cfg.compile),
+        adv_coef=float(cfg.adv_coef),
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),
         seed=int(cfg.seed),
+        resume=None if cfg.resume is None else str(cfg.resume),
     )
     run(train_cfg, run_dir)
 

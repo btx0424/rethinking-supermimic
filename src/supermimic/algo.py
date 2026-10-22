@@ -19,7 +19,6 @@ from .mdp import (
     GOAL_FRAMES,
     HIST,
     INV_DIM,
-    MAX_STEP_REWARD,
     NUM_J,
     REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
@@ -57,6 +56,8 @@ class TrainConfig:
     stochastic_actor: bool = False
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
+    # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
+    reward_style: str = "gaussian"
     swanlab_project: str = "rethinking-supermimic"
     swanlab_mode: str = "offline"
     swanlab_experiment: str = "lafan1"
@@ -65,11 +66,17 @@ class TrainConfig:
     grad_clip_norm: float | None = None
     grad_clip_value: float | None = None  # policy only; None disables
     # Scale policy/critic rewards by 1/max(√Var(G), G_r_max/G_max). Stats from sim collect.
-    # G_max = MAX_STEP_REWARD / (1-γ) is fixed by the MDP.
+    # G_max = max_step_reward(style)/(1-γ) is fixed by the MDP.
     normalize_reward: bool = False
+    # torch.compile the WM window and the imagination horizon. False runs them eager.
+    compile: bool = True
+    # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
+    adv_coef: float = 0.0
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
+    # Continue from this checkpoint. Missing modules (older runs) are left at init.
+    resume: str | None = None
 
 
 @contextmanager
@@ -134,16 +141,18 @@ def _mean(xs: list) -> float:
     return sum(xs) / len(xs)
 
 
-def _term_score(name: str, value: torch.Tensor | float) -> torch.Tensor | float:
-    """Normalize a reward term to a score. Tracking ∈ [0, 1]; penalties are negative means / dt.
+def _term_score(
+    name: str, value: torch.Tensor | float, style: str = "gaussian"
+) -> torch.Tensor | float:
+    """Normalize a reward term for logging.
 
-    Keeps ``torch.Tensor`` inputs on-device (no sync). Callers that need a Python
-    float should reduce via ``_mean`` at log time.
+    Tracking: value / (weight · dt), about (0, 1] at the peak. Action-rate and
+    joint-limit are the paper penalties in every style, logged as the raw mean / dt
+    (negative). Keeps tensors on-device; ``_mean`` syncs at log time.
     """
-    scale = REWARD_TERM_WEIGHT[name] * CONTROL_DT
     if name in ("action_rate", "joint_limit"):
         return value / CONTROL_DT
-    return value / scale
+    return value / (REWARD_TERM_WEIGHT[style][name] * CONTROL_DT)
 
 
 def _grad_norm(params) -> float:
@@ -188,11 +197,12 @@ class MSELoss(nn.Module):
 
 
 class AdversarialLoss(nn.Module):
-    """LSGAN world-model loss. Owns the discriminator; not used for WM training yet.
+    """LSGAN transition discriminator on invariant features.
 
-    Discriminates real vs predicted next-state invariant features, conditioned on
-    ``(inv(s), a, ξ)``. Labels: real → +1, fake → −1; the generator fools D to +1
-    (Mao et al. LSGAN / AMP convention).
+    Discriminates real vs predicted next-state features, conditioned on
+    ``(inv(s), a, ξ)``. Labels: real → +1, fake → −1; the generator fools D
+    toward +1 (Mao et al. LSGAN / AMP). The world-model objective is MSE plus
+    ``adv_coef`` times the generator loss. ``adv_coef=0`` leaves MSE unchanged.
     """
 
     def __init__(self, hidden: list[int] | None = None):
@@ -230,6 +240,140 @@ class AdversarialLoss(nn.Module):
         return self.generator_loss(fake_g), self.discriminator_loss(real, fake_d)
 
 
+def world_model_window(
+    wm: WorldModel,
+    norms: InputNorms,
+    s: torch.Tensor,
+    s1: torch.Tensor,
+    actions: torch.Tensor,
+    xi: torch.Tensor,
+    detach_pred: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autoregressive WM window compiled as one graph.
+
+    Returns MSE errors ``(B, K, D)``, detached start states, and predicted states
+    ``(K, B, STATE)``. Predicted states stay on the graph when ``detach_pred`` is
+    false so the generator loss can train the world model. The K loop is unrolled.
+    """
+    p, quat, v, w, q, qd = unflatten_state(s[:, 0])
+    xi_n = normalize_xi(xi[:, 0])
+    errors = []
+    starts = []
+    preds = []
+    for j in range(actions.shape[1]):
+        starts.append(torch.cat((p, quat, v, w, q, qd), dim=-1))
+        p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, actions[:, j], xi_n, norms)
+        true = unflatten_state(s1[:, j])
+        errors.append(local_state_error(*true, p, quat, v, w, q, qd))
+        preds.append(torch.cat((p, quat, v, w, q, qd), dim=-1))
+    pred = torch.stack(preds, dim=0)
+    if detach_pred:
+        pred = pred.detach()
+    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred
+
+
+def imagine_horizon(
+    policy: Policy,
+    wm: WorldModel,
+    critic: Critic,
+    norms: InputNorms,
+    mdp,
+    hist_s: torch.Tensor,
+    hist_a_prev: torch.Tensor,
+    hist_xi: torch.Tensor,
+    hist_f: torch.Tensor,
+    s: torch.Tensor,
+    a_prev: torch.Tensor,
+    xi: torch.Tensor,
+    frame: torch.Tensor,
+    reward_scale: torch.Tensor,
+    horizon: int,
+    gamma: float,
+    deterministic: bool,
+):
+    """H-step imagination compiled as one graph.
+
+    Returns the policy loss and the tensors the critic and the logs need.
+    ``reward_scale`` is 1 when reward normalization is off.
+    """
+    batch = s.shape[0]
+    device = s.device
+    p, quat, v, w, q, qd = unflatten_state(hist_s)
+    hist_n = p.shape[0] * p.shape[1]
+    obs = mdp.obs(
+        p.reshape(hist_n, 3),
+        quat.reshape(hist_n, 4),
+        v.reshape(hist_n, 3),
+        w.reshape(hist_n, 3),
+        q.reshape(hist_n, -1),
+        qd.reshape(hist_n, -1),
+        hist_a_prev.reshape(hist_n, -1),
+        hist_xi.reshape(hist_n, -1),
+        hist_f.reshape(hist_n),
+    )
+    obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
+    p, quat, v, w, q, qd = unflatten_state(s)
+    xi_n = normalize_xi(xi)
+    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    states = [(p, quat, v, w, q, qd)]
+    frames = [frame]
+    goals = [goal]
+    actions = []
+    prev_actions = []
+    for _ in range(horizon):
+        action = policy(obs_hist, goal, norms, deterministic=deterministic)
+        prev_actions.append(a_prev)
+        actions.append(action)
+        p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
+        frame = frame + 1
+        goal = mdp.motion.goal(frame, GOAL_FRAMES)
+        obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
+        obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
+        states.append((p, quat, v, w, q, qd))
+        frames.append(frame)
+        goals.append(goal)
+        a_prev = action
+    flat = _flatten_time(states[1:])
+    reward, term_parts = mdp.reward(
+        *flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions), terms=True
+    )
+    done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
+    reward = reward.view(horizon, batch)
+    done = done.view(horizon, batch)
+    term_raw = torch.stack([term_parts[name] for name in REWARD_TERM_NAMES]).view(len(REWARD_TERM_NAMES), horizon, batch)
+    term_mean = term_raw.detach().mean(dim=(1, 2))
+    reward_mean = reward.detach().mean()
+    reward = reward / reward_scale
+    term_r = term_raw / reward_scale
+    alive = torch.cumprod(1.0 - done, dim=0)
+    survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
+    discount = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+    weighted = discount[:, None] * survival
+    step_return = weighted * reward
+    returns = step_return.sum(0)
+    bootstrap = gamma**horizon * alive[-1] * critic(
+        norms.critic(invariant_features(*states[-1]), goals[-1], xi_n)
+    )
+    term_loss = -(weighted * term_r).sum(dim=1).mean(dim=-1)
+    policy_loss = -(returns + bootstrap).mean()
+    critic_states = tuple(t.detach() for t in _flatten_time(states))
+    return (
+        policy_loss,
+        step_return,
+        bootstrap,
+        term_loss,
+        reward.detach(),
+        done.detach(),
+        alive[-1].detach(),
+        reward_mean.detach(),
+        term_mean,
+        critic_states,
+        _stack(frames).detach(),
+        _stack(goals).detach(),
+        xi.detach(),
+    )
+
+
 class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
@@ -259,9 +403,18 @@ class Trainer:
             gamma=cfg.gamma,
             anchor=cfg.anchor,
             obs_terms=cfg.obs_terms,
+            reward_style=cfg.reward_style,
         )
+        self.r_max = self.sim.mdp.max_step_reward
         obs_dim = self.sim.mdp.obs_dim
         self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual).to(self.device)
+        # Compiling the whole window / horizon, not a single step. Eager when compile is off.
+        if cfg.compile:
+            self._wm_window = torch.compile(world_model_window, dynamic=False)
+            self._imagine_horizon = torch.compile(imagine_horizon, dynamic=False)
+        else:
+            self._wm_window = world_model_window
+            self._imagine_horizon = imagine_horizon
         self.policy = Policy(obs_dim, GOAL_DIM, HIST, stochastic=cfg.stochastic_actor).to(self.device)
         self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
@@ -270,13 +423,14 @@ class Trainer:
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
         self.buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, self.device)
         self.mse_loss = MSELoss(self.device).to(self.device)
-        # Built for later experiments; WM training still uses ``mse_loss`` only.
+        # Discriminator probe only — never added into the WM objective.
         self.adv_loss = AdversarialLoss().to(self.device)
+        self.opt_disc = torch.optim.Adam(self.adv_loss.parameters(), lr=cfg.lr)
         self.reward_norm = (
             RewardNormalizer(
                 cfg.num_envs,
                 cfg.gamma,
-                g_max=MAX_STEP_REWARD / (1.0 - cfg.gamma),
+                g_max=self.r_max / (1.0 - cfg.gamma),
                 device=self.device,
             )
             if cfg.normalize_reward
@@ -294,6 +448,8 @@ class Trainer:
         }
         self.agg = {
             "wm": [],
+            "wm_mse": [],
+            "wm_adv": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -302,6 +458,10 @@ class Trainer:
             "gn_wm": [],
             "gn_pi": [],
             "gn_v": [],
+            "disc": [],
+            "disc_real": [],
+            "disc_fake": [],
+            "disc_acc": [],
             "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
             "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
             "reward_grad_boot": [],
@@ -310,7 +470,10 @@ class Trainer:
         self.step_acc = 0.0
         self.started = 0.0
         self.logged = 0.0
+        self.start_iteration = 0
         self._log_f = None
+        if cfg.resume:
+            self.load_checkpoint(cfg.resume)
 
     def fit(self) -> None:
         cfg = self.cfg
@@ -333,13 +496,14 @@ class Trainer:
             "sim_score,ep_score,term_frac,it_per_s,lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
+            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
         self.started = time.time()
         self.logged = self.started
         try:
-            for iteration in range(cfg.iterations):
+            for iteration in range(self.start_iteration, cfg.iterations):
                 self._step(iteration)
         finally:
             swanlab.finish()
@@ -349,7 +513,7 @@ class Trainer:
     def _step(self, iteration: int) -> None:
         cfg = self.cfg
         lr = lr_at(iteration, cfg.lr, cfg.lr_decay_iters)
-        for opt in (self.opt_wm, self.opt_pi, self.opt_v):
+        for opt in (self.opt_wm, self.opt_pi, self.opt_v, self.opt_disc):
             for group in opt.param_groups:
                 group["lr"] = lr
         self.step_acc += 1.0 / cfg.utd
@@ -366,7 +530,7 @@ class Trainer:
             return
 
         with timed(self.device):
-            wm_loss, err8, gn_wm = self.update_world_model()
+            wm_loss, err8, gn_wm, disc_stats = self.update_world_model()
         self.timing["wm"].append(timed.last)
 
         # Freeze WM/V params through imagine + policy backward (not torch.no_grad:
@@ -389,7 +553,10 @@ class Trainer:
         self.timing["critic"].append(timed.last)
 
         # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
+        # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
         self.agg["wm"].append(wm_loss.detach())
+        self.agg["wm_mse"].append(disc_stats["mse"])
+        self.agg["wm_adv"].append(disc_stats["adv"])
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -398,6 +565,10 @@ class Trainer:
         self.agg["gn_wm"].append(gn_wm)
         self.agg["gn_pi"].append(gn_pi)
         self.agg["gn_v"].append(gn_v)
+        self.agg["disc"].append(disc_stats["loss"])
+        self.agg["disc_real"].append(disc_stats["real"])
+        self.agg["disc_fake"].append(disc_stats["fake"])
+        self.agg["disc_acc"].append(disc_stats["acc"])
         for name, value in imag_terms.items():
             self.agg["imag_terms"][name].append(value)
 
@@ -435,71 +606,153 @@ class Trainer:
             self.buffer.add(out)
             if self.reward_norm is not None:
                 self.reward_norm.update(out["r"], out["done"])
-            self.stats["r"].append((out["r"].mean() / MAX_STEP_REWARD).detach())
+            style = self.cfg.reward_style
+            self.stats["r"].append((out["r"].mean() / self.r_max).detach())
             for name, value in out["terms"].items():
-                self.stats["sim_terms"][name].append(_term_score(name, value.mean().detach()))
+                self.stats["sim_terms"][name].append(
+                    _term_score(name, value.mean().detach(), style)
+                )
             done = out["done"]
             # One intentional sync for the Python branch.
             if bool(done.any().item()):
                 length = out["ep_len"][done].float().clamp(min=1)
                 self.stats["ep"].append(
-                    (out["ep_ret"][done] / (MAX_STEP_REWARD * length)).mean().detach()
+                    (out["ep_ret"][done] / (self.r_max * length)).mean().detach()
                 )
                 for name, value in out["ep_term"].items():
                     self.stats["ep_terms"][name].append(
-                        _term_score(name, (value[done] / length).mean().detach())
+                        _term_score(name, (value[done] / length).mean().detach(), style)
                     )
                 # Already synced above; host floats are fine for rare episode counts.
                 self.stats["term"].append(float(out["d"][done].float().sum()))
                 self.stats["done_n"].append(float(done.sum()))
 
-    def update_world_model(self) -> tuple[torch.Tensor, torch.Tensor, float]:
+    def update_world_model(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, torch.Tensor]]:
+        """Fit the WM on MSE + ``adv_coef`` · LSGAN generator loss, then step D."""
         cfg = self.cfg
         loss = err8 = None
         norms: list[float] = []
+        mse_losses: list[torch.Tensor] = []
+        adv_losses: list[torch.Tensor] = []
+        disc_losses: list[torch.Tensor] = []
+        disc_reals: list[torch.Tensor] = []
+        disc_fakes: list[torch.Tensor] = []
+        disc_accs: list[torch.Tensor] = []
+        use_adv = cfg.adv_coef > 0
         for _ in range(cfg.wm_batches):
             batch = self.buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
-            loss, err8 = self.world_model_loss(batch)
+            errors, saved, preds = self.world_model_rollout(batch, detach_pred=not use_adv)
+            mse, err8 = self.mse_loss(errors)
             self.opt_wm.zero_grad(set_to_none=True)
-            loss.backward()
+            if use_adv:
+                # D is held fixed so the generator step does not write θ_D grads.
+                with hold_out_net(self.adv_loss):
+                    adv = self._generator_loss(saved, preds)
+                    loss = mse + cfg.adv_coef * adv
+                    loss.backward()
+            else:
+                adv = mse.new_zeros(())
+                loss = mse
+                loss.backward()
             norms.append(_clip_grads(self.wm.parameters(), cfg.grad_clip_norm))
             self.opt_wm.step()
+            mse_losses.append(mse.detach())
+
+            # Features for D are detached. With coef 0 this is also the logged generator loss.
+            d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
+            adv_losses.append(adv.detach() if use_adv else adv_det)
+            disc_losses.append(d_loss)
+            disc_reals.append(d_real)
+            disc_fakes.append(d_fake)
+            disc_accs.append(d_acc)
         assert loss is not None and err8 is not None
-        return loss, err8, _mean(norms)
+        mse_mean = torch.stack(mse_losses).mean()
+        adv_mean = torch.stack(adv_losses).mean()
+        disc_stats = {
+            "loss": torch.stack(disc_losses).mean(),
+            "real": torch.stack(disc_reals).mean(),
+            "fake": torch.stack(disc_fakes).mean(),
+            "acc": torch.stack(disc_accs).mean(),
+            "mse": mse_mean,
+            "adv": adv_mean,
+        }
+        return mse_mean + cfg.adv_coef * adv_mean, err8, _mean(norms), disc_stats
+
+    def update_discriminator(
+        self, saved: list[dict[str, torch.Tensor]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One LSGAN D step. Also returns the detached generator loss for logging."""
+        with torch.no_grad():
+            inv_s = torch.cat([invariant_features(*s["s"]) for s in saved])
+            inv_pred = torch.cat([invariant_features(*s["s_pred"]) for s in saved])
+            inv_true = torch.cat([invariant_features(*s["s_true"]) for s in saved])
+        action = torch.cat([s["action"] for s in saved])
+        xi_n = torch.cat([s["xi_n"] for s in saved])
+        real = self.adv_loss.score(inv_s, action, xi_n, inv_true)
+        fake = self.adv_loss.score(inv_s, action, xi_n, inv_pred)
+        d_loss = self.adv_loss.discriminator_loss(real, fake)
+        self.opt_disc.zero_grad(set_to_none=True)
+        d_loss.backward()
+        _clip_grads(self.adv_loss.parameters(), self.cfg.grad_clip_norm)
+        self.opt_disc.step()
+        # Accuracy under the LSGAN sign convention: real > 0, fake < 0.
+        with torch.no_grad():
+            acc = 0.5 * ((real > 0).float().mean() + (fake < 0).float().mean())
+            adv = self.adv_loss.generator_loss(fake.detach())
+        return d_loss.detach(), real.detach().mean(), fake.detach().mean(), acc.detach(), adv.detach()
+
+    def _generator_loss(self, saved: list[dict[str, torch.Tensor]], preds: torch.Tensor) -> torch.Tensor:
+        """LSGAN generator loss through predicted states. Caller holds D's parameters fixed."""
+        inv_s = []
+        inv_pred = []
+        for j, step in enumerate(saved):
+            start = step["s"] if j == 0 else unflatten_state(preds[j - 1])
+            inv_s.append(invariant_features(*start))
+            inv_pred.append(invariant_features(*unflatten_state(preds[j])))
+        fake = self.adv_loss.score(
+            torch.cat(inv_s),
+            torch.cat([step["action"] for step in saved]),
+            torch.cat([step["xi_n"] for step in saved]),
+            torch.cat(inv_pred),
+        )
+        return self.adv_loss.generator_loss(fake)
 
     def world_model_rollout(
-        self, batch: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        """Autoregressive WM window. Returns stacked local errors and per-step transition feats."""
-        p, quat, v, w, q, qd = unflatten_state(batch["s"][:, 0])
-        xi_n = normalize_xi(batch["xi"][:, 0])
-        errors = []
-        steps = []
-        for j in range(batch["a"].shape[1]):
-            inv_s = invariant_features(p, quat, v, w, q, qd)
-            action = batch["a"][:, j]
-            p, quat, v, w, q, qd = self.wm.step(
-                p, quat, v, w, q, qd, action, xi_n, self.norms
-            )
+        self, batch: dict[str, torch.Tensor], detach_pred: bool = True
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]], torch.Tensor]:
+        """Autoregressive WM window.
+
+        Returns MSE errors, detached states for D, and predicted states. Predicted
+        states require grad only when ``detach_pred`` is false.
+        """
+        errors, starts, preds = self._wm_window(
+            self.wm,
+            self.norms,
+            batch["s"],
+            batch["s1"],
+            batch["a"],
+            batch["xi"],
+            detach_pred,
+        )
+        xi_n = normalize_xi(batch["xi"][:, 0]).detach()
+        saved = []
+        for j in range(starts.shape[0]):
             true = unflatten_state(batch["s1"][:, j])
-            errors.append(
-                local_state_error(
-                    true[0], true[1], true[2], true[3], true[4], true[5], p, quat, v, w, q, qd
-                )
-            )
-            steps.append(
+            saved.append(
                 {
-                    "inv_s": inv_s,
-                    "action": action,
+                    "s": unflatten_state(starts[j]),
+                    "s_pred": unflatten_state(preds[j].detach()),
+                    "s_true": tuple(t.detach() for t in true),
+                    "action": batch["a"][:, j].detach(),
                     "xi_n": xi_n,
-                    "inv_pred": invariant_features(p, quat, v, w, q, qd),
-                    "inv_true": invariant_features(*true),
                 }
             )
-        return torch.stack(errors, dim=1), steps
+        return errors, saved, preds
 
     def world_model_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        errors, _steps = self.world_model_rollout(batch)
+        errors, _saved, _preds = self.world_model_rollout(batch)
         return self.mse_loss(errors)
 
     def sample_policy_starts(self) -> dict[str, torch.Tensor]:
@@ -519,93 +772,135 @@ class Trainer:
             raise RuntimeError("Could not sample enough imagination starts inside the clips.")
         return out
 
+    def _imagine_graph(self, start: dict[str, torch.Tensor]) -> dict:
+        """Differentiable imagination rollout and return pieces (shared by train / diagnostics)."""
+        cfg = self.cfg
+        scale = (
+            self.reward_norm.scale().detach()
+            if self.reward_norm is not None
+            else start["s"].new_ones(())
+        )
+        (
+            policy_loss,
+            step_return,
+            bootstrap,
+            term_loss,
+            reward,
+            done,
+            alive_last,
+            reward_mean,
+            term_mean,
+            critic_states,
+            frames,
+            goals,
+            xi,
+        ) = self._imagine_horizon(
+            self.policy,
+            self.wm,
+            self.critic,
+            self.norms,
+            self.sim.mdp,
+            start["hist_s"],
+            start["hist_a_prev"],
+            start["hist_xi"],
+            start["hist_f"],
+            start["s"],
+            start["a_prev"],
+            start["xi"],
+            start["f"],
+            scale,
+            cfg.horizon,
+            cfg.gamma,
+            not cfg.stochastic_actor,
+        )
+        term_losses = {name: term_loss[i] for i, name in enumerate(REWARD_TERM_NAMES)}
+        term_losses["bootstrap"] = -bootstrap.mean()
+        imag_terms = {
+            name: _term_score(name, term_mean[i], cfg.reward_style) for i, name in enumerate(REWARD_TERM_NAMES)
+        }
+        critic_batch = {
+            "states": critic_states,
+            "frames": frames,
+            "goals": goals,
+            "xi": xi.unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
+            "reward": reward,
+            "done": done,
+        }
+        return {
+            "policy_loss": policy_loss,
+            "critic_batch": critic_batch,
+            "raw_score": reward_mean / self.r_max,
+            "survival_last": alive_last.mean(),
+            "imag_terms": imag_terms,
+            "term_losses": term_losses,
+            "step_return": step_return,
+            "bootstrap": bootstrap,
+            "horizon": cfg.horizon,
+        }
+
     def imagine(self, start: dict[str, torch.Tensor]):
         """One differentiable rollout. Returns the policy loss and detached critic data."""
-        cfg = self.cfg
-        mdp = self.sim.mdp
-        device = start["s"].device
-        batch = start["s"].shape[0]
-        p, quat, v, w, q, qd = unflatten_state(start["hist_s"])
-        hist_n = p.shape[0] * p.shape[1]
-        obs = mdp.obs(
-            p.reshape(hist_n, 3),
-            quat.reshape(hist_n, 4),
-            v.reshape(hist_n, 3),
-            w.reshape(hist_n, 3),
-            q.reshape(hist_n, -1),
-            qd.reshape(hist_n, -1),
-            start["hist_a_prev"].reshape(hist_n, -1),
-            start["hist_xi"].reshape(hist_n, -1),
-            start["hist_f"].reshape(hist_n),
-        )
-        obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
-        p, quat, v, w, q, qd = unflatten_state(start["s"])
-        a_prev = start["a_prev"]
-        xi = start["xi"]
-        xi_n = normalize_xi(xi)
-        frame = start["f"]
-        goal = mdp.motion.goal(frame, GOAL_FRAMES)
-        states = [(p, quat, v, w, q, qd)]
-        frames = [frame]
-        goals = [goal]
-        actions = []
-        prev_actions = []
-        for _ in range(cfg.horizon):
-            action = self.policy(obs_hist, goal, self.norms, deterministic=not cfg.stochastic_actor)
-            prev_actions.append(a_prev)
-            actions.append(action)
-            p, quat, v, w, q, qd = self.wm.step(p, quat, v, w, q, qd, action, xi_n, self.norms)
-            frame = frame + 1
-            goal = mdp.motion.goal(frame, GOAL_FRAMES)
-            obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
-            obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
-            states.append((p, quat, v, w, q, qd))
-            frames.append(frame)
-            goals.append(goal)
-            a_prev = action
-        flat = _flatten_time(states[1:])
-        reward, term_parts = mdp.reward(
-            *flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions), terms=True
-        )
-        done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
-        reward = reward.view(cfg.horizon, batch)
-        done = done.view(cfg.horizon, batch)
-        raw_score = reward.detach().mean() / MAX_STEP_REWARD
-        imag_terms = {name: _term_score(name, value.detach().mean()) for name, value in term_parts.items()}
-        term_r = {name: value.view(cfg.horizon, batch) for name, value in term_parts.items()}
-        if self.reward_norm is not None:
-            reward = self.reward_norm.normalize(reward)
-            term_r = {name: self.reward_norm.normalize(value) for name, value in term_r.items()}
-        alive = torch.cumprod(1.0 - done, dim=0)
-        survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
-        discount = cfg.gamma ** torch.arange(cfg.horizon, device=device, dtype=torch.float32)
-        returns = (discount[:, None] * survival * reward).sum(0)
-        bootstrap = cfg.gamma**cfg.horizon * alive[-1] * self.critic(
-            self.norms.critic(invariant_features(*states[-1]), goals[-1], xi_n)
-        )
-        # Per-term losses share discount/survival with the total; L = Σ_k L_k + L_boot.
-        term_losses = {
-            name: -(discount[:, None] * survival * value).sum(0).mean()
-            for name, value in term_r.items()
-        }
-        term_losses["bootstrap"] = -bootstrap.mean()
-        policy_loss = -(returns + bootstrap).mean()
-        critic_batch = {
-            "states": tuple(t.detach() for t in _flatten_time(states)),
-            "frames": _stack(frames).detach(),
-            "goals": _stack(goals).detach(),
-            "xi": xi.detach().unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
-            "reward": reward.detach(),
-            "done": done.detach(),
-        }
+        g = self._imagine_graph(start)
         return (
-            policy_loss,
-            critic_batch,
-            raw_score,
-            alive[-1].detach().mean(),
-            imag_terms,
-            term_losses,
+            g["policy_loss"],
+            g["critic_batch"],
+            g["raw_score"],
+            g["survival_last"],
+            g["imag_terms"],
+            g["term_losses"],
         )
+
+    def diagnose_imagination_step_grads(
+        self, start: dict[str, torch.Tensor] | None = None
+    ) -> dict[str, list[float]]:
+        """Per-step actor grad norms along the imagination horizon.
+
+        Not called from training — each of the ``H`` (plus bootstrap) backwards
+        retains the full BPTT graph, so cost is roughly ``O(H)`` policy updates.
+
+        For step ``t``, ``cumulative[t]`` is ``||∇_θ L_≤t||`` with
+        ``L_≤t = -mean(Σ_{k≤t} γ^k S_k r_k)``. ``marginal[t]`` is the same for
+        the single term at ``t``. Bootstrap is reported separately and also as
+        ``cumulative_with_boot`` (final cumulative + bootstrap, matching the
+        training loss).
+        """
+        if start is None:
+            start = self.sample_policy_starts()
+        params = [p for p in self.policy.parameters() if p.requires_grad]
+        with hold_out_net(self.wm), hold_out_net(self.critic):
+            g = self._imagine_graph(start)
+            step_return = g["step_return"]
+            bootstrap = g["bootstrap"]
+            horizon = g["horizon"]
+            marginal: list[float] = []
+            cumulative: list[float] = []
+            for t in range(horizon):
+                loss_t = -step_return[t].mean()
+                grads_t = torch.autograd.grad(
+                    loss_t, params, retain_graph=True, allow_unused=True
+                )
+                marginal.append(_grads_norm(list(grads_t)))
+                loss_cum = -step_return[: t + 1].sum(0).mean()
+                grads_cum = torch.autograd.grad(
+                    loss_cum, params, retain_graph=True, allow_unused=True
+                )
+                cumulative.append(_grads_norm(list(grads_cum)))
+            boot_grads = torch.autograd.grad(
+                -bootstrap.mean(), params, retain_graph=True, allow_unused=True
+            )
+            boot_norm = _grads_norm(list(boot_grads))
+            full_grads = torch.autograd.grad(
+                g["policy_loss"], params, retain_graph=False, allow_unused=True
+            )
+            full_norm = _grads_norm(list(full_grads))
+        total = cumulative[-1] + 1e-12
+        return {
+            "marginal": marginal,
+            "cumulative": cumulative,
+            "cumulative_frac": [c / total for c in cumulative],
+            "bootstrap": boot_norm,
+            "full": full_norm,
+        }
 
     def update_policy(
         self,
@@ -705,6 +1000,13 @@ class Trainer:
         for name in REWARD_TERM_NAMES:
             row.append(reward_grads[name])
         row.append(reward_grad_boot)
+        disc_loss = _mean(self.agg["disc"])
+        disc_real = _mean(self.agg["disc_real"])
+        disc_fake = _mean(self.agg["disc_fake"])
+        disc_acc = _mean(self.agg["disc_acc"])
+        wm_mse = _mean(self.agg["wm_mse"])
+        wm_adv = _mean(self.agg["wm_adv"])
+        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv))
         row.extend(
             (
                 gn_wm,
@@ -722,6 +1024,8 @@ class Trainer:
         self._log_f.flush()
         metrics = {
             "train/wm_loss": row[2],
+            "train/wm_loss_mse": wm_mse,
+            "train/wm_loss_adv": wm_adv,
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
@@ -747,6 +1051,10 @@ class Trainer:
             metrics[f"score/imag_{name}"] = imag_terms[name]
             metrics[f"grad/reward_{name}"] = reward_grads[name]
         metrics["grad/reward_bootstrap"] = reward_grad_boot
+        metrics["train/disc_loss"] = disc_loss
+        metrics["train/disc_real"] = disc_real
+        metrics["train/disc_fake"] = disc_fake
+        metrics["train/disc_acc"] = disc_acc
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
         if self.reward_norm is not None:
@@ -764,13 +1072,14 @@ class Trainer:
             for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
         )
         print(
-            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} e8 {row[3]:.4f} | "
+            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
             f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
             f"{ent_s} {row[11]:.2f} it/s | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
+            f"D loss {disc_loss:.3f} real {disc_real:.2f} fake {disc_fake:.2f} acc {disc_acc:.2f} | "
             f"collect {seconds['collect']:.3f}s wm {seconds['wm']:.3f}s "
             f"imagine {seconds['imagine']:.3f}s policy {seconds['policy']:.3f}s critic {seconds['critic']:.3f}s",
             flush=True,
@@ -786,6 +1095,8 @@ class Trainer:
         }
         self.agg = {
             "wm": [],
+            "wm_mse": [],
+            "wm_adv": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -794,21 +1105,79 @@ class Trainer:
             "gn_wm": [],
             "gn_pi": [],
             "gn_v": [],
+            "disc": [],
+            "disc_real": [],
+            "disc_fake": [],
+            "disc_acc": [],
             "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
             "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
             "reward_grad_boot": [],
         }
         self.timing = {key: [] for key in self.timing}
 
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load whatever this checkpoint contains. Absent modules stay freshly initialized."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        modules = {
+            "wm": self.wm,
+            "pi": self.policy,
+            "critic": self.critic,
+            "disc": self.adv_loss,
+            "norms": self.norms,
+        }
+        optimizers = {
+            "opt_wm": self.opt_wm,
+            "opt_pi": self.opt_pi,
+            "opt_v": self.opt_v,
+            "opt_disc": self.opt_disc,
+        }
+        loaded: list[str] = []
+        absent: list[str] = []
+        for key, module in modules.items():
+            if key not in ckpt:
+                absent.append(key)
+                continue
+            missing, unexpected = module.load_state_dict(ckpt[key], strict=False)
+            loaded.append(key)
+            if missing or unexpected:
+                print(f"resume {key}: missing={list(missing)} unexpected={list(unexpected)}", flush=True)
+        for key, opt in optimizers.items():
+            if key not in ckpt:
+                absent.append(key)
+                continue
+            try:
+                opt.load_state_dict(ckpt[key])
+            except (ValueError, RuntimeError) as exc:
+                absent.append(key)
+                print(f"resume skip {key}: {exc}", flush=True)
+                continue
+            loaded.append(key)
+        if self.reward_norm is not None and "reward_norm" in ckpt:
+            try:
+                self.reward_norm.load_state_dict(ckpt["reward_norm"])
+                loaded.append("reward_norm")
+            except (KeyError, RuntimeError, ValueError) as exc:
+                absent.append("reward_norm")
+                print(f"resume skip reward_norm: {exc}", flush=True)
+        elif "reward_norm" not in ckpt:
+            absent.append("reward_norm")
+        self.start_iteration = int(ckpt.get("iteration", 0))
+        print(
+            f"resumed {path} at iteration {self.start_iteration} | loaded {loaded} | absent {absent}",
+            flush=True,
+        )
+
     def save_checkpoint(self, iteration: int) -> None:
         ckpt = {
             "wm": self.wm.state_dict(),
             "pi": self.policy.state_dict(),
             "critic": self.critic.state_dict(),
+            "disc": self.adv_loss.state_dict(),
             "norms": self.norms.state_dict(),
             "opt_wm": self.opt_wm.state_dict(),
             "opt_pi": self.opt_pi.state_dict(),
             "opt_v": self.opt_v.state_dict(),
+            "opt_disc": self.opt_disc.state_dict(),
             "iteration": iteration,
             "cfg": self.cfg.__dict__,
         }

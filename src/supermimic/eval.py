@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from .kinematics import TorchKinematics, compile_g1
-from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, MAX_STEP_REWARD, PAPER_OBS_TERMS
+from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
 from .network import InputNorms, Policy
 from .sim import TrackingSim
@@ -32,6 +32,7 @@ def evaluate(ckpt: Path, device: str) -> None:
         reset_noise=False,
         anchor=str(saved_cfg.get("anchor", "torso")),
         obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
+        reward_style=str(saved_cfg.get("reward_style", "gaussian")),
     )
     policy = Policy(
         sim.mdp.obs_dim,
@@ -64,7 +65,7 @@ def evaluate(ckpt: Path, device: str) -> None:
         returns = returns + out["r"] * alive.float()
         failed = failed | (out["d"] & alive)
         alive = alive & ~out["done"]
-    score = returns / (MAX_STEP_REWARD * lengths.float())
+    score = returns / (sim.mdp.max_step_reward * lengths.float())
     print(f"normalized return {float(score.mean()):.4f}  failed {int(failed.sum())}/{n}")
     for name, value, fail in zip(motion.clip_names, score.tolist(), failed.tolist()):
         print(f"  {name:28} {value:.3f}  {'fail' if fail else 'ok'}")

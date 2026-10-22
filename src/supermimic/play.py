@@ -142,6 +142,7 @@ def play(
             reset_noise=False,
             anchor=str(saved_cfg.get("anchor", "torso")),
             obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
+            reward_style=str(saved_cfg.get("reward_style", "gaussian")),
         )
         policy = Policy(
             sim.mdp.obs_dim,
