@@ -14,5 +14,8 @@ data/
 logs/
 swanlog/
 
+# Local benchmark result cache
+benchmark/.train_compile_cache.json
+
 # hydra
 outputs/

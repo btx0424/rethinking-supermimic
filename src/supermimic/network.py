@@ -205,7 +205,8 @@ class WorldModel(nn.Module):
         p, quat, v, w, q, qd = state.root()
         body_pos = state.body_pos
         if body_pos is None:
-            body_pos, _, _, _ = mdp.bodies(p, quat, v, w, q, qd)
+            # body_pos, _, _, _ = mdp.bodies(p, quat, v, w, q, qd)
+            raise ValueError("state.body_pos is required for WorldModel.step.")
         body = heading_body_pos(p, quat, body_pos)
         feat = torch.cat(
             (norms.wm(invariant_features(p, quat, v, w, q, qd), action, xi_n, body), contact),

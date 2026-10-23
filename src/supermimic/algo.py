@@ -12,6 +12,10 @@ from pathlib import Path
 import swanlab
 import torch
 import torch.nn as nn
+import torch._logging as torch_logging
+import logging
+torch_logging.set_logs(dynamo=logging.INFO, inductor=logging.INFO)
+
 from torch.utils.tensorboard import SummaryWriter
 
 from .buffer import ReplayBuffer
@@ -25,6 +29,7 @@ from .mdp import (
     NUM_J,
     REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
+    STATE_DIM,
     XI_DIM,
     invariant_features,
     local_state_error,
@@ -88,8 +93,11 @@ class TrainConfig:
     # Scale policy/critic rewards by 1/max(√Var(G), G_r_max/G_max). Stats from sim collect.
     # G_max = max_step_reward(style)/(1-γ) is fixed by the MDP.
     normalize_reward: bool = False
-    # torch.compile the world-model window and one imagination step. False runs both eager.
+    # torch.compile the world model and one imagination step. False runs both eager.
     compile: bool = True
+    # World-model compile unit: ``window`` (whole K-loop) or ``step`` (one transition;
+    # the K-loop stays eager, matching the imagination pattern).
+    compile_wm: str = "window"
     # MLP matmuls. ``bf16`` casts back to fp32 before integration. ``none`` is fp32.
     amp: str = "bf16"
     # Reward / world-model FK. ``torch`` compiles with the imagination graph; ``warp`` does not.
@@ -334,6 +342,27 @@ def contact_bce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return per_body.mean(dim=(0, 1)).mean()
 
 
+def world_model_step(
+    wm: WorldModel,
+    norms: InputNorms,
+    state: WorldModelState,
+    action: torch.Tensor,
+    xi_n: torch.Tensor,
+    contact: torch.Tensor,
+    s1: torch.Tensor,
+    mdp,
+) -> tuple[WorldModelState, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One autoregressive WM step (optionally compiled; the K-loop may stay eager).
+
+    ``s1`` is the true next state ``(B, STATE)``. Returns the predicted next
+    state, local error ``(B, D)``, flat prediction, and contact logits.
+    """
+    state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
+    true = unflatten_state(s1)
+    error = local_state_error(*true, *state.root())
+    return state, error, state.flatten(), logit
+
+
 def world_model_window(
     wm: WorldModel,
     norms: InputNorms,
@@ -347,13 +376,14 @@ def world_model_window(
     mdp,
     detach_pred: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autoregressive WM window compiled as one graph.
+    """Autoregressive WM window (compile this for ``compile_wm=window``).
 
     Returns MSE errors ``(B, K, D)``, detached start states, predicted states
     ``(K, B, STATE)``, and contact logits ``(K, B, bodies)``. The contact fed
     into step ``j+1`` is the sigmoid of step ``j``, not the recorded bit.
     Predicted states stay on the graph when ``detach_pred`` is false so the
-    generator loss can train the world model. The K loop is unrolled.
+    generator loss can train the world model. The K loop is unrolled in-graph
+    (Inductor times out if the body is factored through a ``step`` callable).
     ``body_pos`` / ``body_quat`` are the buffered tracked-body poses for ``s``.
     """
     state = WorldModelState(*unflatten_state(s[:, 0]), body_pos[:, 0], body_quat[:, 0])
@@ -365,11 +395,49 @@ def world_model_window(
     logits = []
     for j in range(actions.shape[1]):
         starts.append(state.flatten())
+        # Keep the transition inlined (same ops as ``world_model_step``).
         state, logit = wm.step(state, actions[:, j], xi_n, norms, carried, mdp)
         carried = logit.sigmoid()
         true = unflatten_state(s1[:, j])
         errors.append(local_state_error(*true, *state.root()))
         preds.append(state.flatten())
+        logits.append(logit)
+    pred = torch.stack(preds, dim=0)
+    if detach_pred:
+        pred = pred.detach()
+    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred, torch.stack(logits, dim=0)
+
+
+def world_model_window_steps(
+    wm: WorldModel,
+    norms: InputNorms,
+    s: torch.Tensor,
+    s1: torch.Tensor,
+    actions: torch.Tensor,
+    xi: torch.Tensor,
+    contact: torch.Tensor,
+    body_pos: torch.Tensor,
+    body_quat: torch.Tensor,
+    mdp,
+    detach_pred: bool,
+    step,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Eager K-loop that calls a (possibly compiled) ``world_model_step``."""
+    state = WorldModelState(*unflatten_state(s[:, 0]), body_pos[:, 0], body_quat[:, 0])
+    xi_n = normalize_xi(xi[:, 0])
+    carried = contact[:, 0]
+    errors = []
+    starts = []
+    preds = []
+    logits = []
+    for j in range(actions.shape[1]):
+        starts.append(state.flatten())
+        state, error, pred, logit = step(
+            wm, norms, state, actions[:, j], xi_n, carried, s1[:, j], mdp
+        )
+        carried = logit.sigmoid()
+        errors.append(error)
+        preds.append(pred)
         logits.append(logit)
     pred = torch.stack(preds, dim=0)
     if detach_pred:
@@ -574,6 +642,12 @@ class Trainer:
         self.motion = MotionLib.load(device=self.device)
         model, names = compile_g1()
         self.kin = make_kinematics(model, names, cfg.fk, self.device)
+        # Torch FK caches device tensors on first forward. Prewarm so the first
+        # compiled call does not treat as_tensor copies as graph outputs.
+        if cfg.fk == "torch":
+            with torch.no_grad():
+                zeros = torch.zeros(1, STATE_DIM, device=self.device)
+                self.kin.forward(*unflatten_state(zeros))
         self.sim = TrackingSim(
             cfg.num_envs,
             self.motion,
@@ -587,13 +661,39 @@ class Trainer:
         self.r_max = self.sim.mdp.max_step_reward
         obs_dim = self.sim.mdp.obs_dim
         self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual).to(self.device)
-        # The world-model window is one graph. The policy compiles a single imagination
-        # step (mode="default"); the horizon loop stays eager. Both are eager when compile is off.
+        # WM: compile the whole K-window or one step (eager K-loop). Imagination
+        # always compiles a single step; the H-loop stays eager. Inductor default
+        # (not reduce-overhead): CUDA graphs hurt the real multi-batch WM update.
+        if cfg.compile_wm not in ("window", "step"):
+            raise ValueError(f"compile_wm must be 'window' or 'step', got {cfg.compile_wm!r}")
         if cfg.compile:
-            self._wm_window = torch.compile(world_model_window, mode="reduce-overhead", dynamic=False)
-            self._imagine_step = torch.compile(imagine_step, mode="reduce-overhead", dynamic=False)
+            if cfg.compile_wm == "window":
+                self._wm_rollout = torch.compile(world_model_window, mode="default", dynamic=False)
+            else:
+                compiled_step = torch.compile(world_model_step, mode="default", dynamic=False)
+
+                def _wm_rollout_steps(
+                    wm, norms, s, s1, actions, xi, contact, body_pos, body_quat, mdp, detach_pred=True
+                ):
+                    return world_model_window_steps(
+                        wm,
+                        norms,
+                        s,
+                        s1,
+                        actions,
+                        xi,
+                        contact,
+                        body_pos,
+                        body_quat,
+                        mdp,
+                        detach_pred,
+                        compiled_step,
+                    )
+
+                self._wm_rollout = _wm_rollout_steps
+            self._imagine_step = torch.compile(imagine_step, mode="default", dynamic=False)
         else:
-            self._wm_window = world_model_window
+            self._wm_rollout = world_model_window
             self._imagine_step = imagine_step
         self.policy = Policy(
             obs_dim,
@@ -975,7 +1075,7 @@ class Trainer:
         logits ``(K, B, bodies)``. Predicted states require grad only when
         ``detach_pred`` is false. Contact logits stay on the graph.
         """
-        errors, starts, preds, contact_logits = self._wm_window(
+        errors, starts, preds, contact_logits = self._wm_rollout(
             self.wm,
             self.norms,
             batch["s"],

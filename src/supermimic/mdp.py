@@ -48,6 +48,9 @@ OBS_SPEC = (
     ("projected_gravity", 3, 0.05),
     ("last_action", NUM_J, 0.0),
     ("anchor_ori", 6, 0.05),
+    # Heading-frame position of the reference anchor relative to the robot anchor.
+    # Not removed by the reward's xy alignment, so the policy can see drift.
+    ("anchor_pos", 3, 0.01),
     # Tracking error of the reward bodies, not their world pose.
     ("body_pos", len(TRACKED_BODIES) * 3, 0.01),
     ("body_ori", len(TRACKED_BODIES) * 6, 0.05),
@@ -329,7 +332,8 @@ class MDP:
     def needs_body_pose(self) -> bool:
         """Whether observation terms read tracked-body poses from the state."""
         return "body_pos" in self.obs_terms or "body_ori" in self.obs_terms or (
-            "anchor_ori" in self.obs_terms and self.anchor != self.kin.pelvis_index
+            ("anchor_ori" in self.obs_terms or "anchor_pos" in self.obs_terms)
+            and self.anchor != self.kin.pelvis_index
         )
 
     def obs(self, state: WorldModelState, a_prev, xi, frame=None) -> torch.Tensor:
@@ -362,6 +366,16 @@ class MDP:
             ref_quat = self.motion.body_quat[frame][..., self.anchor, :]
             relative = quat_mul(quat_inv(robot_quat), ref_quat)
             parts["anchor_ori"] = mat_to_6d(quat_to_mat(relative))
+        if "anchor_pos" in self.obs_terms:
+            if frame is None:
+                raise ValueError("The anchor_pos observation needs the reference frame.")
+            if self.anchor == self.kin.pelvis_index:
+                robot_p = p
+            else:
+                robot_p = body_p[..., self.anchor, :]
+            ref_p = self.motion.body_p[frame][..., self.anchor, :]
+            # Reference minus robot, in the robot heading frame. xy is the drift.
+            parts["anchor_pos"] = quat_apply_inverse(yaw_quat(quat), ref_p - robot_p)
         if "body_pos" in self.obs_terms or "body_ori" in self.obs_terms:
             if frame is None:
                 raise ValueError("The body_pos and body_ori observations need the reference frame.")
