@@ -16,6 +16,7 @@ from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 from .kinematics import compile_g1, make_kinematics
 from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
+from .mdp import WorldModelState
 from .network import InputNorms, build_policy
 
 # Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
@@ -252,7 +253,9 @@ def play(
     def step_policy() -> bool:
         assert sim is not None and policy is not None and norms is not None and obs_hist is not None
         p, quat, v, w, q, qd = sim.state()
-        obs = sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi, sim.f)
+        bodies = sim.tracked_bodies()
+        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+        obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
         fresh = sim.ep_step == 0
         obs_hist[:] = torch.where(
             fresh[:, None, None],

@@ -116,12 +116,22 @@ def _setup(batch: int, device: torch.device):
     wm.requires_grad_(False)
     critic.requires_grad_(False)
 
+    from supermimic.mdp import N_BODY, N_CONTACT
+
     def rand_state(n: int) -> torch.Tensor:
         state = torch.randn(n, STATE_DIM, device=device)
         quat = state[..., 3:7]
         state[..., 3:7] = quat / quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         return state
 
+    def rand_body(n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = torch.randn(n, N_BODY, 3, device=device)
+        quat = torch.randn(n, N_BODY, 4, device=device)
+        quat = quat / quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return pos, quat
+
+    hist_body_pos, hist_body_quat = rand_body(batch * HIST)
+    body_pos, body_quat = rand_body(batch)
     args = (
         policy,
         wm,
@@ -132,10 +142,15 @@ def _setup(batch: int, device: torch.device):
         torch.randn(batch, HIST, 29, device=device),
         torch.randn(batch, HIST, XI_DIM, device=device),
         torch.zeros(batch, HIST, dtype=torch.long, device=device),
+        hist_body_pos.view(batch, HIST, N_BODY, 3),
+        hist_body_quat.view(batch, HIST, N_BODY, 4),
         rand_state(batch),
         torch.randn(batch, 29, device=device),
         torch.randn(batch, XI_DIM, device=device),
         torch.zeros(batch, dtype=torch.long, device=device),
+        torch.zeros(batch, N_CONTACT, device=device),
+        body_pos,
+        body_quat,
         torch.ones((), device=device),
     )
     return policy, wm, norms, mdp, args
@@ -148,30 +163,24 @@ def _imagine_step(
     mdp,
     obs_hist,
     goal,
-    p,
-    quat,
-    v,
-    w,
-    q,
-    qd,
+    state,
     a_prev,
     xi_n,
     xi,
     frame,
     deterministic: bool,
+    contact,
 ):
     """One imagination step: actor, world model, next observation and goal."""
     from supermimic.mdp import GOAL_FRAMES
 
-    from supermimic.network import WorldModelState
-
     action = policy(obs_hist, goal, norms, deterministic=deterministic)
-    p, quat, v, w, q, qd = wm.step(WorldModelState(p, quat, v, w, q, qd), action, xi_n, norms)
+    state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     frame = frame + 1
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
-    obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
+    obs = mdp.add_noise(mdp.obs(state, action, xi, frame))
     obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
-    return obs_hist, goal, p, quat, v, w, q, qd, frame, action
+    return obs_hist, goal, state, frame, action, logit.sigmoid()
 
 
 def _loss_from_step(step, bundle, horizon: int):
@@ -179,39 +188,66 @@ def _loss_from_step(step, bundle, horizon: int):
     from supermimic.algo import _flatten_time, _stack
     from supermimic.mdp import GOAL_FRAMES, HIST, invariant_features, normalize_xi, unflatten_state
 
-    policy, wm, critic, norms, mdp, hist_s, hist_a, hist_xi, hist_f, s, a_prev, xi, frame, scale = bundle
+    (
+        policy,
+        wm,
+        critic,
+        norms,
+        mdp,
+        hist_s,
+        hist_a,
+        hist_xi,
+        hist_f,
+        hist_body_pos,
+        hist_body_quat,
+        s,
+        a_prev,
+        xi,
+        frame,
+        contact,
+        body_pos,
+        body_quat,
+        scale,
+    ) = bundle
     batch = s.shape[0]
     device = s.device
+    from supermimic.mdp import WorldModelState
+
     p, quat, v, w, q, qd = unflatten_state(hist_s)
     n = p.shape[0] * p.shape[1]
-    obs = mdp.obs(
+    hist_state = WorldModelState(
         p.reshape(n, 3),
         quat.reshape(n, 4),
         v.reshape(n, 3),
         w.reshape(n, 3),
         q.reshape(n, -1),
         qd.reshape(n, -1),
+        hist_body_pos.reshape(n, hist_body_pos.shape[-2], 3),
+        hist_body_quat.reshape(n, hist_body_quat.shape[-2], 4),
+    )
+    obs = mdp.obs(
+        hist_state,
         hist_a.reshape(n, -1),
         hist_xi.reshape(n, -1),
         hist_f.reshape(n),
     )
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
-    p, quat, v, w, q, qd = unflatten_state(s)
+    state = WorldModelState(*unflatten_state(s), body_pos, body_quat)
     xi_n = normalize_xi(xi)
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
-    states = [(p, quat, v, w, q, qd)]
+    states = [state]
     frames = [frame]
     goals = [goal]
     actions = []
     prevs = []
     for _ in range(horizon):
         prevs.append(a_prev)
-        obs_hist, goal, p, quat, v, w, q, qd, frame, action = step(
-            policy, wm, norms, mdp, obs_hist, goal, p, quat, v, w, q, qd, a_prev, xi_n, xi, frame, True
+        obs_hist, goal, state, frame, action, contact = step(
+            policy, wm, norms, mdp, obs_hist, goal, state, a_prev, xi_n, xi, frame, True, contact
         )
         actions.append(action)
         a_prev = action
-        states.append((p, quat, v, w, q, qd))
+        states.append(state)
         frames.append(frame)
         goals.append(goal)
     flat = _flatten_time(states[1:])
@@ -225,10 +261,10 @@ def _loss_from_step(step, bundle, horizon: int):
     returns = (discount[:, None] * survival * reward).sum(0)
     bootstrap = (0.99**horizon) * alive[-1] * critic(
         norms.critic(
-            invariant_features(*states[-1]),
+            invariant_features(*states[-1].root()),
             goals[-1],
             xi_n,
-            mdp.privileged(*states[-1], frames[-1]),
+            mdp.privileged(*states[-1].root(), frames[-1]),
         )
     ).mean(-1)
     return -(returns + bootstrap).mean()
@@ -262,6 +298,9 @@ def _worker(conn, kind: str, mode: str | None, batch: int, horizon: int, timeout
             result["steady_ms"] = _steady(run, iters, device) * 1e3
         elif kind == "step":
             compiled = torch.compile(_imagine_step, mode=mode, dynamic=False)
+            from supermimic.mdp import N_CONTACT
+            from supermimic.network import WorldModelState
+
             obs = torch.randn(batch, 10, mdp.obs_dim, device=device)
             goal = torch.randn(batch, 730, device=device)
             p, quat, v, w, q, qd = (torch.randn(batch, n, device=device) for n in (3, 4, 3, 3, 29, 29))
@@ -273,17 +312,13 @@ def _worker(conn, kind: str, mode: str | None, batch: int, horizon: int, timeout
                 mdp,
                 obs,
                 goal,
-                p,
-                quat,
-                v,
-                w,
-                q,
-                qd,
+                WorldModelState(p, quat, v, w, q, qd),
                 torch.randn(batch, 29, device=device),
                 torch.randn(batch, 33, device=device),
                 torch.randn(batch, 33, device=device),
                 torch.zeros(batch, dtype=torch.long, device=device),
                 True,
+                torch.zeros(batch, N_CONTACT, device=device),
             )
 
             def fwd():

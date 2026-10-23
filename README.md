@@ -34,7 +34,7 @@ PYTHONPATH=src python -m supermimic.play --ckpt logs/lafan1/<timestamp>/last.pt
 
 `play` opens a Viser page (default http://localhost:8080) with a ground plane to scrub LAFAN1 clips. With `--ckpt`, the solid robot is the policy and a translucent blue ghost is the reference.
 
-Hydra selects the policy observation and the anchor. The config observation is Table A.1 plus the 6D reference-root orientation, and the anchor is the pelvis. `obs.base_lin_vel=true` adds body-frame linear velocity.
+Hydra selects the policy observation and the anchor. The config observation is Table A.1 plus the 6D reference-root orientation, and the anchor is the pelvis. `obs.base_lin_vel=true` adds body-frame linear velocity. `actor=trunk` concatenates the goal with the history. `actor=film` keeps that trunk on proprioception and lets the goal scale and shift each layer.
 
 `swanlab.mode` is `offline` by default, which writes the run under `swanlog/` without uploading. `online` uploads, and `disabled` turns logging off. `local` needs the SwanLab dashboard extra, which is not installed here.
 
@@ -46,7 +46,7 @@ The paper leaves the following unspecified. The table is how this repo and `supe
 
 | Choice | Paper | Ours | supermimic_vibed |
 |---|---|---|---|
-| Dynamics state | `s_{t+1} = f(s_t, a_t, ξ)`. No coordinates. | Pelvis pose and twist plus joints. The MLP predicts a heading-frame increment (yaw-frame position, body-frame rotation and twist, joint increments). | Same increment parameterization. |
+| Dynamics state | `s_{t+1} = f(s_t, a_t, ξ)`. No coordinates. | Pelvis pose and twist plus joints. The MLP predicts a heading-frame increment (yaw-frame position, body-frame rotation and twist, joint increments), conditioned on a per-body ground-contact probability that it also predicts. | Same increment parameterization. |
 | MLP details | Widths only. Training precision is TF32. | SiLU, no LayerNorm, no residual blocks, zero-initialized world-model output. TF32. A running mean and variance is shared across modules on each input they have in common: state features (world model and critic), goal (encoder and critic), ξ (world model and critic), plus the policy observation and the world-model action. `--wm-norm`, `--wm-residual`, and `--stochastic-actor` are optional. | World model: SiLU, LayerNorm, its own running input and output norm, bf16 matmuls. Policy and critic: ELU, each with its own running input norm. |
 | World-model loss | Eq. 1 is an unweighted square on the state. An analytic head drops its term. | State term only, in the true state's local frame, divided by fixed nominal scales (0.25 m, 0.5 rad, 1 m/s, 3.14 rad/s, 0.5 rad, 5 rad/s). The same scales are the logged 8-step error. | State term only, divided by a running output scale with per-group floors. |
 | Goal encoding | "K=10 future reference frames." No features, no frame, no decision about whether the current frame counts. | Frames `f+1` through `f+10`, in the current reference yaw frame: root displacement, 6D root rotation, root linear and angular velocity, joint position, joint velocity scaled by 0.1. | Frames `f+1` through `f+10`, same features, joint velocity scaled by 0.1. |

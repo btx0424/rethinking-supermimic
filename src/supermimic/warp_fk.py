@@ -117,7 +117,24 @@ def _fk(
 
 
 def _as_wp(tensor: torch.Tensor, dtype, requires_grad: bool):
-    return wp.from_torch(tensor, dtype=dtype, requires_grad=requires_grad)
+    """Wrap a torch tensor. Grad storage stays in the torch caching allocator.
+
+    ``wp.from_torch(..., requires_grad=True)`` otherwise ``cudaMalloc``s the grad
+    through Warp. That fails once PyTorch has reserved the device, even when the
+    requested block is only a few dozen megabytes.
+    """
+    tensor = tensor.detach()
+    if not requires_grad:
+        return wp.from_torch(tensor, dtype=dtype, requires_grad=False)
+    grad = torch.zeros_like(tensor)
+    return wp.from_torch(tensor, dtype=dtype, requires_grad=True, grad=grad)
+
+
+def _torch_warp(n: int, nbody: int, width: int, dtype, torch_device: str):
+    data = torch.zeros(n, nbody, width, device=torch_device)
+    grad = torch.zeros_like(data)
+    array = wp.from_torch(data, dtype=dtype, requires_grad=True, grad=grad)
+    return array, grad
 
 
 class _Scratch:
@@ -126,15 +143,16 @@ class _Scratch:
     def __init__(self, n: int, nbody: int, device):
         self.n = n
         self.busy = False
-        self.pos = wp.zeros((n, nbody), dtype=wp.vec3, device=device, requires_grad=True)
-        self.rot = wp.zeros((n, nbody), dtype=wp.vec4, device=device, requires_grad=True)
-        self.lin = wp.zeros((n, nbody), dtype=wp.vec3, device=device, requires_grad=True)
-        self.ang = wp.zeros((n, nbody), dtype=wp.vec3, device=device, requires_grad=True)
+        torch_device = wp.device_to_torch(device)
+        self.pos, self._pos_g = _torch_warp(n, nbody, 3, wp.vec3, torch_device)
+        self.rot, self._rot_g = _torch_warp(n, nbody, 4, wp.vec4, torch_device)
+        self.lin, self._lin_g = _torch_warp(n, nbody, 3, wp.vec3, torch_device)
+        self.ang, self._ang_g = _torch_warp(n, nbody, 3, wp.vec3, torch_device)
+        self._grads = (self._pos_g, self._rot_g, self._lin_g, self._ang_g)
 
     def zero_grad(self) -> None:
-        for arr in (self.pos, self.rot, self.lin, self.ang):
-            if arr.grad is not None:
-                arr.grad.zero_()
+        for grad in self._grads:
+            grad.zero_()
 
 
 class WarpKinematics:
@@ -168,13 +186,24 @@ class WarpKinematics:
         self._device = device
         self._pool: list[_Scratch] = []
         self._nograd: _Scratch | None = None
-        self._fn = _apply_factory(self)
 
     def set_anchor(self, name: str) -> None:
         self._kin.set_anchor(name)
 
     def __getattr__(self, name: str):
         return getattr(self._kin, name)
+
+    def forward(self, p, quat, v, w, q, qd):
+        """Tracked body poses. Compile sees one custom op; the Warp launch stays inside it."""
+        global _KIN
+        _KIN = self
+        quat = quat_normalize(quat)
+        # Branched on grad mode so an inference call does not push a scratch that
+        # nothing will pop. Compile constant-folds this for the training graph.
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (p, quat, v, w, q, qd)):
+            return warp_fk(p, quat, v, w, q, qd)
+        launched = _launch(self, p, quat, v, w, q, qd, keep=False)
+        return launched.outputs
 
     def _checkout(self, n: int, keep: bool) -> _Scratch:
         """``keep`` holds the buffer until backward. Several FK calls can sit in one graph."""
@@ -198,113 +227,196 @@ class WarpKinematics:
         if scratch is not self._nograd:
             scratch.busy = False
 
-    @torch.compiler.disable
-    def forward(self, p, quat, v, w, q, qd):
-        # Eager only. Dynamo cannot trace Warp's ctypes kernel launch, and this
-        # runs inside the compiled imagination step once body observations need FK.
-        # Autograd is unchanged: the tape still backprops into the caller.
-        # Match TorchKinematics: the free-joint quaternion is normalized in torch
-        # so its gradient stays on the autograd graph.
-        return self._fn.apply(p, quat_normalize(quat), v, w, q, qd)
+
+class _Launch:
+    """One Warp FK. The autograd backward pops it off ``_STACK``."""
+
+    def __init__(self, scratch: _Scratch | None, tape, inputs, outputs_wp, outputs):
+        self.scratch = scratch
+        self.tape = tape
+        self.inputs = inputs
+        self.outputs_wp = outputs_wp
+        self.outputs = outputs
 
 
-def _apply_factory(kin: WarpKinematics):
-    class _Apply(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, p, quat, v, w, q, qd):
-            shape = p.shape[:-1]
-            p = p.reshape(-1, 3).contiguous()
-            quat = quat.reshape(-1, 4).contiguous()
-            v = v.reshape(-1, 3).contiguous()
-            w = w.reshape(-1, 3).contiguous()
-            q = q.reshape(-1, q.shape[-1]).contiguous()
-            qd = qd.reshape(-1, qd.shape[-1]).contiguous()
-            n = p.shape[0]
-            # Function.forward runs under no_grad, so this is the grad-mode signal.
-            keep = any(ctx.needs_input_grad)
-            scratch = kin._checkout(n, keep)
-            out_p = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
-            out_q = torch.empty(n, kin.n_tracked, 4, device=p.device, dtype=p.dtype)
-            out_v = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
-            out_w = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
-            # Detach so Warp's grad buffer is not the leaf's .grad. Views share storage.
-            wp_p = _as_wp(p.detach(), wp.vec3, True)
-            wp_quat = _as_wp(quat.detach(), wp.vec4, True)
-            wp_v = _as_wp(v.detach(), wp.vec3, True)
-            wp_w = _as_wp(w.detach(), wp.vec3, True)
-            wp_q = _as_wp(q.detach(), wp.float32, True)
-            wp_qd = _as_wp(qd.detach(), wp.float32, True)
-            wp_op = _as_wp(out_p, wp.vec3, True)
-            wp_oq = _as_wp(out_q, wp.vec4, True)
-            wp_ov = _as_wp(out_v, wp.vec3, True)
-            wp_ow = _as_wp(out_w, wp.vec3, True)
-            tape = wp.Tape()
-            stream = wp.stream_from_torch(torch.cuda.current_stream(p.device))
-            with wp.ScopedStream(stream):
-                with tape:
-                    wp.launch(
-                        _fk,
-                        dim=n,
-                        inputs=[
-                            kin._parent,
-                            kin._local_pos,
-                            kin._local_quat,
-                            kin._axis,
-                            kin._anchor,
-                            kin._qpos0,
-                            kin._q_index,
-                            kin._kind,
-                            kin._zero_anchor,
-                            wp_p,
-                            wp_quat,
-                            wp_v,
-                            wp_w,
-                            wp_q,
-                            wp_qd,
-                            kin._tracked,
-                            scratch.pos,
-                            scratch.rot,
-                            scratch.lin,
-                            scratch.ang,
-                        ],
-                        outputs=[wp_op, wp_oq, wp_ov, wp_ow],
-                        device=kin._device,
-                    )
-            ctx.tape = tape
-            ctx.scratch = scratch if keep else None
-            ctx.inputs = (wp_p, wp_quat, wp_v, wp_w, wp_q, wp_qd)
-            ctx.outputs = (wp_op, wp_oq, wp_ov, wp_ow)
-            ctx.shape = shape
-            ctx.n_tracked = kin.n_tracked
-            return (
-                out_p.view(*shape, kin.n_tracked, 3),
-                out_q.view(*shape, kin.n_tracked, 4),
-                out_v.view(*shape, kin.n_tracked, 3),
-                out_w.view(*shape, kin.n_tracked, 3),
-            )
+def _launch(kin: WarpKinematics, p, quat, v, w, q, qd, keep: bool) -> _Launch:
+    shape = p.shape[:-1]
+    p = p.reshape(-1, 3).contiguous()
+    quat = quat.reshape(-1, 4).contiguous()
+    v = v.reshape(-1, 3).contiguous()
+    w = w.reshape(-1, 3).contiguous()
+    q = q.reshape(-1, q.shape[-1]).contiguous()
+    qd = qd.reshape(-1, qd.shape[-1]).contiguous()
+    n = p.shape[0]
+    scratch = kin._checkout(n, keep)
+    out_p = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
+    out_q = torch.empty(n, kin.n_tracked, 4, device=p.device, dtype=p.dtype)
+    out_v = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
+    out_w = torch.empty(n, kin.n_tracked, 3, device=p.device, dtype=p.dtype)
+    wp_p = _as_wp(p, wp.vec3, keep)
+    wp_quat = _as_wp(quat, wp.vec4, keep)
+    wp_v = _as_wp(v, wp.vec3, keep)
+    wp_w = _as_wp(w, wp.vec3, keep)
+    wp_q = _as_wp(q, wp.float32, keep)
+    wp_qd = _as_wp(qd, wp.float32, keep)
+    wp_op = _as_wp(out_p, wp.vec3, keep)
+    wp_oq = _as_wp(out_q, wp.vec4, keep)
+    wp_ov = _as_wp(out_v, wp.vec3, keep)
+    wp_ow = _as_wp(out_w, wp.vec3, keep)
+    tape = wp.Tape() if keep else None
+    stream = wp.stream_from_torch(torch.cuda.current_stream(p.device))
+    with wp.ScopedStream(stream):
+        if tape is None:
+            _launch_kernel(kin, n, wp_p, wp_quat, wp_v, wp_w, wp_q, wp_qd, scratch, wp_op, wp_oq, wp_ov, wp_ow)
+        else:
+            with tape:
+                _launch_kernel(kin, n, wp_p, wp_quat, wp_v, wp_w, wp_q, wp_qd, scratch, wp_op, wp_oq, wp_ov, wp_ow)
+    outputs = (
+        out_p.view(*shape, kin.n_tracked, 3),
+        out_q.view(*shape, kin.n_tracked, 4),
+        out_v.view(*shape, kin.n_tracked, 3),
+        out_w.view(*shape, kin.n_tracked, 3),
+    )
+    return _Launch(
+        scratch if keep else None,
+        tape,
+        (wp_p, wp_quat, wp_v, wp_w, wp_q, wp_qd),
+        (wp_op, wp_oq, wp_ov, wp_ow),
+        outputs,
+    )
 
-        @staticmethod
-        def backward(ctx, gp, gq, gv, gw):
-            outs = ctx.outputs
-            grads = (
-                gp.reshape(-1, ctx.n_tracked, 3).contiguous(),
-                gq.reshape(-1, ctx.n_tracked, 4).contiguous(),
-                gv.reshape(-1, ctx.n_tracked, 3).contiguous(),
-                gw.reshape(-1, ctx.n_tracked, 3).contiguous(),
-            )
-            for arr, grad in zip(outs, grads):
-                wp.to_torch(arr.grad).copy_(grad)
-            stream = wp.stream_from_torch(torch.cuda.current_stream(grads[0].device))
-            try:
-                with wp.ScopedStream(stream):
-                    ctx.tape.backward()
-            finally:
-                if ctx.scratch is not None:
-                    kin._release(ctx.scratch)
-            result = []
-            for arr in ctx.inputs:
-                g = wp.to_torch(arr.grad)
-                result.append(None if g is None else g.detach().clone())
-            return tuple(result)
 
-    return _Apply
+def _launch_kernel(kin, n, wp_p, wp_quat, wp_v, wp_w, wp_q, wp_qd, scratch, wp_op, wp_oq, wp_ov, wp_ow):
+    wp.launch(
+        _fk,
+        dim=n,
+        inputs=[
+            kin._parent,
+            kin._local_pos,
+            kin._local_quat,
+            kin._axis,
+            kin._anchor,
+            kin._qpos0,
+            kin._q_index,
+            kin._kind,
+            kin._zero_anchor,
+            wp_p,
+            wp_quat,
+            wp_v,
+            wp_w,
+            wp_q,
+            wp_qd,
+            kin._tracked,
+            scratch.pos,
+            scratch.rot,
+            scratch.lin,
+            scratch.ang,
+        ],
+        outputs=[wp_op, wp_oq, wp_ov, wp_ow],
+        device=kin._device,
+    )
+
+
+# Packs pushed by the forward op and popped by the backward op. Compile traces
+# the backward formula but not this stack: the pop lives inside the backward op.
+_STACK: list[_Launch] = []
+_KIN: WarpKinematics | None = None
+
+
+@torch.library.custom_op("supermimic::warp_fk", mutates_args=())
+def warp_fk(
+    p: torch.Tensor,
+    quat: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    q: torch.Tensor,
+    qd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _KIN is None:
+        raise RuntimeError("Warp FK was called before a WarpKinematics was constructed.")
+    launched = _launch(_KIN, p, quat, v, w, q, qd, keep=True)
+    _STACK.append(launched)
+    return launched.outputs
+
+
+@warp_fk.register_fake
+def _(p, quat, v, w, q, qd):
+    if _KIN is None:
+        raise RuntimeError("Warp FK was traced before a WarpKinematics was constructed.")
+    n = _KIN.n_tracked
+    lead = p.shape[:-1]
+    return (
+        p.new_empty(*lead, n, 3),
+        quat.new_empty(*lead, n, 4),
+        v.new_empty(*lead, n, 3),
+        w.new_empty(*lead, n, 3),
+    )
+
+
+def _setup_context(ctx, inputs, output) -> None:
+    ctx.save_for_backward(*inputs, *output)
+
+
+def _backward(ctx, gp, gq, gv, gw):
+    saved = ctx.saved_tensors
+    primals = saved[:6]
+    outputs = saved[6:]
+    grads = []
+    for grad, out in zip((gp, gq, gv, gw), outputs):
+        grads.append(torch.zeros_like(out) if grad is None else grad)
+    return warp_fk_bwd(*primals, *grads)
+
+
+@torch.library.custom_op("supermimic::warp_fk_bwd", mutates_args=())
+def warp_fk_bwd(
+    p: torch.Tensor,
+    quat: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    q: torch.Tensor,
+    qd: torch.Tensor,
+    gp: torch.Tensor,
+    gq: torch.Tensor,
+    gv: torch.Tensor,
+    gw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del p, quat, v, w, q, qd
+    if not _STACK:
+        raise RuntimeError("Warp FK backward ran without a matching forward.")
+    launched = _STACK.pop()
+    try:
+        flat = (
+            gp.reshape(-1, gp.shape[-2], gp.shape[-1]).contiguous(),
+            gq.reshape(-1, gq.shape[-2], gq.shape[-1]).contiguous(),
+            gv.reshape(-1, gv.shape[-2], gv.shape[-1]).contiguous(),
+            gw.reshape(-1, gw.shape[-2], gw.shape[-1]).contiguous(),
+        )
+        for arr, grad in zip(launched.outputs_wp, flat):
+            wp.to_torch(arr.grad).copy_(grad)
+        stream = wp.stream_from_torch(torch.cuda.current_stream(gp.device))
+        with wp.ScopedStream(stream):
+            launched.tape.backward()
+        result = []
+        for arr in launched.inputs:
+            g = wp.to_torch(arr.grad)
+            result.append(g.detach().clone())
+        return tuple(result)
+    finally:
+        if _KIN is not None and launched.scratch is not None:
+            _KIN._release(launched.scratch)
+
+
+@warp_fk_bwd.register_fake
+def _(p, quat, v, w, q, qd, gp, gq, gv, gw):
+    del gp, gq, gv, gw
+    return (
+        torch.empty_like(p),
+        torch.empty_like(quat),
+        torch.empty_like(v),
+        torch.empty_like(w),
+        torch.empty_like(q),
+        torch.empty_like(qd),
+    )
+
+
+warp_fk.register_autograd(_backward, setup_context=_setup_context)

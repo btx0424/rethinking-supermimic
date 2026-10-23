@@ -12,6 +12,7 @@ from pathlib import Path
 import swanlab
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 
 from .buffer import ReplayBuffer
 from .mdp import (
@@ -91,12 +92,15 @@ class TrainConfig:
     compile: bool = True
     # MLP matmuls. ``bf16`` casts back to fp32 before integration. ``none`` is fp32.
     amp: str = "bf16"
-    # Reward FK. ``warp`` (default) or ``torch``.
-    fk: str = "warp"
+    # Reward / world-model FK. ``torch`` compiles with the imagination graph; ``warp`` does not.
+    fk: str = "torch"
     # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
     adv_coef: float = 0.0
     # L1 reward-match weight added to the world-model MSE. 0 leaves MSE unchanged.
     reward_coef: float = 0.0
+    # Per-body contact BCE weight. The bits also enter the increment, so the state
+    # loss trains them even at 0. 0.01 keeps BCE on the scale of the state MSE.
+    contact_coef: float = 0.01
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
@@ -324,6 +328,12 @@ class RewardL1Loss(nn.Module):
         return (reward_pred - reward_true).abs().mean()
 
 
+def contact_bce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean of the per-body binary cross-entropies. Both tensors are ``(K, B, bodies)``."""
+    per_body = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return per_body.mean(dim=(0, 1)).mean()
+
+
 def world_model_window(
     wm: WorldModel,
     norms: InputNorms,
@@ -331,29 +341,40 @@ def world_model_window(
     s1: torch.Tensor,
     actions: torch.Tensor,
     xi: torch.Tensor,
+    contact: torch.Tensor,
+    body_pos: torch.Tensor,
+    body_quat: torch.Tensor,
+    mdp,
     detach_pred: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive WM window compiled as one graph.
 
-    Returns MSE errors ``(B, K, D)``, detached start states, and predicted states
-    ``(K, B, STATE)``. Predicted states stay on the graph when ``detach_pred`` is
-    false so the generator loss can train the world model. The K loop is unrolled.
+    Returns MSE errors ``(B, K, D)``, detached start states, predicted states
+    ``(K, B, STATE)``, and contact logits ``(K, B, bodies)``. The contact fed
+    into step ``j+1`` is the sigmoid of step ``j``, not the recorded bit.
+    Predicted states stay on the graph when ``detach_pred`` is false so the
+    generator loss can train the world model. The K loop is unrolled.
+    ``body_pos`` / ``body_quat`` are the buffered tracked-body poses for ``s``.
     """
-    state = WorldModelState(*unflatten_state(s[:, 0]))
+    state = WorldModelState(*unflatten_state(s[:, 0]), body_pos[:, 0], body_quat[:, 0])
     xi_n = normalize_xi(xi[:, 0])
+    carried = contact[:, 0]
     errors = []
     starts = []
     preds = []
+    logits = []
     for j in range(actions.shape[1]):
-        starts.append(torch.cat(state, dim=-1))
-        state = wm.step(state, actions[:, j], xi_n, norms)
+        starts.append(state.flatten())
+        state, logit = wm.step(state, actions[:, j], xi_n, norms, carried, mdp)
+        carried = logit.sigmoid()
         true = unflatten_state(s1[:, j])
-        errors.append(local_state_error(*true, *state))
-        preds.append(torch.cat(state, dim=-1))
+        errors.append(local_state_error(*true, *state.root()))
+        preds.append(state.flatten())
+        logits.append(logit)
     pred = torch.stack(preds, dim=0)
     if detach_pred:
         pred = pred.detach()
-    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred
+    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred, torch.stack(logits, dim=0)
 
 
 def imagine_step(
@@ -363,26 +384,22 @@ def imagine_step(
     mdp,
     obs_hist: torch.Tensor,
     goal: torch.Tensor,
-    p: torch.Tensor,
-    quat: torch.Tensor,
-    v: torch.Tensor,
-    w: torch.Tensor,
-    q: torch.Tensor,
-    qd: torch.Tensor,
+    state: WorldModelState,
     a_prev: torch.Tensor,
     xi_n: torch.Tensor,
     xi: torch.Tensor,
     frame: torch.Tensor,
     deterministic: bool,
+    contact: torch.Tensor,
 ):
     """One imagination step. This is the compiled policy graph; the horizon loop stays eager."""
     action = policy(obs_hist, goal, norms, deterministic=deterministic)
-    p, quat, v, w, q, qd = wm.step(WorldModelState(p, quat, v, w, q, qd), action, xi_n, norms)
+    state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     frame = frame + 1
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
-    obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
+    obs = mdp.add_noise(mdp.obs(state, action, xi, frame))
     obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
-    return obs_hist, goal, p, quat, v, w, q, qd, frame, action
+    return obs_hist, goal, state, frame, action, logit.sigmoid()
 
 
 def imagine_horizon(
@@ -395,10 +412,15 @@ def imagine_horizon(
     hist_a_prev: torch.Tensor,
     hist_xi: torch.Tensor,
     hist_f: torch.Tensor,
+    hist_body_pos: torch.Tensor,
+    hist_body_quat: torch.Tensor,
     s: torch.Tensor,
     a_prev: torch.Tensor,
     xi: torch.Tensor,
     frame: torch.Tensor,
+    contact: torch.Tensor,
+    body_pos: torch.Tensor,
+    body_quat: torch.Tensor,
     reward_scale: torch.Tensor,
     horizon: int,
     gamma: float,
@@ -409,55 +431,58 @@ def imagine_horizon(
 
     Returns the policy loss and the tensors the critic and the logs need.
     ``reward_scale`` is 1 when reward normalization is off.
+    Body poses come from the replay buffer (same timesteps as ``s`` / ``hist_s``).
     """
     batch = s.shape[0]
     device = s.device
     p, quat, v, w, q, qd = unflatten_state(hist_s)
     hist_n = p.shape[0] * p.shape[1]
-    obs = mdp.obs(
+    hist_state = WorldModelState(
         p.reshape(hist_n, 3),
         quat.reshape(hist_n, 4),
         v.reshape(hist_n, 3),
         w.reshape(hist_n, 3),
         q.reshape(hist_n, -1),
         qd.reshape(hist_n, -1),
+        hist_body_pos.reshape(hist_n, hist_body_pos.shape[-2], 3),
+        hist_body_quat.reshape(hist_n, hist_body_quat.shape[-2], 4),
+    )
+    obs = mdp.obs(
+        hist_state,
         hist_a_prev.reshape(hist_n, -1),
         hist_xi.reshape(hist_n, -1),
         hist_f.reshape(hist_n),
     )
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
-    p, quat, v, w, q, qd = unflatten_state(s)
+    state = WorldModelState(*unflatten_state(s), body_pos, body_quat)
     xi_n = normalize_xi(xi)
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
-    states = [(p, quat, v, w, q, qd)]
+    states = [state]
     frames = [frame]
     goals = [goal]
     actions = []
     prev_actions = []
+    carried = contact
     for _ in range(horizon):
         prev_actions.append(a_prev)
-        obs_hist, goal, p, quat, v, w, q, qd, frame, action = step(
+        obs_hist, goal, state, frame, action, carried = step(
             policy,
             wm,
             norms,
             mdp,
             obs_hist,
             goal,
-            p,
-            quat,
-            v,
-            w,
-            q,
-            qd,
+            state,
             a_prev,
             xi_n,
             xi,
             frame,
             deterministic,
+            carried,
         )
         actions.append(action)
         a_prev = action
-        states.append((p, quat, v, w, q, qd))
+        states.append(state)
         frames.append(frame)
         goals.append(goal)
     flat = _flatten_time(states[1:])
@@ -479,14 +504,19 @@ def imagine_horizon(
     step_return = weighted * reward
     returns = step_return.sum(0)
     # Heads stay separate through GAE. The actor follows the mean value.
-    bootstrap = gamma**horizon * alive[-1] * critic(
+    head_values = critic(
         norms.critic(
-            invariant_features(*states[-1]),
+            invariant_features(*states[-1].root()),
             goals[-1],
             xi_n,
-            mdp.privileged(*states[-1], frames[-1]),
+            mdp.privileged(*states[-1].root(), frames[-1]),
         )
-    ).mean(-1)
+    )
+    bootstrap = gamma**horizon * alive[-1] * head_values.mean(-1)
+    # Diagnostics read the per-head values. Training leaves this unset.
+    trace = getattr(critic, "_head_trace", None)
+    if trace is not None:
+        trace.append((head_values, alive[-1]))
     term_loss = -(weighted * term_r).sum(dim=1).mean(dim=-1)
     policy_loss = -(returns + bootstrap).mean()
     for action in actions:
@@ -560,8 +590,8 @@ class Trainer:
         # The world-model window is one graph. The policy compiles a single imagination
         # step (mode="default"); the horizon loop stays eager. Both are eager when compile is off.
         if cfg.compile:
-            self._wm_window = torch.compile(world_model_window, dynamic=False)
-            self._imagine_step = torch.compile(imagine_step, mode="default", dynamic=False)
+            self._wm_window = torch.compile(world_model_window, mode="reduce-overhead", dynamic=False)
+            self._imagine_step = torch.compile(imagine_step, mode="reduce-overhead", dynamic=False)
         else:
             self._wm_window = world_model_window
             self._imagine_step = imagine_step
@@ -617,6 +647,7 @@ class Trainer:
             "wm_mse": [],
             "wm_adv": [],
             "wm_reward": [],
+            "wm_contact": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -640,6 +671,7 @@ class Trainer:
         self.start_iteration = 0
         self.wm_frozen = False
         self._log_f = None
+        self._tb: SummaryWriter | None = None
         if cfg.resume:
             self.load_checkpoint(cfg.resume)
         if cfg.wm_ckpt:
@@ -656,6 +688,9 @@ class Trainer:
             config={**logged_cfg, "obs_dim": self.sim.mdp.obs_dim, "anchor_body": self.kin.anchor_name},
             mode=cfg.swanlab_mode,
         )
+        tb_dir = self.log_dir / "tb"
+        self._tb = SummaryWriter(log_dir=tb_dir)
+        print(f"tensorboard={tb_dir}", flush=True)
         self._log_f = (self.log_dir / "train_log.csv").open("w")
         term_cols = ",".join(
             f"sim_{n},ep_{n},imag_{n}" for n in REWARD_TERM_NAMES
@@ -666,7 +701,7 @@ class Trainer:
             "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
-            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,"
+            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,wm_loss_contact,"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
@@ -677,6 +712,8 @@ class Trainer:
                 self._step(iteration)
         finally:
             swanlab.finish()
+            if self._tb is not None:
+                self._tb.close()
             if self._log_f is not None:
                 self._log_f.close()
 
@@ -735,6 +772,7 @@ class Trainer:
         self.agg["wm_mse"].append(disc_stats["mse"])
         self.agg["wm_adv"].append(disc_stats["adv"])
         self.agg["wm_reward"].append(disc_stats["reward"])
+        self.agg["wm_contact"].append(disc_stats["contact"])
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -759,8 +797,10 @@ class Trainer:
         cfg = self.cfg
         for _ in range(n_steps):
             p, quat, v, w, q, qd = self.sim.state()
+            bodies = self.sim.tracked_bodies()
+            state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
             obs = self.sim.mdp.add_noise(
-                self.sim.mdp.obs(p, quat, v, w, q, qd, self.sim.a_prev, self.sim.xi, self.sim.f)
+                self.sim.mdp.obs(state, self.sim.a_prev, self.sim.xi, self.sim.f)
             )
             fresh = self.sim.ep_step == 0
             self.obs_hist = torch.where(
@@ -776,6 +816,7 @@ class Trainer:
             if not self.wm_frozen:
                 self.norms.state.update(invariant_features(p, quat, v, w, q, qd))
                 self.norms.xi.update(xi_n)
+                self.norms.body.update(self.sim.mdp.heading_bodies(p, quat, v, w, q, qd, bodies[0]))
             with torch.no_grad():
                 action = self.policy(
                     self.obs_hist, goal, self.norms, deterministic=not cfg.stochastic_actor
@@ -818,6 +859,7 @@ class Trainer:
         mse_losses: list[torch.Tensor] = []
         adv_losses: list[torch.Tensor] = []
         reward_losses: list[torch.Tensor] = []
+        contact_losses: list[torch.Tensor] = []
         disc_losses: list[torch.Tensor] = []
         disc_reals: list[torch.Tensor] = []
         disc_fakes: list[torch.Tensor] = []
@@ -828,10 +870,11 @@ class Trainer:
             batch = self.buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
             grad_ctx = torch.no_grad() if self.wm_frozen else contextlib.nullcontext()
             with grad_ctx:
-                errors, saved, preds = self.world_model_rollout(
+                errors, saved, preds, contact_logits = self.world_model_rollout(
                     batch, detach_pred=not (use_adv or use_reward)
                 )
                 mse, err8 = self.mse_loss(errors)
+                contact_loss = contact_bce(contact_logits, batch["c1"].transpose(0, 1))
             if use_reward:
                 reward_l1 = self.reward_l1(preds, batch)
             else:
@@ -848,6 +891,8 @@ class Trainer:
                 adv = mse.new_zeros(())
             if use_reward:
                 loss = loss + cfg.reward_coef * reward_l1
+            if cfg.contact_coef > 0:
+                loss = loss + cfg.contact_coef * contact_loss
             if self.wm_frozen:
                 norms.append(0.0)
             else:
@@ -856,6 +901,7 @@ class Trainer:
                 self.opt_wm.step()
             mse_losses.append(mse.detach())
             reward_losses.append(reward_l1.detach())
+            contact_losses.append(contact_loss.detach())
 
             # Features for D are detached. With coef 0 this is also the logged generator loss.
             d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
@@ -876,8 +922,9 @@ class Trainer:
             "mse": mse_mean,
             "adv": adv_mean,
             "reward": reward_mean,
+            "contact": torch.stack(contact_losses).mean(),
         }
-        total = mse_mean + cfg.adv_coef * adv_mean + cfg.reward_coef * reward_mean
+        total = mse_mean + cfg.adv_coef * adv_mean + cfg.reward_coef * reward_mean + cfg.contact_coef * disc_stats["contact"]
         return total, err8, _mean(norms), disc_stats
 
     def update_discriminator(
@@ -921,19 +968,24 @@ class Trainer:
 
     def world_model_rollout(
         self, batch: dict[str, torch.Tensor], detach_pred: bool = True
-    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]], torch.Tensor]:
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
         """Autoregressive WM window.
 
-        Returns MSE errors, detached states for D, and predicted states. Predicted
-        states require grad only when ``detach_pred`` is false.
+        Returns MSE errors, detached states for D, predicted states, and contact
+        logits ``(K, B, bodies)``. Predicted states require grad only when
+        ``detach_pred`` is false. Contact logits stay on the graph.
         """
-        errors, starts, preds = self._wm_window(
+        errors, starts, preds, contact_logits = self._wm_window(
             self.wm,
             self.norms,
             batch["s"],
             batch["s1"],
             batch["a"],
             batch["xi"],
+            batch["c"],
+            batch["body_pos"],
+            batch["body_quat"],
+            self.sim.mdp,
             detach_pred,
         )
         xi_n = normalize_xi(batch["xi"][:, 0]).detach()
@@ -949,10 +1001,10 @@ class Trainer:
                     "xi_n": xi_n,
                 }
             )
-        return errors, saved, preds
+        return errors, saved, preds, contact_logits
 
     def world_model_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        errors, _saved, _preds = self.world_model_rollout(batch)
+        errors, _saved, _preds, _contact = self.world_model_rollout(batch)
         return self.mse_loss(errors)
 
     def sample_policy_starts(self) -> dict[str, torch.Tensor]:
@@ -1008,10 +1060,15 @@ class Trainer:
             start["hist_a_prev"],
             start["hist_xi"],
             start["hist_f"],
+            start["hist_body_pos"],
+            start["hist_body_quat"],
             start["s"],
             start["a_prev"],
             start["xi"],
             start["f"],
+            start["c"],
+            start["body_pos"],
+            start["body_quat"],
             scale,
             cfg.horizon,
             cfg.gamma,
@@ -1249,7 +1306,8 @@ class Trainer:
         wm_mse = _mean(self.agg["wm_mse"])
         wm_adv = _mean(self.agg["wm_adv"])
         wm_reward = _mean(self.agg["wm_reward"])
-        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv, wm_reward))
+        wm_contact = _mean(self.agg["wm_contact"])
+        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv, wm_reward, wm_contact))
         row.extend(
             (
                 gn_wm,
@@ -1270,6 +1328,7 @@ class Trainer:
             "train/wm_loss_mse": wm_mse,
             "train/wm_loss_adv": wm_adv,
             "train/wm_loss_reward": wm_reward,
+            "train/wm_loss_contact": wm_contact,
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
@@ -1305,6 +1364,11 @@ class Trainer:
         if self.reward_norm is not None:
             metrics["train/reward_scale"] = float(self.reward_norm.scale())
         swanlab.log(metrics, step=iteration)
+        if self._tb is not None:
+            for key, value in metrics.items():
+                if math.isfinite(value):
+                    self._tb.add_scalar(key, value, iteration)
+            self._tb.flush()
         ent_s = f" H {entropy:.3f} |" if math.isfinite(entropy) else ""
         track = " ".join(
             f"{n[0]}{sim_terms[n]:.2f}"
@@ -1343,6 +1407,7 @@ class Trainer:
             "wm_mse": [],
             "wm_adv": [],
             "wm_reward": [],
+            "wm_contact": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -1375,7 +1440,7 @@ class Trainer:
             kept = [
                 key
                 for key in own
-                if key.startswith(("state.", "action.", "xi.")) and key in norms
+                if key.startswith(("state.", "action.", "xi.", "body.")) and key in norms
             ]
             for key in kept:
                 own[key] = norms[key]

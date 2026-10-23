@@ -25,9 +25,10 @@ obs:
   # 6D reference orientation of the anchor in the robot anchor frame.
   # With anchor=pelvis this is the reference root in the robot root, as in Uni.
   anchor_ori: true
-  # Tracking error of the 14 reward bodies (anchor-aligned). Requires FK.
-  body_pos: false
-  body_ori: false
+  # Tracking error of the 14 reward bodies (anchor-aligned). The world model
+  # reads the same kinematics, so these observations are already paid for.
+  body_pos: true
+  body_ori: true
 
 # Reward anchor and the body used by obs.anchor_ori. torso or pelvis.
 anchor: pelvis
@@ -48,7 +49,7 @@ wm_lr: 2.0e-4
 pi_lr: 5.0e-4
 # Actor learning rate ramps 0 → pi_lr, then joins the cosine decay.
 pi_warmup: 50
-v_lr: 2.0e-4
+v_lr: 5.0e-4
 # adam | muon. Muon on hidden matrices of the world model and the policy.
 # First Linear, output heads, and the critic stay Adam.
 optim: muon
@@ -75,12 +76,15 @@ normalize_reward: false
 compile: true
 # MLP GEMMs in bf16; state integration stays fp32. none is fp32.
 amp: bf16
-# Reward FK. warp (default) or torch.
-fk: warp
+# Reward / world-model FK. torch compiles with the imagination graph; warp does not.
+fk: torch
 # Weight of the LSGAN generator loss added to the world-model MSE. 0 disables it.
 adv_coef: 0.0
 # Weight of the L1 reward match added to the world-model MSE. 0 disables it.
 reward_coef: 0.0
+# Per-body ground-contact BCE added to the world-model MSE. The predicted
+# probability is also an input of the next increment. 0 drops the BCE only.
+contact_coef: 0.01
 device: cuda
 log_every: 50
 ckpt_every: 1000

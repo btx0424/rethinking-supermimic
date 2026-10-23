@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from .kinematics import TRACKED_BODIES, TorchKinematics
@@ -25,10 +27,18 @@ STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J
 # Critic-only tracking errors: joint position, heading-frame anchored body position,
 # heading-frame root position, 6D root orientation.
 PRIV_DIM = NUM_J + len(TRACKED_BODIES) * 3 + 3 + 6
+# One ground-contact bit per tracked body. The world model reads it and predicts the next one.
+N_CONTACT = len(TRACKED_BODIES)
+N_BODY = len(TRACKED_BODIES)
+# Heading-frame body positions. The world model reads them and does not predict them.
+BODY_POS_DIM = N_BODY * 3
 HIST = 10
 GOAL_FRAMES = 10
 GOAL_DIM = GOAL_PER_FRAME * GOAL_FRAMES
 GRAVITY = (0.0, 0.0, -1.0)
+# Hard termination. Height is |root z − reference z|. Tilt is the projected-gravity z error.
+TERM_HEIGHT = 0.25
+TERM_TILT = 0.8
 # (name, dimension, uniform noise half-width). Order is the observation layout.
 OBS_SPEC = (
     ("joint_pos", NUM_J, 0.01),
@@ -203,6 +213,39 @@ def unflatten_state(s: torch.Tensor):
     )
 
 
+class WorldModelState(NamedTuple):
+    """Root pose and twist in the world frame, plus the 29 hinge joints.
+
+    ``body_pos`` / ``body_quat`` are tracked-body poses from forward kinematics
+    (or from the simulator). ``MDP.obs`` reads them and does not run FK.
+    ``WorldModel.step`` fills them on the returned next state.
+    """
+
+    p: torch.Tensor
+    """World position, (..., 3)."""
+    quat: torch.Tensor
+    """World orientation as wxyz, (..., 4)."""
+    v: torch.Tensor
+    """World linear velocity, (..., 3)."""
+    w: torch.Tensor
+    """World angular velocity, (..., 3)."""
+    q: torch.Tensor
+    """Joint positions, (..., 29)."""
+    qd: torch.Tensor
+    """Joint velocities, (..., 29)."""
+    body_pos: torch.Tensor | None = None
+    """World-frame tracked-body positions, (..., 14, 3)."""
+    body_quat: torch.Tensor | None = None
+    """World-frame tracked-body orientations, (..., 14, 4)."""
+
+    def root(self) -> tuple[torch.Tensor, ...]:
+        """The six root-and-joint tensors the buffer stores."""
+        return (self.p, self.quat, self.v, self.w, self.q, self.qd)
+
+    def flatten(self) -> torch.Tensor:
+        return torch.cat(self.root(), dim=-1)
+
+
 def invariant_features(p, quat, v, w, q, qd) -> torch.Tensor:
     """Heading-invariant state: height, tilt, body-frame twist, joints."""
     yaw = yaw_quat(quat)
@@ -218,6 +261,18 @@ def invariant_features(p, quat, v, w, q, qd) -> torch.Tensor:
         ),
         dim=-1,
     )
+
+
+def heading_body_pos(p, quat, body_p) -> torch.Tensor:
+    """Tracked-body positions in the root heading frame, relative to the root.
+
+    ``body_p`` is ``(..., n_body, 3)`` in the world. Yaw is removed and the root
+    position is subtracted, so these features stay invariant with the rest of the
+    world-model state. The z component is the height difference.
+    """
+    yaw = yaw_quat(quat).unsqueeze(-2)
+    local = quat_apply_inverse(yaw, body_p - p.unsqueeze(-2))
+    return local.flatten(-2)
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
@@ -271,8 +326,19 @@ class MDP:
         )
         self.gravity = default_q.new_tensor(GRAVITY)
 
-    def obs(self, p, quat, v, w, q, qd, a_prev, xi, frame=None) -> torch.Tensor:
-        """Noise-free proprioception. ``xi`` supplies the encoder offset."""
+    def needs_body_pose(self) -> bool:
+        """Whether observation terms read tracked-body poses from the state."""
+        return "body_pos" in self.obs_terms or "body_ori" in self.obs_terms or (
+            "anchor_ori" in self.obs_terms and self.anchor != self.kin.pelvis_index
+        )
+
+    def obs(self, state: WorldModelState, a_prev, xi, frame=None) -> torch.Tensor:
+        """Noise-free proprioception. ``xi`` supplies the encoder offset.
+
+        Body-dependent terms read ``state.body_pos`` / ``state.body_quat``. Callers
+        must fill those (simulator or ``WorldModel.step``); this method does not run FK.
+        """
+        p, quat, v, w, q, qd = state.root()
         measured = q + xi[..., 1:30]
         parts = {
             "joint_pos": measured - self.default_q,
@@ -282,16 +348,13 @@ class MDP:
             "projected_gravity": quat_apply_inverse(quat, self.gravity.expand_as(w)),
             "last_action": a_prev,
         }
-        need_fk = "body_pos" in self.obs_terms or "body_ori" in self.obs_terms or (
-            "anchor_ori" in self.obs_terms and self.anchor != self.kin.pelvis_index
-        )
-        body_p = body_quat = None
-        if need_fk:
-            body_p, body_quat, _, _ = self.bodies(p, quat, v, w, q, qd)
+        body_p, body_quat = state.body_pos, state.body_quat
+        if self.needs_body_pose() and (body_p is None or body_quat is None):
+            raise ValueError("Observation terms need state.body_pos and state.body_quat; fill them before obs.")
         if "anchor_ori" in self.obs_terms:
             if frame is None:
                 raise ValueError("The anchor_ori observation needs the reference frame.")
-            # Pelvis is the free-joint state. Any other anchor comes from the FK above.
+            # Pelvis is the free-joint state. Any other anchor comes from body_quat.
             if self.anchor == self.kin.pelvis_index:
                 robot_quat = quat
             else:
@@ -321,7 +384,13 @@ class MDP:
     def bodies(self, p, quat, v, w, q, qd):
         return self.kin.forward(p, quat, v, w, q, qd)
 
-    def reward(self, p, quat, v, w, q, qd, frame, action, a_prev, terms: bool = False):
+    def heading_bodies(self, p, quat, v, w, q, qd, body_p=None) -> torch.Tensor:
+        """Heading-frame tracked-body positions, ``(..., BODY_POS_DIM)``. Not a prediction target."""
+        if body_p is None:
+            body_p = self.bodies(p, quat, v, w, q, qd)[0]
+        return heading_body_pos(p, quat, body_p)
+
+    def reward(self, p, quat, v, w, q, qd, frame, action, a_prev, terms: bool = False, bodies=None):
         """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
 
         Action-rate and joint-limit are always the paper penalties
@@ -329,7 +398,10 @@ class MDP:
 
         With ``terms=True``, also return a name→tensor dict that sums to the reward.
         """
-        body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
+        if bodies is None:
+            body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
+        else:
+            body_p, body_quat, body_v, body_w = bodies
         ref_p = self.motion.body_p[frame]
         ref_quat = self.motion.body_quat[frame]
         ref_pos, ref_ori = _anchor_relative(body_p, body_quat, ref_p, ref_quat, self.anchor)
@@ -364,13 +436,13 @@ class MDP:
 
     def termination(self, p, quat, frame) -> torch.Tensor:
         height, tilt = self._errors(p, quat, frame)
-        return (height > 0.25) | (tilt > 0.8)
+        return (height > TERM_HEIGHT) | (tilt > TERM_TILT)
 
     def soft_termination(self, p, quat, frame, height_scale: float = 0.02, tilt_scale: float = 0.04) -> torch.Tensor:
         """Differentiable termination probability around the hard thresholds."""
         height, tilt = self._errors(p, quat, frame)
-        alive = (1.0 - torch.sigmoid((height - 0.25) / height_scale)) * (
-            1.0 - torch.sigmoid((tilt - 0.8) / tilt_scale)
+        alive = (1.0 - torch.sigmoid((height - TERM_HEIGHT) / height_scale)) * (
+            1.0 - torch.sigmoid((tilt - TERM_TILT) / tilt_scale)
         )
         return 1.0 - alive
 

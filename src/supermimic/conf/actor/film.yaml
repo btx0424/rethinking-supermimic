@@ -1,0 +1,5 @@
+# Proprioceptive trunk. The goal scales and shifts each hidden layer.
+# Select with `actor=film`.
+kind: film
+hidden: [512, 512, 512]
+norm: layer

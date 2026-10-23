@@ -8,8 +8,9 @@ from pathlib import Path
 import torch
 
 from .kinematics import compile_g1, make_kinematics
-from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
-from .motion import MotionLib
+from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS, TERM_HEIGHT, TERM_TILT
+from .motion import CONTROL_DT, MotionLib
+from .mdp import WorldModelState
 from .network import InputNorms, build_policy
 from .sim import TrackingSim
 
@@ -43,10 +44,15 @@ def evaluate(ckpt: Path, device: str) -> None:
     alive = torch.ones(n, dtype=torch.bool, device=device)
     returns = torch.zeros(n, device=device)
     failed = torch.zeros(n, dtype=torch.bool, device=device)
+    fail_step = torch.full((n,), -1, dtype=torch.long, device=device)
+    fail_height = torch.zeros(n, device=device)
+    fail_tilt = torch.zeros(n, device=device)
     lengths = (motion.clip_end - motion.clip_start - 1).clamp(min=1)
     while bool(alive.any()):
         p, quat, v, w, q, qd = sim.state()
-        obs = sim.mdp.obs(p, quat, v, w, q, qd, sim.a_prev, sim.xi, sim.f)
+        bodies = sim.tracked_bodies()
+        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+        obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
         fresh = sim.ep_step == 0
         obs_hist = torch.where(
             fresh[:, None, None],
@@ -57,13 +63,36 @@ def evaluate(ckpt: Path, device: str) -> None:
         with torch.no_grad():
             action = policy(obs_hist, goal, norms, deterministic=True)
         out = sim.step(action, auto_reset=False)
+        first = out["d"] & alive
+        if bool(first.any()):
+            p1, quat1, _, _, _, _ = sim.state()
+            height, tilt = sim.mdp._errors(p1, quat1, sim.f)
+            fail_step = torch.where(first, sim.ep_step, fail_step)
+            fail_height = torch.where(first, height, fail_height)
+            fail_tilt = torch.where(first, tilt, fail_tilt)
         returns = returns + out["r"] * alive.float()
-        failed = failed | (out["d"] & alive)
+        failed = failed | first
         alive = alive & ~out["done"]
     score = returns / (sim.mdp.max_step_reward * lengths.float())
     print(f"normalized return {float(score.mean()):.4f}  failed {int(failed.sum())}/{n}")
-    for name, value, fail in zip(motion.clip_names, score.tolist(), failed.tolist()):
-        print(f"  {name:28} {value:.3f}  {'fail' if fail else 'ok'}")
+    for name, value, fail, step, height, tilt in zip(
+        motion.clip_names,
+        score.tolist(),
+        failed.tolist(),
+        fail_step.tolist(),
+        fail_height.tolist(),
+        fail_tilt.tolist(),
+    ):
+        if not fail:
+            print(f"  {name:28} {value:.3f}  ok")
+            continue
+        parts = []
+        if height > TERM_HEIGHT:
+            parts.append(f"height {height:.3f} m > {TERM_HEIGHT:.2f}")
+        if tilt > TERM_TILT:
+            parts.append(f"tilt {tilt:.3f} > {TERM_TILT:.2f}")
+        cause = " and ".join(parts) if parts else "hard termination"
+        print(f"  {name:28} {value:.3f}  fail  {cause} at frame {step} ({step * CONTROL_DT:.2f} s)")
 
 
 def main() -> None:

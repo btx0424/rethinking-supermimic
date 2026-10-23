@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import NUM_J, STATE_DIM, XI_DIM
+from .mdp import N_BODY, N_CONTACT, NUM_J, STATE_DIM, XI_DIM
 
 
 class ReplayBuffer:
@@ -15,9 +15,13 @@ class ReplayBuffer:
         shape = (capacity, num_envs)
         self.s = torch.zeros(*shape, STATE_DIM, device=device)
         self.s1 = torch.zeros(*shape, STATE_DIM, device=device)
+        self.body_pos = torch.zeros(*shape, N_BODY, 3, device=device)
+        self.body_quat = torch.zeros(*shape, N_BODY, 4, device=device)
         self.a = torch.zeros(*shape, NUM_J, device=device)
         self.a_prev = torch.zeros(*shape, NUM_J, device=device)
         self.xi = torch.zeros(*shape, XI_DIM, device=device)
+        self.c = torch.zeros(*shape, N_CONTACT, device=device)
+        self.c1 = torch.zeros(*shape, N_CONTACT, device=device)
         self.f = torch.zeros(*shape, dtype=torch.long, device=device)
         self.ep = torch.full(shape, -1, dtype=torch.long, device=device)
         self.step = torch.zeros(*shape, dtype=torch.long, device=device)
@@ -28,9 +32,13 @@ class ReplayBuffer:
         i = self.ptr
         self.s[i] = batch["s"]
         self.s1[i] = batch["s1"]
+        self.body_pos[i] = batch["body_pos"]
+        self.body_quat[i] = batch["body_quat"]
         self.a[i] = batch["a"]
         self.a_prev[i] = batch["a_prev"]
         self.xi[i] = batch["xi"]
+        self.c[i] = batch["c"]
+        self.c1[i] = batch["c1"]
         self.f[i] = batch["f"]
         self.ep[i] = batch["ep"]
         self.step[i] = batch["step"]
@@ -80,9 +88,13 @@ class ReplayBuffer:
         return {
             "s": self.s[idx, env[:, None]],
             "s1": self.s1[idx, env[:, None]],
+            "body_pos": self.body_pos[idx, env[:, None]],
+            "body_quat": self.body_quat[idx, env[:, None]],
             "a": self.a[idx, env[:, None]],
             "a_prev": self.a_prev[idx, env[:, None]],
             "xi": self.xi[idx, env[:, None]],
+            "c": self.c[idx, env[:, None]],
+            "c1": self.c1[idx, env[:, None]],
             "f": self.f[idx, env[:, None]],
         }
 
@@ -108,10 +120,15 @@ class ReplayBuffer:
             raw[bad, col] = raw[bad, col + 1]
         return {
             "s": self.s[time, env],
+            "body_pos": self.body_pos[time, env],
+            "body_quat": self.body_quat[time, env],
             "a_prev": self.a_prev[time, env],
             "xi": self.xi[time, env],
+            "c": self.c[time, env],
             "f": self.f[time, env],
             "hist_s": self.s[raw, env[:, None]],
+            "hist_body_pos": self.body_pos[raw, env[:, None]],
+            "hist_body_quat": self.body_quat[raw, env[:, None]],
             "hist_a_prev": self.a_prev[raw, env[:, None]],
             "hist_xi": self.xi[raw, env[:, None]],
             "hist_f": self.f[raw, env[:, None]],

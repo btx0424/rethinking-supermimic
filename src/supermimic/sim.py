@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import warp as wp
 
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.managers.event_manager import RecomputeLevel
@@ -11,13 +12,21 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.string import resolve_expr
 
-from .kinematics import TorchKinematics
+from .kinematics import TRACKED_BODIES, TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
+from .mdp import MDP, N_CONTACT, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
 from .motion import BIN_FRAMES, MotionLib
 
 DECIMATION = 4
 MAX_EPISODE_STEPS = 500  # 10 s at 50 Hz.
+
+
+def _as_torch(value) -> torch.Tensor:
+    """Contact fields are tensor proxies in this mjlab build and warp arrays in others."""
+    tensor = getattr(value, "_tensor", value)
+    if isinstance(tensor, torch.Tensor):
+        return tensor
+    return wp.to_torch(value)
 
 
 class TrackingSim:
@@ -35,6 +44,10 @@ class TrackingSim:
         reward_style: str = "gaussian",
     ):
         self.device = device
+        # Keep the captured step graph's pool. A sync otherwise returns it to the
+        # driver, and the next launch fails once PyTorch has taken the memory.
+        if str(device).startswith("cuda"):
+            wp.set_mempool_release_threshold(device, 1.0)
         self.motion = motion
         self.num_envs = num_envs
         self.gamma = gamma
@@ -93,7 +106,17 @@ class TrackingSim:
         self._foot_ids = self.robot.indexing.geom_ids[foot_local]
         torso_local = self.robot.body_names.index("torso_link")
         self._torso_id = int(self.robot.indexing.body_ids[torso_local])
+        # mjlab body tensors follow robot.body_names. TRACKED_BODIES is the FK order.
+        missing = [name for name in TRACKED_BODIES if name not in self.robot.body_names]
+        if missing:
+            raise KeyError(f"mjlab G1 is missing tracked bodies: {missing}")
+        self._tracked_local = torch.tensor(
+            [self.robot.body_names.index(name) for name in TRACKED_BODIES],
+            dtype=torch.long,
+            device=device,
+        )
         self._terrain_ids = self.scene["terrain"].indexing.geom_ids
+        self._init_contact_index()
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
         self._default_ipos = self.sim.get_default_field("body_ipos").clone()
         self.G_max = max_step_reward(reward_style) / (1.0 - gamma)
@@ -119,6 +142,60 @@ class TrackingSim:
             self.reset(env_ids, frames)
         else:
             self.reset(env_ids)
+
+    def _init_contact_index(self) -> None:
+        """Map a model geom to a tracked-body slot, and flag terrain geoms."""
+        mj = self.sim.mj_model
+        body_of_geom = torch.tensor(mj.geom_bodyid, device=self.device, dtype=torch.long)
+        body_slot = torch.full((mj.nbody,), -1, device=self.device, dtype=torch.long)
+        for slot, name in enumerate(TRACKED_BODIES):
+            local = self.robot.body_names.index(name)
+            body_slot[int(self.robot.indexing.body_ids[local])] = slot
+        self._geom_tracked = body_slot[body_of_geom]
+        terrain = torch.zeros(mj.ngeom, dtype=torch.bool, device=self.device)
+        terrain[self._terrain_ids] = True
+        self._terrain_geom = terrain
+
+    def ground_contact(self) -> torch.Tensor:
+        """Per-env ground-contact bits for the tracked bodies, shape ``(N, N_CONTACT)``.
+
+        A body is in contact when one of its geoms is touching the terrain.
+        Inactive contact slots have a huge distance and are ignored.
+        """
+        contact = self.sim.data.contact
+        geom = _as_torch(contact.geom).long()
+        dist = _as_torch(contact.dist)
+        margin = _as_torch(contact.includemargin)
+        world = _as_torch(contact.worldid).long()
+        if geom.ndim == 1:
+            geom = geom.view(-1, 2)
+        valid_geom = (geom[:, 0] >= 0) & (geom[:, 1] >= 0)
+        active = (dist < margin) & valid_geom & (world >= 0) & (world < self.num_envs)
+        g0 = geom[:, 0].clamp(min=0)
+        g1 = geom[:, 1].clamp(min=0)
+        terrain0 = self._terrain_geom[g0]
+        terrain1 = self._terrain_geom[g1]
+        ground = active & (terrain0 ^ terrain1)
+        robot = torch.where(terrain0, g1, g0)
+        slot = self._geom_tracked[robot]
+        ground = ground & (slot >= 0)
+        bits = dist.new_zeros(self.num_envs, N_CONTACT)
+        if bool(ground.any()):
+            bits[world[ground], slot[ground]] = 1
+        return bits
+
+    def tracked_bodies(self):
+        """The 14 reward bodies, in ``TRACKED_BODIES`` order, from the MuJoCo state.
+
+        Positions have the environment origin removed, matching ``MDP.bodies``.
+        Link pose and the link-origin twist, not the center-of-mass pose.
+        """
+        idx = self._tracked_local
+        pose = self.robot.data.body_link_pose_w[:, idx]
+        pos = pose[..., :3] - self.scene.env_origins[:, None, :]
+        quat = pose[..., 3:7]
+        vel = self.robot.data.body_link_vel_w[:, idx]
+        return pos, quat, vel[..., :3], vel[..., 3:6]
 
     def state(self):
         data = self.robot.data
@@ -156,6 +233,8 @@ class TrackingSim:
     def step(self, action: torch.Tensor, auto_reset: bool = True) -> dict[str, torch.Tensor]:
         p, quat, v, w, q, qd = self.state()
         s = flatten_state(p, quat, v, w, q, qd)
+        body_pos, body_quat, _, _ = self.tracked_bodies()
+        contact = self.ground_contact()
         a_prev = self.a_prev
         f = self.f
         xi = self.xi
@@ -168,10 +247,22 @@ class TrackingSim:
             self.sim.step()
         self.sim.forward()
         p1, quat1, v1, w1, q1, qd1 = self.state()
+        bodies1 = self.tracked_bodies()
+        contact_next = self.ground_contact()
         last = self.motion.clip_end[self.motion.clip_id[f]] - 1
         f_next = torch.minimum(f + 1, last)
         reward, terms = self.mdp.reward(
-            p1, quat1, v1, w1, q1, qd1, f_next, action, a_prev, terms=True
+            p1,
+            quat1,
+            v1,
+            w1,
+            q1,
+            qd1,
+            f_next,
+            action,
+            a_prev,
+            terms=True,
+            bodies=bodies1,
         )
         hard = self.mdp.termination(p1, quat1, f_next)
         self.ep_step += 1
@@ -188,9 +279,13 @@ class TrackingSim:
         out = {
             "s": s,
             "s1": flatten_state(p1, quat1, v1, w1, q1, qd1),
+            "body_pos": body_pos.detach(),
+            "body_quat": body_quat.detach(),
             "a": action.detach(),
             "a_prev": a_prev.detach().clone(),
             "xi": xi.clone(),
+            "c": contact.detach(),
+            "c1": contact_next.detach(),
             "f": f.clone(),
             "ep": ep,
             "step": step_id,

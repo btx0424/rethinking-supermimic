@@ -63,6 +63,7 @@ def main(cfg: DictConfig) -> None:
         fk=str(cfg.fk),
         adv_coef=float(cfg.adv_coef),
         reward_coef=float(cfg.reward_coef),
+        contact_coef=float(cfg.contact_coef),
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),
