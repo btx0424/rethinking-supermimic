@@ -287,9 +287,31 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int, norm: str = "layer"):
+    """Independent value heads. Callers average them only for the policy bootstrap."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        norm: str = "layer",
+        ensemble: int | None = None,
+    ):
         super().__init__()
-        self.net = MLP(in_dim, [512, 256, 256], 1, norm=norm)
+        n = 2 if ensemble is None else int(ensemble)
+        if n < 1:
+            raise ValueError(f"critic ensemble must be >= 1, got {n}")
+        self.ensemble = n
+        self.heads = nn.ModuleList(MLP(in_dim, [512, 256, 256], 1, norm=norm) for _ in range(n))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        """Values with the ensemble on the last axis, shape ``(*, ensemble)``."""
+        return torch.stack([head(x).squeeze(-1) for head in self.heads], dim=-1)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # Checkpoints from the single critic stored one MLP under ``net``.
+        if any(key.startswith("net.") for key in state_dict) and not any(
+            key.startswith("heads.") for key in state_dict
+        ):
+            state_dict = {
+                ("heads.0." + key.removeprefix("net.")): value for key, value in state_dict.items()
+            }
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)

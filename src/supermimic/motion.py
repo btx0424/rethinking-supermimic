@@ -183,13 +183,17 @@ class MotionLib:
         self._goal_ready = True
 
     def future_frames(self, f: torch.Tensor, k: int) -> torch.Tensor:
-        steps = torch.arange(k, device=f.device)
+        """Frames ``f+1`` through ``f+k``, clamped to each clip's last frame."""
+        steps = torch.arange(1, k + 1, device=f.device)
         future = f[:, None] + steps
         last = self.clip_end[self.clip_id[f]] - 1
         return torch.minimum(future, last[:, None])
 
     def goal(self, f: torch.Tensor, k: int) -> torch.Tensor:
-        """K future reference frames in the current reference yaw frame. Shape (B, K * 73)."""
+        """Frames f+1..f+k in the current reference yaw frame. Shape (B, K * 73).
+
+        Joint velocity is scaled by 0.1 so it does not swamp the root displacement.
+        """
         if not self._goal_ready:
             self._prepare_goal()
         future = self.future_frames(f, k)
@@ -201,7 +205,14 @@ class MotionLib:
         relative = quat_mul(quat_inv(yaw).unsqueeze(1).expand_as(self.root_quat[future]), self.root_quat[future])
         rot6 = mat_to_6d(quat_to_mat(relative))
         feats = torch.cat(
-            (dp, rot6, self.root_v_local[future], self.root_w_local[future], self.q[future], self.qd[future]),
+            (
+                dp,
+                rot6,
+                self.root_v_local[future],
+                self.root_w_local[future],
+                self.q[future],
+                self.qd[future] * 0.1,
+            ),
             dim=-1,
         )
         return feats.reshape(f.shape[0], -1)

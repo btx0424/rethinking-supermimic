@@ -34,9 +34,13 @@ OBS_SPEC = (
     ("joint_pos", NUM_J, 0.01),
     ("joint_vel", NUM_J, 0.5),
     ("base_ang_vel", 3, 0.2),
+    ("base_lin_vel", 3, 0.2),
     ("projected_gravity", 3, 0.05),
     ("last_action", NUM_J, 0.0),
     ("anchor_ori", 6, 0.05),
+    # Tracking error of the reward bodies, not their world pose.
+    ("body_pos", len(TRACKED_BODIES) * 3, 0.01),
+    ("body_ori", len(TRACKED_BODIES) * 6, 0.05),
 )
 PAPER_OBS_TERMS = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
 # Per-component scale of a state error. Eq. 1 is an unweighted square, which is
@@ -274,20 +278,41 @@ class MDP:
             "joint_pos": measured - self.default_q,
             "joint_vel": qd,
             "base_ang_vel": quat_apply_inverse(quat, w),
+            "base_lin_vel": quat_apply_inverse(quat, v),
             "projected_gravity": quat_apply_inverse(quat, self.gravity.expand_as(w)),
             "last_action": a_prev,
         }
+        need_fk = "body_pos" in self.obs_terms or "body_ori" in self.obs_terms or (
+            "anchor_ori" in self.obs_terms and self.anchor != self.kin.pelvis_index
+        )
+        body_p = body_quat = None
+        if need_fk:
+            body_p, body_quat, _, _ = self.bodies(p, quat, v, w, q, qd)
         if "anchor_ori" in self.obs_terms:
             if frame is None:
                 raise ValueError("The anchor_ori observation needs the reference frame.")
-            # Pelvis is the free-joint state — no FK. Torso (default) needs one.
+            # Pelvis is the free-joint state. Any other anchor comes from the FK above.
             if self.anchor == self.kin.pelvis_index:
                 robot_quat = quat
             else:
-                robot_quat = self.bodies(p, quat, v, w, q, qd)[1][..., self.anchor, :]
+                robot_quat = body_quat[..., self.anchor, :]
             ref_quat = self.motion.body_quat[frame][..., self.anchor, :]
             relative = quat_mul(quat_inv(robot_quat), ref_quat)
             parts["anchor_ori"] = mat_to_6d(quat_to_mat(relative))
+        if "body_pos" in self.obs_terms or "body_ori" in self.obs_terms:
+            if frame is None:
+                raise ValueError("The body_pos and body_ori observations need the reference frame.")
+            # Same 14 bodies and the same anchor alignment as the body tracking reward.
+            ref_pos, ref_ori = _anchor_relative(
+                body_p, body_quat, self.motion.body_p[frame], self.motion.body_quat[frame], self.anchor
+            )
+            if "body_pos" in self.obs_terms:
+                yaw = yaw_quat(quat)
+                error = quat_apply_inverse(yaw.unsqueeze(-2), ref_pos - body_p)
+                parts["body_pos"] = error.flatten(-2)
+            if "body_ori" in self.obs_terms:
+                relative = quat_mul(quat_inv(body_quat), ref_ori)
+                parts["body_ori"] = mat_to_6d(quat_to_mat(relative)).flatten(-2)
         return torch.cat([parts[name] for name in self.obs_terms], dim=-1)
 
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:

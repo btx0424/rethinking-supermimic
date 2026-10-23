@@ -198,7 +198,11 @@ class WarpKinematics:
         if scratch is not self._nograd:
             scratch.busy = False
 
+    @torch.compiler.disable
     def forward(self, p, quat, v, w, q, qd):
+        # Eager only. Dynamo cannot trace Warp's ctypes kernel launch, and this
+        # runs inside the compiled imagination step once body observations need FK.
+        # Autograd is unchanged: the tape still backprops into the caller.
         # Match TorchKinematics: the free-joint quaternion is normalized in torch
         # so its gradient stays on the autograd graph.
         return self._fn.apply(p, quat_normalize(quat), v, w, q, qd)

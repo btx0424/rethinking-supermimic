@@ -57,6 +57,9 @@ class TrainConfig:
     action_noise: float = 0.1
     critic_epochs: int = 5
     critic_minibatches: int = 4
+    # Independent value heads. GAE and the value loss stay per head.
+    # The policy bootstrap uses their mean. 1 is the single critic.
+    critic_ensemble: int = 2
     lr_decay_iters: int = 250_000
     wm_norm: str = "none"
     wm_residual: bool | float = 0.0
@@ -475,6 +478,7 @@ def imagine_horizon(
     weighted = discount[:, None] * survival
     step_return = weighted * reward
     returns = step_return.sum(0)
+    # Heads stay separate through GAE. The actor follows the mean value.
     bootstrap = gamma**horizon * alive[-1] * critic(
         norms.critic(
             invariant_features(*states[-1]),
@@ -482,7 +486,7 @@ def imagine_horizon(
             xi_n,
             mdp.privileged(*states[-1], frames[-1]),
         )
-    )
+    ).mean(-1)
     term_loss = -(weighted * term_r).sum(dim=1).mean(dim=-1)
     policy_loss = -(returns + bootstrap).mean()
     for action in actions:
@@ -573,7 +577,9 @@ class Trainer:
             norm=cfg.policy_norm,
             kind=cfg.policy_kind,
         ).to(self.device)
-        self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM).to(self.device)
+        self.critic = Critic(
+            INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM, ensemble=cfg.critic_ensemble
+        ).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
         from .optim import build_optimizer
 
@@ -1161,17 +1167,21 @@ class Trainer:
         features = self.norms.critic(
             invariant_features(*flat), batch["goals"], normalize_xi(batch["xi"]), priv
         )
+        ensemble = self.critic.ensemble
         with torch.no_grad():
-            values = self.critic(features).view(horizon + 1, n)
+            # One λ-return per head, from that head's own bootstrap.
+            values = self.critic(features).view(horizon + 1, n, ensemble)
             target = values[-1]
             targets = []
+            reward = batch["reward"].unsqueeze(-1)
+            cont = (1.0 - batch["done"]).unsqueeze(-1)
             for t in range(horizon - 1, -1, -1):
                 nxt = (1.0 - cfg.lam) * values[t + 1] + cfg.lam * target
-                target = batch["reward"][t] + cfg.gamma * (1.0 - batch["done"][t]) * nxt
+                target = reward[t] + cfg.gamma * cont[t] * nxt
                 targets.append(target)
             targets = torch.stack(targets[::-1])
         pred_in = features.view(horizon + 1, n, -1)[:-1].reshape(-1, features.shape[-1])
-        target_flat = targets.reshape(-1)
+        target_flat = targets.reshape(-1, ensemble)
         count = pred_in.shape[0]
         minibatch = count // cfg.critic_minibatches
         last = pred_in.new_zeros(())
@@ -1180,10 +1190,15 @@ class Trainer:
             order = torch.randperm(count, device=pred_in.device)
             for i in range(cfg.critic_minibatches):
                 idx = order[i * minibatch : (i + 1) * minibatch]
-                last = (self.critic(pred_in[idx]) - target_flat[idx]).square().mean()
+                pred = self.critic(pred_in[idx])
+                last = (pred - target_flat[idx]).square().mean()
                 self.opt_v.zero_grad(set_to_none=True)
                 last.backward()
-                norms.append(_clip_grads(self.critic.parameters(), cfg.grad_clip_norm))
+                # Clip each head on its own so one head's norm does not rescale the other.
+                head_norms = [
+                    _clip_grads(head.parameters(), cfg.grad_clip_norm) for head in self.critic.heads
+                ]
+                norms.append(sum(head_norms) / len(head_norms))
                 self.opt_v.step()
         return last.detach(), _mean(norms)
 

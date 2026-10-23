@@ -230,7 +230,7 @@ def _loss_from_step(step, bundle, horizon: int):
             xi_n,
             mdp.privileged(*states[-1], frames[-1]),
         )
-    )
+    ).mean(-1)
     return -(returns + bootstrap).mean()
 
 

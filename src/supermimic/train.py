@@ -38,6 +38,7 @@ def main(cfg: DictConfig) -> None:
         action_noise=float(cfg.action_noise),
         critic_epochs=int(cfg.critic_epochs),
         critic_minibatches=int(cfg.critic_minibatches),
+        critic_ensemble=int(cfg.critic_ensemble),
         lr_decay_iters=int(cfg.lr_decay_iters),
         wm_norm=str(cfg.wm_norm),
         wm_residual=bool(cfg.wm_residual),
