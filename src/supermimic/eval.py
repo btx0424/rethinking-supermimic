@@ -10,7 +10,7 @@ import torch
 from .kinematics import compile_g1, make_kinematics
 from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
 from .motion import MotionLib
-from .network import InputNorms, Policy, policy_widths
+from .network import InputNorms, build_policy
 from .sim import TrackingSim
 
 
@@ -34,16 +34,7 @@ def evaluate(ckpt: Path, device: str) -> None:
         obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
         reward_style=str(saved_cfg.get("reward_style", "gaussian")),
     )
-    policy = Policy(
-        sim.mdp.obs_dim,
-        GOAL_DIM,
-        HIST,
-        z_dim=int(saved_cfg.get("policy_z_dim", 32)),
-        stochastic=bool(saved_cfg.get("stochastic_actor", False)),
-        encoder_hidden=policy_widths(saved_cfg, "policy_encoder"),
-        decoder_hidden=policy_widths(saved_cfg, "policy_decoder"),
-        norm=str(saved_cfg.get("policy_norm", "none")),
-    ).to(device)
+    policy = build_policy(sim.mdp.obs_dim, GOAL_DIM, HIST, saved_cfg).to(device)
     policy.load_state_dict(saved["pi"])
     norms = InputNorms(sim.mdp.obs_dim).to(device)
     norms.load_state_dict(saved["norms"])

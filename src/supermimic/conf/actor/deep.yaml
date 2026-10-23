@@ -1,4 +1,5 @@
 # Paper Table A.4. Select with `actor=deep` (the default).
+kind: split
 z_dim: 32
 encoder: [2048, 1024, 512, 256]
 decoder: [2048, 1024, 512, 256]

@@ -1,4 +1,5 @@
 # Two hidden layers. Select with `actor=shallow`.
+kind: split
 z_dim: 32
 encoder: [256, 256]
 decoder: [512, 256, 256]

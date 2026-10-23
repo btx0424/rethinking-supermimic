@@ -163,8 +163,10 @@ def _imagine_step(
     """One imagination step: actor, world model, next observation and goal."""
     from supermimic.mdp import GOAL_FRAMES
 
+    from supermimic.network import WorldModelState
+
     action = policy(obs_hist, goal, norms, deterministic=deterministic)
-    p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
+    p, quat, v, w, q, qd = wm.step(WorldModelState(p, quat, v, w, q, qd), action, xi_n, norms)
     frame = frame + 1
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
     obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))

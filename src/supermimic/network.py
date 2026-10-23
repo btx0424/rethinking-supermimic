@@ -10,6 +10,7 @@ import math
 
 import torch
 import torch.nn as nn
+from typing import NamedTuple
 
 from .math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
 from .mdp import GOAL_DIM, INV_DIM, NUM_J, PRIV_DIM, XI_DIM, invariant_features
@@ -148,6 +149,23 @@ class MLP(nn.Module):
             return self.head(self.blocks(x)).float()
 
 
+class WorldModelState(NamedTuple):
+    """Root pose and twist in the world frame, plus the 29 hinge joints."""
+
+    p: torch.Tensor
+    """World position, (..., 3)."""
+    quat: torch.Tensor
+    """World orientation as wxyz, (..., 4)."""
+    v: torch.Tensor
+    """World linear velocity, (..., 3)."""
+    w: torch.Tensor
+    """World angular velocity, (..., 3)."""
+    q: torch.Tensor
+    """Joint positions, (..., 29)."""
+    qd: torch.Tensor
+    """Joint velocities, (..., 29)."""
+
+
 class WorldModel(nn.Module):
     """Deterministic dynamics. The network predicts a frame-local increment."""
 
@@ -161,19 +179,27 @@ class WorldModel(nn.Module):
         nn.init.zeros_(self.net.head.weight)
         nn.init.zeros_(self.net.head.bias)
 
-    def step(self, p, quat, v, w, q, qd, action, xi_n, norms: InputNorms):
+    def step(self, state: WorldModelState, action: torch.Tensor, xi_n: torch.Tensor, norms: InputNorms) -> WorldModelState:
+        p, quat, v, w, q, qd = state
         feat = norms.wm(invariant_features(p, quat, v, w, q, qd), action, xi_n)
         dp, drot, dv, dw, dq, dqd = self.net(feat).split((3, 3, 3, 3, NUM_J, NUM_J), dim=-1)
         yaw = yaw_quat(quat)
-        p1 = p + quat_apply(yaw, dp)
-        quat1 = quat_normalize(quat_mul(quat, rotvec_to_quat(drot)))
-        v1 = v + quat_apply(quat, dv)
-        w1 = w + quat_apply(quat, dw)
-        return p1, quat1, v1, w1, q + dq, qd + dqd
+        return WorldModelState(
+            p + quat_apply(yaw, dp),
+            quat_normalize(quat_mul(quat, rotvec_to_quat(drot))),
+            v + quat_apply(quat, dv),
+            w + quat_apply(quat, dw),
+            q + dq,
+            qd + dqd,
+        )
 
 
 # Table A.4 encoder and decoder widths. Depth is the length of the list.
 PAPER_POLICY_HIDDEN = (2048, 1024, 512, 256)
+
+
+# Single trunk: goal and proprioceptive history concatenated. No tanh code.
+TRUNK_POLICY_HIDDEN = (512, 512, 512)
 
 
 def policy_widths(saved: dict, key: str) -> list[int]:
@@ -181,8 +207,31 @@ def policy_widths(saved: dict, key: str) -> list[int]:
     return [int(width) for width in saved.get(key, PAPER_POLICY_HIDDEN)]
 
 
+def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict) -> Policy:
+    """Rebuild a policy from a checkpoint config. Missing ``policy_kind`` is the split actor."""
+    kind = str(saved.get("policy_kind", "split"))
+    norm = str(saved.get("policy_norm", "none"))
+    stochastic = bool(saved.get("stochastic_actor", False))
+    if kind == "trunk":
+        hidden = [int(width) for width in saved.get("policy_trunk", TRUNK_POLICY_HIDDEN)]
+        return Policy(
+            obs_dim, goal_dim, hist, stochastic=stochastic, norm=norm, kind="trunk", trunk_hidden=hidden
+        )
+    return Policy(
+        obs_dim,
+        goal_dim,
+        hist,
+        z_dim=int(saved.get("policy_z_dim", 32)),
+        stochastic=stochastic,
+        encoder_hidden=policy_widths(saved, "policy_encoder"),
+        decoder_hidden=policy_widths(saved, "policy_decoder"),
+        norm=norm,
+        kind="split",
+    )
+
+
 class Policy(nn.Module):
-    """Deterministic encoder-decoder. ``stochastic`` adds a state-independent Gaussian."""
+    """Actor. ``split`` is the tanh encoder plus decoder. ``trunk`` is one MLP on goal and history."""
 
     def __init__(
         self,
@@ -193,21 +242,39 @@ class Policy(nn.Module):
         stochastic: bool = False,
         encoder_hidden: list[int] | tuple[int, ...] = PAPER_POLICY_HIDDEN,
         decoder_hidden: list[int] | tuple[int, ...] = PAPER_POLICY_HIDDEN,
+        trunk_hidden: list[int] | tuple[int, ...] = TRUNK_POLICY_HIDDEN,
         norm: str = "none",
+        kind: str = "split",
     ):
         super().__init__()
+        if kind not in ("split", "trunk"):
+            raise ValueError(f"Policy kind must be 'split' or 'trunk', got {kind!r}.")
         self.hist = hist
         self.stochastic = stochastic
-        self.encoder = MLP(goal_dim, list(encoder_hidden), z_dim, norm)
-        self.decoder = MLP(z_dim + obs_dim * hist, list(decoder_hidden), NUM_J, norm)
-        nn.init.zeros_(self.decoder.head.bias)
-        with torch.no_grad():
-            self.decoder.head.weight.mul_(0.01)
+        self.kind = kind
+        if kind == "trunk":
+            self.trunk = MLP(goal_dim + obs_dim * hist, list(trunk_hidden), NUM_J, norm)
+            nn.init.zeros_(self.trunk.head.bias)
+            with torch.no_grad():
+                self.trunk.head.weight.mul_(0.01)
+            self.encoder = None
+            self.decoder = None
+        else:
+            self.encoder = MLP(goal_dim, list(encoder_hidden), z_dim, norm)
+            self.decoder = MLP(z_dim + obs_dim * hist, list(decoder_hidden), NUM_J, norm)
+            nn.init.zeros_(self.decoder.head.bias)
+            with torch.no_grad():
+                self.decoder.head.weight.mul_(0.01)
+            self.trunk = None
         self.log_std = nn.Parameter(torch.full((NUM_J,), -1.0)) if stochastic else None
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, norms: InputNorms, deterministic: bool = True) -> torch.Tensor:
-        z = torch.tanh(self.encoder(norms.goal(goal)))
-        mean = self.decoder(torch.cat((z, norms.obs(obs_hist).flatten(-2)), dim=-1))
+        obs = norms.obs(obs_hist).flatten(-2)
+        if self.trunk is not None:
+            mean = self.trunk(torch.cat((norms.goal(goal), obs), dim=-1))
+        else:
+            z = torch.tanh(self.encoder(norms.goal(goal)))
+            mean = self.decoder(torch.cat((z, obs), dim=-1))
         if self.log_std is not None and not deterministic:
             return mean + self.log_std.exp() * torch.randn_like(mean)
         return mean

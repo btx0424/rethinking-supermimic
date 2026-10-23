@@ -32,7 +32,7 @@ from .mdp import (
     unflatten_state,
 )
 from . import network
-from .network import Critic, InputNorms, MLP, Policy, WorldModel
+from .network import Critic, InputNorms, MLP, Policy, WorldModel, WorldModelState
 from .reward_norm import RewardNormalizer
 
 
@@ -49,6 +49,8 @@ class TrainConfig:
     pi_batch: int = 4096
     wm_lr: float = 2e-4
     pi_lr: float = 5e-4
+    # Actor stays at 0 until the world model has a usable 8-step error (~200 iters).
+    pi_warmup: int = 250
     v_lr: float = 2e-4
     gamma: float = 0.99
     lam: float = 0.95
@@ -65,6 +67,9 @@ class TrainConfig:
     policy_decoder: tuple[int, ...] = (2048, 1024, 512, 256)
     # Encoder and decoder MLP norm: none, layer, or rms.
     policy_norm: str = "none"
+    # ``split`` is the tanh encoder-decoder. ``trunk`` is one MLP on goal and history.
+    policy_kind: str = "split"
+    policy_trunk: tuple[int, ...] = (512, 512, 512)
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -127,6 +132,13 @@ def lr_at(iteration: int, base: float, decay_iters: int) -> float:
         return base * 0.03
     cosine = 0.5 * (1.0 + math.cos(math.pi * iteration / decay_iters))
     return base * (0.03 + 0.97 * cosine)
+
+
+def pi_lr_at(iteration: int, base: float, decay_iters: int, warmup: int) -> float:
+    """Linear warmup from 0, then the same cosine decay as the other optimizers."""
+    if warmup > 0 and iteration < warmup:
+        return base * iteration / warmup
+    return lr_at(iteration, base, decay_iters)
 
 
 @contextmanager
@@ -324,17 +336,17 @@ def world_model_window(
     ``(K, B, STATE)``. Predicted states stay on the graph when ``detach_pred`` is
     false so the generator loss can train the world model. The K loop is unrolled.
     """
-    p, quat, v, w, q, qd = unflatten_state(s[:, 0])
+    state = WorldModelState(*unflatten_state(s[:, 0]))
     xi_n = normalize_xi(xi[:, 0])
     errors = []
     starts = []
     preds = []
     for j in range(actions.shape[1]):
-        starts.append(torch.cat((p, quat, v, w, q, qd), dim=-1))
-        p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, actions[:, j], xi_n, norms)
+        starts.append(torch.cat(state, dim=-1))
+        state = wm.step(state, actions[:, j], xi_n, norms)
         true = unflatten_state(s1[:, j])
-        errors.append(local_state_error(*true, p, quat, v, w, q, qd))
-        preds.append(torch.cat((p, quat, v, w, q, qd), dim=-1))
+        errors.append(local_state_error(*true, *state))
+        preds.append(torch.cat(state, dim=-1))
     pred = torch.stack(preds, dim=0)
     if detach_pred:
         pred = pred.detach()
@@ -362,7 +374,7 @@ def imagine_step(
 ):
     """One imagination step. This is the compiled policy graph; the horizon loop stays eager."""
     action = policy(obs_hist, goal, norms, deterministic=deterministic)
-    p, quat, v, w, q, qd = wm.step(p, quat, v, w, q, qd, action, xi_n, norms)
+    p, quat, v, w, q, qd = wm.step(WorldModelState(p, quat, v, w, q, qd), action, xi_n, norms)
     frame = frame + 1
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
     obs = mdp.add_noise(mdp.obs(p, quat, v, w, q, qd, action, xi, frame))
@@ -557,7 +569,9 @@ class Trainer:
             stochastic=cfg.stochastic_actor,
             encoder_hidden=cfg.policy_encoder,
             decoder_hidden=cfg.policy_decoder,
+            trunk_hidden=cfg.policy_trunk,
             norm=cfg.policy_norm,
+            kind=cfg.policy_kind,
         ).to(self.device)
         self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
@@ -643,7 +657,7 @@ class Trainer:
         grad_r_cols = ",".join(f"grad_r_{n}" for n in REWARD_TERM_NAMES)
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,imag_score,imag_survival,"
-            "sim_score,ep_score,term_frac,it_per_s,lr,entropy,"
+            "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
             "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,"
@@ -663,14 +677,14 @@ class Trainer:
     def _step(self, iteration: int) -> None:
         cfg = self.cfg
         schedules = (
-            (self.opt_wm, cfg.wm_lr),
-            (self.opt_pi, cfg.pi_lr),
-            (self.opt_v, cfg.v_lr),
-            (self.opt_disc, cfg.wm_lr),
+            (self.opt_wm, lr_at(iteration, cfg.wm_lr, cfg.lr_decay_iters)),
+            (self.opt_pi, pi_lr_at(iteration, cfg.pi_lr, cfg.lr_decay_iters, cfg.pi_warmup)),
+            (self.opt_v, lr_at(iteration, cfg.v_lr, cfg.lr_decay_iters)),
+            (self.opt_disc, lr_at(iteration, cfg.wm_lr, cfg.lr_decay_iters)),
         )
-        lr = lr_at(iteration, cfg.wm_lr, cfg.lr_decay_iters)
-        for opt, base in schedules:
-            group_lr = lr_at(iteration, base, cfg.lr_decay_iters)
+        lr = schedules[0][1]
+        pi_lr = schedules[1][1]
+        for opt, group_lr in schedules:
             for group in opt.param_groups:
                 group["lr"] = group_lr
         self.step_acc += 1.0 / cfg.utd
@@ -731,7 +745,7 @@ class Trainer:
             self.agg["imag_terms"][name].append(value)
 
         if (iteration + 1) % cfg.log_every == 0:
-            self._log(iteration + 1, lr)
+            self._log(iteration + 1, lr, pi_lr)
         if (iteration + 1) % cfg.ckpt_every == 0 or iteration + 1 == cfg.iterations:
             self.save_checkpoint(iteration + 1)
 
@@ -1053,8 +1067,12 @@ class Trainer:
         """
         if start is None:
             start = self.sample_policy_starts()
-        encoder = [p for p in self.policy.encoder.parameters() if p.requires_grad]
-        decoder = [p for p in self.policy.decoder.parameters() if p.requires_grad]
+        if self.policy.encoder is None:
+            encoder = []
+            decoder = [p for p in self.policy.trunk.parameters() if p.requires_grad]
+        else:
+            encoder = [p for p in self.policy.encoder.parameters() if p.requires_grad]
+            decoder = [p for p in self.policy.decoder.parameters() if p.requires_grad]
         extra = [self.policy.log_std] if self.policy.log_std is not None else []
         params = encoder + decoder + extra
         n_enc = len(encoder)
@@ -1169,7 +1187,7 @@ class Trainer:
                 self.opt_v.step()
         return last.detach(), _mean(norms)
 
-    def _log(self, iteration: int, lr: float) -> None:
+    def _log(self, iteration: int, lr: float, pi_lr: float) -> None:
         cfg = self.cfg
         now = time.time()
         term = sum(self.stats["term"]) / max(sum(self.stats["done_n"]), 1.0)
@@ -1201,6 +1219,7 @@ class Trainer:
             term,
             cfg.log_every / (now - self.logged),
             lr,
+            pi_lr,
             entropy,
         ]
         for name in REWARD_TERM_NAMES:
@@ -1246,6 +1265,7 @@ class Trainer:
             "train/term_frac": term,
             "train/it_per_s": row[11],
             "train/lr": lr,
+            "train/pi_lr": pi_lr,
             "grad/wm": gn_wm,
             "grad/pi": gn_pi,
             "grad/v": gn_v,
@@ -1286,7 +1306,7 @@ class Trainer:
             f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
             f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
-            f"{ent_s} {row[11]:.2f} it/s | "
+            f"{ent_s} {row[11]:.2f} it/s | pi_lr {pi_lr:.2e} | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
             f"D loss {disc_loss:.3f} real {disc_real:.2f} fake {disc_fake:.2f} acc {disc_acc:.2f} | "

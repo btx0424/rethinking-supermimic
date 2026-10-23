@@ -40,6 +40,8 @@ wm_batch: 2048
 pi_batch: 4096
 wm_lr: 2.0e-4
 pi_lr: 5.0e-4
+# Actor learning rate ramps 0 → pi_lr, then joins the cosine decay.
+pi_warmup: 50
 v_lr: 2.0e-4
 # adam | muon. Muon on hidden matrices of the world model and the policy.
 # First Linear, output heads, and the critic stay Adam.
