@@ -104,17 +104,23 @@ class GhostRobot:
                 lod="off",
             )
             self.handles.append((body_id, handle))
+        self.server = server
 
     def update(self, xpos: np.ndarray, xquat: np.ndarray) -> None:
-        for body_id, handle in self.handles:
-            handle.batched_positions = xpos[body_id : body_id + 1]
-            handle.batched_wxyzs = xquat[body_id : body_id + 1]
+        # One websocket payload for every body. Per-handle writes each become
+        # their own packet, which stalls an SSH-forwarded viewer.
+        with self.server.atomic():
+            for body_id, handle in self.handles:
+                handle.batched_positions = xpos[body_id : body_id + 1]
+                handle.batched_wxyzs = xquat[body_id : body_id + 1]
+            self.server.flush()
 
 
 def play(
     port: int = 8080,
     ckpt: Path | None = None,
     device: str = "cuda",
+    hz: float = 30.0,
 ) -> None:
     motion = MotionLib.load(device="cpu")
     model, joint_names = compile_g1()
@@ -205,7 +211,7 @@ def play(
             else "**reference** only (pass `--ckpt` to overlay tracking)"
         )
 
-    state = {"clip": 0, "need_reset": True}
+    state = {"clip": 0, "need_reset": True, "frame": 0}
 
     def refresh_info(clip: int) -> None:
         length = _clip_length(motion, clip)
@@ -280,12 +286,28 @@ def play(
 
     refresh_info(0)
     push_scene(reference_pose(0, 0), None)
-    print(f"Viewer at http://localhost:{port}", flush=True)
+    print(f"Viewer at http://localhost:{port} ({hz:g} Hz)", flush=True)
     if ckpt is not None:
         print(f"Policy checkpoint: {ckpt}", flush=True)
 
+    if hz <= 0:
+        raise ValueError(f"hz must be positive, got {hz}.")
+    view_dt = 1.0 / hz
     accumulator = 0.0
+    view_acc = 0.0
     last = time.perf_counter()
+    # Republishing a held pose every loop tick is what saturates an SSH tunnel.
+    shown: dict[str, tuple[int, int] | None] = {"key": None}
+
+    def publish(clip_i: int, local: int, solid, ghost_pose, force: bool = False) -> None:
+        key = (clip_i, local)
+        if not force and shown["key"] == key:
+            return
+        if int(frame_slider.value) != local:
+            frame_slider.value = local
+        push_scene(solid, ghost_pose)
+        shown["key"] = key
+
     try:
         while True:
             now = time.perf_counter()
@@ -294,18 +316,29 @@ def play(
             clip = state["clip"]
             length = _clip_length(motion, clip)
 
+            view_acc += dt
+            draw = view_acc >= view_dt
+            if draw:
+                view_acc -= view_dt
+                if view_acc > view_dt:
+                    view_acc = 0.0
+
             if state["need_reset"]:
                 state["need_reset"] = False
+                state["frame"] = 0
                 frame_slider.value = 0
                 ref = reference_pose(clip, 0)
                 if overlay:
                     reset_policy(clip)
-                    push_scene(policy_pose_np(), ref)
+                    publish(clip, 0, policy_pose_np(), ref, force=True)
                 else:
-                    push_scene(ref, None)
+                    publish(clip, 0, ref, None, force=True)
                 accumulator = 0.0
+                view_acc = 0.0
+                draw = False
 
             if playing.value and length > 1:
+                # Policy and the clip stay on the 50 Hz motion clock. Only the viewer is capped.
                 accumulator += dt * float(speed.value) * fps
                 steps = int(accumulator)
                 if steps > 0:
@@ -316,16 +349,14 @@ def play(
                             alive = step_policy()
                             if not alive:
                                 break
-                        local = min(int(sim.ep_step[0].item()), length - 1)  # type: ignore[union-attr]
-                        frame_slider.value = local
-                        push_scene(policy_pose_np(), reference_pose(clip, local))
+                        state["frame"] = min(int(sim.ep_step[0].item()), length - 1)  # type: ignore[union-attr]
                         if not alive:
                             if loop.value:
                                 state["need_reset"] = True
                             else:
                                 playing.value = False
                     else:
-                        nxt = int(frame_slider.value) + steps
+                        nxt = int(state["frame"]) + steps
                         last_frame = length - 1
                         if nxt > last_frame:
                             if loop.value:
@@ -333,18 +364,26 @@ def play(
                             else:
                                 nxt = last_frame
                                 playing.value = False
-                        frame_slider.value = nxt
-                        push_scene(reference_pose(clip, int(frame_slider.value)), None)
+                        state["frame"] = nxt
+                if draw:
+                    local = int(state["frame"])
+                    ref = reference_pose(clip, local)
+                    if overlay and sim is not None:
+                        publish(clip, local, policy_pose_np(), ref)
+                    else:
+                        publish(clip, local, ref, None)
             else:
                 accumulator = 0.0
-                local = int(frame_slider.value)
-                ref = reference_pose(clip, local)
-                if overlay and sim is not None and not state["need_reset"]:
-                    push_scene(policy_pose_np(), ref)
-                else:
-                    push_scene(ref, None)
+                state["frame"] = int(frame_slider.value)
+                if draw:
+                    local = int(state["frame"])
+                    ref = reference_pose(clip, local)
+                    if overlay and sim is not None:
+                        publish(clip, local, policy_pose_np(), ref)
+                    else:
+                        publish(clip, local, ref, None)
 
-            time.sleep(0.005)
+            time.sleep(min(0.02, 0.5 * view_dt))
     except KeyboardInterrupt:
         return
     finally:
@@ -356,8 +395,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--ckpt", type=Path, default=None, help="Policy checkpoint for overlay.")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--hz", type=float, default=30.0, help="Viewer update rate. The clip and policy still step at 50 Hz.")
     args = parser.parse_args()
-    play(port=args.port, ckpt=args.ckpt, device=args.device)
+    play(port=args.port, ckpt=args.ckpt, device=args.device, hz=args.hz)
 
 
 if __name__ == "__main__":

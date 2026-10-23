@@ -30,25 +30,26 @@ def _norm(kind: str, dim: int) -> nn.Module:
 
 
 class Block(nn.Module):
-    def __init__(self, din: int, dout: int, norm: str, residual: bool):
+    def __init__(self, din: int, dout: int, norm: str, residual: bool | float):
         super().__init__()
         self.fc = nn.Linear(din, dout)
         self.norm = _norm(norm, dout)
         self.act = nn.SiLU()
-        self.residual = residual
-        if residual and din == dout:
+        self.residual = float(residual) > 0.0
+        if self.residual and din == dout:
             self.skip: nn.Module = nn.Identity()
-        elif residual:
+            self.alpha = nn.Parameter(torch.tensor(float(residual)))
+        elif self.residual:
             self.skip = nn.Linear(din, dout, bias=False)
+            self.alpha = nn.Parameter(torch.tensor(float(residual)))
         else:
             self.skip = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.act(self.norm(self.fc(x)))
         if self.residual:
-            y = y + self.skip(x)
+            y = y + self.alpha * self.skip(x)
         return y
-
 
 class RunningNorm(nn.Module):
     """Running mean and variance. Updates do not receive gradients."""
@@ -119,6 +120,10 @@ class InputNorms(nn.Module):
         self.xi.update(xi_n)
 
 
+def _mark_non_muon(linear: nn.Linear) -> None:
+    linear.weight._non_muon = True  # type: ignore[attr-defined]
+
+
 class MLP(nn.Module):
     def __init__(self, inp: int, hidden: list[int], out: int, norm: str = "none", residual: bool = False):
         super().__init__()
@@ -129,6 +134,12 @@ class MLP(nn.Module):
             din = width
         self.blocks = nn.Sequential(*blocks)
         self.head = nn.Linear(din if hidden else inp, out)
+        # Muon is for hidden matrices. The input projection and the output head stay Adam.
+        if blocks:
+            _mark_non_muon(blocks[0].fc)
+            if isinstance(blocks[0].skip, nn.Linear):
+                _mark_non_muon(blocks[0].skip)
+        _mark_non_muon(self.head)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if AMP_DTYPE is None or x.device.type == "cpu":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 from contextlib import contextmanager
@@ -46,7 +47,9 @@ class TrainConfig:
     wm_batches: int = 10
     wm_batch: int = 2048
     pi_batch: int = 4096
-    lr: float = 2e-4
+    wm_lr: float = 2e-4
+    pi_lr: float = 5e-4
+    v_lr: float = 2e-4
     gamma: float = 0.99
     lam: float = 0.95
     action_noise: float = 0.1
@@ -54,7 +57,7 @@ class TrainConfig:
     critic_minibatches: int = 4
     lr_decay_iters: int = 250_000
     wm_norm: str = "none"
-    wm_residual: bool = False
+    wm_residual: bool | float = 0.0
     stochastic_actor: bool = False
     # Encoder and decoder widths. Depth is the list length. Paper Table A.4 is four layers.
     policy_z_dim: int = 32
@@ -84,11 +87,22 @@ class TrainConfig:
     fk: str = "warp"
     # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
     adv_coef: float = 0.0
+    # L1 reward-match weight added to the world-model MSE. 0 leaves MSE unchanged.
+    reward_coef: float = 0.0
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
     # Continue from this checkpoint. Missing modules (older runs) are left at init.
     resume: str | None = None
+    # Checkpoint to load the world model from. null trains it from scratch.
+    # Also loads the state, action, and ξ normalizers that model was trained with.
+    wm_ckpt: str | None = None
+    # frozen: the loaded model and those normalizers stay fixed.
+    # tunable: keep training them. Ignored when wm_ckpt is null.
+    wm_tune: str = "frozen"
+    # adam | muon. Muon covers hidden 2D weights of the world model and the policy.
+    # The first Linear, the output head, biases, and the critic stay Adam.
+    optim: str = "muon"
 
 
 @contextmanager
@@ -182,6 +196,20 @@ def _grads_norm(grads: list[torch.Tensor | None]) -> float:
     return float(nn.utils.get_total_norm(used))
 
 
+def _flat_grad(grads: list[torch.Tensor | None]) -> torch.Tensor:
+    used = [g.detach().reshape(-1) for g in grads if g is not None]
+    if not used:
+        return torch.zeros(1)
+    return torch.cat(used)
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    denom = a.norm() * b.norm()
+    if float(denom) < 1e-12:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
+
+
 def _clip_grads(params, max_norm: float | None, max_value: float | None = None) -> float:
     """Return total grad norm (pre-clip). Clip only when limits are set and positive."""
     params = list(params)
@@ -250,6 +278,35 @@ class AdversarialLoss(nn.Module):
         fake_d = self.score(inv_s, action, xi_n, inv_pred.detach())
         fake_g = self.score(inv_s, action, xi_n, inv_pred)
         return self.generator_loss(fake_g), self.discriminator_loss(real, fake_d)
+
+
+class RewardL1Loss(nn.Module):
+    """L1 match of analytic rewards between predicted and true next states.
+
+    State components have different units and scales. This term ignores that and
+    trains the world model so the predicted state scores the same reward as the
+    true next state, at the same reference frame and actions. Gradients flow only
+    through the predicted state. The true-state reward is always detached.
+    """
+
+    def __init__(self, mdp):
+        super().__init__()
+        self.mdp = mdp
+
+    def forward(self, preds: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """``preds`` is ``(K, B, STATE)`` from one world-model window."""
+        steps, batch_size = preds.shape[0], preds.shape[1]
+        pred = preds.reshape(steps * batch_size, -1)
+        true = batch["s1"].transpose(0, 1).reshape(steps * batch_size, -1)
+        frame = batch["f"].transpose(0, 1).reshape(steps * batch_size)
+        last = self.mdp.motion.clip_end[self.mdp.motion.clip_id[frame]] - 1
+        frame = torch.minimum(frame + 1, last)
+        action = batch["a"].transpose(0, 1).reshape(steps * batch_size, -1)
+        a_prev = batch["a_prev"].transpose(0, 1).reshape(steps * batch_size, -1)
+        reward_pred = self.mdp.reward(*unflatten_state(pred), frame, action, a_prev)
+        with torch.no_grad():
+            reward_true = self.mdp.reward(*unflatten_state(true), frame, action, a_prev)
+        return (reward_pred - reward_true).abs().mean()
 
 
 def world_model_window(
@@ -416,10 +473,15 @@ def imagine_horizon(
     )
     term_loss = -(weighted * term_r).sum(dim=1).mean(dim=-1)
     policy_loss = -(returns + bootstrap).mean()
+    for action in actions:
+        if action.requires_grad:
+            action.retain_grad()
     critic_states = tuple(t.detach() for t in _flatten_time(states))
     return (
         policy_loss,
         step_return,
+        reward,
+        weighted.unsqueeze(0) * term_r,
         bootstrap,
         term_loss,
         reward.detach(),
@@ -431,6 +493,8 @@ def imagine_horizon(
         _stack(frames).detach(),
         _stack(goals).detach(),
         xi.detach(),
+        actions,
+        survival.detach().mean(-1),
     )
 
 
@@ -497,14 +561,17 @@ class Trainer:
         ).to(self.device)
         self.critic = Critic(INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM).to(self.device)
         self.norms = InputNorms(obs_dim).to(self.device)
-        self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
-        self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
-        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        from .optim import build_optimizer
+
+        self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
+        self.opt_pi = build_optimizer(self.policy, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95))
+        self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.v_lr)
         self.buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, self.device)
         self.mse_loss = MSELoss(self.device).to(self.device)
+        self.reward_l1 = RewardL1Loss(self.sim.mdp)
         # Discriminator probe only — never added into the WM objective.
         self.adv_loss = AdversarialLoss().to(self.device)
-        self.opt_disc = torch.optim.Adam(self.adv_loss.parameters(), lr=cfg.lr)
+        self.opt_disc = torch.optim.Adam(self.adv_loss.parameters(), lr=cfg.wm_lr)
         self.reward_norm = (
             RewardNormalizer(
                 cfg.num_envs,
@@ -529,6 +596,7 @@ class Trainer:
             "wm": [],
             "wm_mse": [],
             "wm_adv": [],
+            "wm_reward": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -550,9 +618,12 @@ class Trainer:
         self.started = 0.0
         self.logged = 0.0
         self.start_iteration = 0
+        self.wm_frozen = False
         self._log_f = None
         if cfg.resume:
             self.load_checkpoint(cfg.resume)
+        if cfg.wm_ckpt:
+            self.load_pretrained_wm(cfg.wm_ckpt)
 
     def fit(self) -> None:
         cfg = self.cfg
@@ -575,7 +646,7 @@ class Trainer:
             "sim_score,ep_score,term_frac,it_per_s,lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
-            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,"
+            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
@@ -591,10 +662,17 @@ class Trainer:
 
     def _step(self, iteration: int) -> None:
         cfg = self.cfg
-        lr = lr_at(iteration, cfg.lr, cfg.lr_decay_iters)
-        for opt in (self.opt_wm, self.opt_pi, self.opt_v, self.opt_disc):
+        schedules = (
+            (self.opt_wm, cfg.wm_lr),
+            (self.opt_pi, cfg.pi_lr),
+            (self.opt_v, cfg.v_lr),
+            (self.opt_disc, cfg.wm_lr),
+        )
+        lr = lr_at(iteration, cfg.wm_lr, cfg.lr_decay_iters)
+        for opt, base in schedules:
+            group_lr = lr_at(iteration, base, cfg.lr_decay_iters)
             for group in opt.param_groups:
-                group["lr"] = lr
+                group["lr"] = group_lr
         self.step_acc += 1.0 / cfg.utd
         n_steps = int(self.step_acc)
         self.step_acc -= n_steps
@@ -636,6 +714,7 @@ class Trainer:
         self.agg["wm"].append(wm_loss.detach())
         self.agg["wm_mse"].append(disc_stats["mse"])
         self.agg["wm_adv"].append(disc_stats["adv"])
+        self.agg["wm_reward"].append(disc_stats["reward"])
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -671,16 +750,19 @@ class Trainer:
             )
             goal = self.motion.goal(self.sim.f, GOAL_FRAMES)
             xi_n = normalize_xi(self.sim.xi)
-            self.norms.state.update(invariant_features(p, quat, v, w, q, qd))
             self.norms.obs.update(obs)
             self.norms.goal.update(goal)
-            self.norms.xi.update(xi_n)
+            # A frozen world model keeps the normalizers it was loaded with.
+            if not self.wm_frozen:
+                self.norms.state.update(invariant_features(p, quat, v, w, q, qd))
+                self.norms.xi.update(xi_n)
             with torch.no_grad():
                 action = self.policy(
                     self.obs_hist, goal, self.norms, deterministic=not cfg.stochastic_actor
                 )
             executed = action + cfg.action_noise * torch.randn_like(action)
-            self.norms.action.update(executed)
+            if not self.wm_frozen:
+                self.norms.action.update(executed)
             out = self.sim.step(executed)
             self.buffer.add(out)
             if self.reward_norm is not None:
@@ -709,35 +791,51 @@ class Trainer:
     def update_world_model(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, torch.Tensor]]:
-        """Fit the WM on MSE + ``adv_coef`` · LSGAN generator loss, then step D."""
+        """Fit the WM on MSE plus optional adversarial and reward-L1 terms, then step D."""
         cfg = self.cfg
         loss = err8 = None
         norms: list[float] = []
         mse_losses: list[torch.Tensor] = []
         adv_losses: list[torch.Tensor] = []
+        reward_losses: list[torch.Tensor] = []
         disc_losses: list[torch.Tensor] = []
         disc_reals: list[torch.Tensor] = []
         disc_fakes: list[torch.Tensor] = []
         disc_accs: list[torch.Tensor] = []
-        use_adv = cfg.adv_coef > 0
+        use_adv = cfg.adv_coef > 0 and not self.wm_frozen
+        use_reward = cfg.reward_coef > 0 and not self.wm_frozen
         for _ in range(cfg.wm_batches):
             batch = self.buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
-            errors, saved, preds = self.world_model_rollout(batch, detach_pred=not use_adv)
-            mse, err8 = self.mse_loss(errors)
+            grad_ctx = torch.no_grad() if self.wm_frozen else contextlib.nullcontext()
+            with grad_ctx:
+                errors, saved, preds = self.world_model_rollout(
+                    batch, detach_pred=not (use_adv or use_reward)
+                )
+                mse, err8 = self.mse_loss(errors)
+            if use_reward:
+                reward_l1 = self.reward_l1(preds, batch)
+            else:
+                with torch.no_grad():
+                    reward_l1 = self.reward_l1(preds.detach(), batch)
             self.opt_wm.zero_grad(set_to_none=True)
+            loss = mse
             if use_adv:
                 # D is held fixed so the generator step does not write θ_D grads.
                 with hold_out_net(self.adv_loss):
                     adv = self._generator_loss(saved, preds)
-                    loss = mse + cfg.adv_coef * adv
-                    loss.backward()
+                    loss = loss + cfg.adv_coef * adv
             else:
                 adv = mse.new_zeros(())
-                loss = mse
+            if use_reward:
+                loss = loss + cfg.reward_coef * reward_l1
+            if self.wm_frozen:
+                norms.append(0.0)
+            else:
                 loss.backward()
-            norms.append(_clip_grads(self.wm.parameters(), cfg.grad_clip_norm))
-            self.opt_wm.step()
+                norms.append(_clip_grads(self.wm.parameters(), cfg.grad_clip_norm))
+                self.opt_wm.step()
             mse_losses.append(mse.detach())
+            reward_losses.append(reward_l1.detach())
 
             # Features for D are detached. With coef 0 this is also the logged generator loss.
             d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
@@ -749,6 +847,7 @@ class Trainer:
         assert loss is not None and err8 is not None
         mse_mean = torch.stack(mse_losses).mean()
         adv_mean = torch.stack(adv_losses).mean()
+        reward_mean = torch.stack(reward_losses).mean()
         disc_stats = {
             "loss": torch.stack(disc_losses).mean(),
             "real": torch.stack(disc_reals).mean(),
@@ -756,8 +855,10 @@ class Trainer:
             "acc": torch.stack(disc_accs).mean(),
             "mse": mse_mean,
             "adv": adv_mean,
+            "reward": reward_mean,
         }
-        return mse_mean + cfg.adv_coef * adv_mean, err8, _mean(norms), disc_stats
+        total = mse_mean + cfg.adv_coef * adv_mean + cfg.reward_coef * reward_mean
+        return total, err8, _mean(norms), disc_stats
 
     def update_discriminator(
         self, saved: list[dict[str, torch.Tensor]]
@@ -862,6 +963,8 @@ class Trainer:
         (
             policy_loss,
             step_return,
+            step_reward,
+            term_weighted,
             bootstrap,
             term_loss,
             reward,
@@ -873,6 +976,8 @@ class Trainer:
             frames,
             goals,
             xi,
+            actions,
+            survival,
         ) = imagine_horizon(
             self.policy,
             self.wm,
@@ -914,7 +1019,11 @@ class Trainer:
             "imag_terms": imag_terms,
             "term_losses": term_losses,
             "step_return": step_return,
+            "step_reward": step_reward,
+            "term_weighted": term_weighted,
             "bootstrap": bootstrap,
+            "actions": actions,
+            "survival": survival,
             "horizon": cfg.horizon,
         }
 
@@ -932,54 +1041,71 @@ class Trainer:
 
     def diagnose_imagination_step_grads(
         self, start: dict[str, torch.Tensor] | None = None
-    ) -> dict[str, list[float]]:
-        """Per-step actor grad norms along the imagination horizon.
+    ) -> dict[str, list[float] | float]:
+        """Actor-gradient diagnostics along one imagination horizon.
 
-        Not called from training — each of the ``H`` (plus bootstrap) backwards
-        retains the full BPTT graph, so cost is roughly ``O(H)`` policy updates.
+        Not called from training. Each scalar backward retains the BPTT graph.
 
-        For step ``t``, ``cumulative[t]`` is ``||∇_θ L_≤t||`` with
-        ``L_≤t = -mean(Σ_{k≤t} γ^k S_k r_k)``. ``marginal[t]`` is the same for
-        the single term at ``t``. Bootstrap is reported separately and also as
-        ``cumulative_with_boot`` (final cumulative + bootstrap, matching the
-        training loss).
+        ``marginal`` / ``raw`` are ``||∇_θ r_t||`` with and without ``γ^t S_t``.
+        ``cosine`` is the alignment of that weighted step with the full update.
+        ``encoder`` / ``decoder`` split the weighted step. ``action`` is
+        ``||∂G/∂a_t||`` of the full return. ``terms`` is per reward term.
         """
         if start is None:
             start = self.sample_policy_starts()
-        params = [p for p in self.policy.parameters() if p.requires_grad]
+        encoder = [p for p in self.policy.encoder.parameters() if p.requires_grad]
+        decoder = [p for p in self.policy.decoder.parameters() if p.requires_grad]
+        extra = [self.policy.log_std] if self.policy.log_std is not None else []
+        params = encoder + decoder + extra
+        n_enc = len(encoder)
         with hold_out_net(self.wm), hold_out_net(self.critic):
             g = self._imagine_graph(start)
             step_return = g["step_return"]
+            step_reward = g["step_reward"]
+            term_weighted = g["term_weighted"]
             bootstrap = g["bootstrap"]
-            horizon = g["horizon"]
-            marginal: list[float] = []
-            cumulative: list[float] = []
+            horizon = int(g["horizon"])
+
+            def grads_of(loss: torch.Tensor) -> list[torch.Tensor | None]:
+                return list(torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True))
+
+            full = grads_of(g["policy_loss"])
+            full_flat = _flat_grad(full)
+            full_norm = _grads_norm(full)
+            reward_only = grads_of(-step_return.sum(0).mean())
+            boot = grads_of(-bootstrap.mean())
+            boot_norm = _grads_norm(boot)
+            boot_cos = _cosine(_flat_grad(boot), _flat_grad(reward_only))
+
+            marginal, raw, cosine, enc_norm, dec_norm = [], [], [], [], []
             for t in range(horizon):
-                loss_t = -step_return[t].mean()
-                grads_t = torch.autograd.grad(
-                    loss_t, params, retain_graph=True, allow_unused=True
-                )
-                marginal.append(_grads_norm(list(grads_t)))
-                loss_cum = -step_return[: t + 1].sum(0).mean()
-                grads_cum = torch.autograd.grad(
-                    loss_cum, params, retain_graph=True, allow_unused=True
-                )
-                cumulative.append(_grads_norm(list(grads_cum)))
-            boot_grads = torch.autograd.grad(
-                -bootstrap.mean(), params, retain_graph=True, allow_unused=True
-            )
-            boot_norm = _grads_norm(list(boot_grads))
-            full_grads = torch.autograd.grad(
-                g["policy_loss"], params, retain_graph=False, allow_unused=True
-            )
-            full_norm = _grads_norm(list(full_grads))
-        total = cumulative[-1] + 1e-12
+                weighted = grads_of(-step_return[t].mean())
+                unweighted = grads_of(-step_reward[t].mean())
+                marginal.append(_grads_norm(weighted))
+                raw.append(_grads_norm(unweighted))
+                cosine.append(_cosine(_flat_grad(weighted), full_flat))
+                enc_norm.append(_grads_norm(weighted[:n_enc]))
+                dec_norm.append(_grads_norm(weighted[n_enc : n_enc + len(decoder)]))
+            terms = {name: [] for name in REWARD_TERM_NAMES}
+            for index, name in enumerate(REWARD_TERM_NAMES):
+                for t in range(horizon):
+                    terms[name].append(_grads_norm(grads_of(-term_weighted[index, t].mean())))
+            g["policy_loss"].backward()
+            action_norm = [float(action.grad.detach().norm()) for action in g["actions"]]
+            survival = [float(x) for x in g["survival"].detach().cpu()]
         return {
             "marginal": marginal,
-            "cumulative": cumulative,
-            "cumulative_frac": [c / total for c in cumulative],
+            "raw": raw,
+            "cosine": cosine,
+            "encoder": enc_norm,
+            "decoder": dec_norm,
+            "action": action_norm,
+            "terms": terms,
+            "survival": survival,
             "bootstrap": boot_norm,
+            "bootstrap_cosine": boot_cos,
             "full": full_norm,
+            "reward": _grads_norm(reward_only),
         }
 
     def update_policy(
@@ -1088,7 +1214,8 @@ class Trainer:
         disc_acc = _mean(self.agg["disc_acc"])
         wm_mse = _mean(self.agg["wm_mse"])
         wm_adv = _mean(self.agg["wm_adv"])
-        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv))
+        wm_reward = _mean(self.agg["wm_reward"])
+        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv, wm_reward))
         row.extend(
             (
                 gn_wm,
@@ -1108,6 +1235,7 @@ class Trainer:
             "train/wm_loss": row[2],
             "train/wm_loss_mse": wm_mse,
             "train/wm_loss_adv": wm_adv,
+            "train/wm_loss_reward": wm_reward,
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
@@ -1154,7 +1282,7 @@ class Trainer:
             for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
         )
         print(
-            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} e8 {row[3]:.4f} | "
+            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
             f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
@@ -1179,6 +1307,7 @@ class Trainer:
             "wm": [],
             "wm_mse": [],
             "wm_adv": [],
+            "wm_reward": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -1196,6 +1325,34 @@ class Trainer:
             "reward_grad_boot": [],
         }
         self.timing = {key: [] for key in self.timing}
+
+    def load_pretrained_wm(self, path: str | Path) -> None:
+        """Load a world model and the normalizers it reads. Policy and critic stay fresh."""
+        if self.cfg.wm_tune not in ("frozen", "tunable"):
+            raise ValueError(f"wm_tune must be 'frozen' or 'tunable', got {self.cfg.wm_tune!r}")
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        if "wm" not in ckpt:
+            raise KeyError(f"{path} has no world model ('wm').")
+        self.wm.load_state_dict(ckpt["wm"])
+        norms = ckpt.get("norms")
+        if norms is not None:
+            own = self.norms.state_dict()
+            kept = [
+                key
+                for key in own
+                if key.startswith(("state.", "action.", "xi.")) and key in norms
+            ]
+            for key in kept:
+                own[key] = norms[key]
+            self.norms.load_state_dict(own)
+        else:
+            kept = []
+        self.wm_frozen = self.cfg.wm_tune == "frozen"
+        self.wm.requires_grad_(not self.wm_frozen)
+        print(
+            f"loaded world model from {path} ({self.cfg.wm_tune}); normalizers {kept or 'absent'}",
+            flush=True,
+        )
 
     def load_checkpoint(self, path: str | Path) -> None:
         """Load whatever this checkpoint contains. Absent modules stay freshly initialized."""

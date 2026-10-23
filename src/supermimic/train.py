@@ -29,7 +29,9 @@ def main(cfg: DictConfig) -> None:
         wm_batches=int(cfg.wm_batches),
         wm_batch=int(cfg.wm_batch),
         pi_batch=int(cfg.pi_batch),
-        lr=float(cfg.lr),
+        wm_lr=float(cfg.wm_lr),
+        pi_lr=float(cfg.pi_lr),
+        v_lr=float(cfg.v_lr),
         gamma=float(cfg.gamma),
         lam=float(cfg.lam),
         action_noise=float(cfg.action_noise),
@@ -56,11 +58,15 @@ def main(cfg: DictConfig) -> None:
         amp=str(cfg.amp),
         fk=str(cfg.fk),
         adv_coef=float(cfg.adv_coef),
+        reward_coef=float(cfg.reward_coef),
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),
         seed=int(cfg.seed),
         resume=None if cfg.resume is None else str(cfg.resume),
+        wm_ckpt=None if cfg.wm_ckpt is None else str(cfg.wm_ckpt),
+        wm_tune=str(cfg.wm_tune),
+        optim=str(cfg.optim),
     )
     run(train_cfg, run_dir)
 

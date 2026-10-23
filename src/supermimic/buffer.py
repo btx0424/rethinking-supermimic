@@ -81,7 +81,9 @@ class ReplayBuffer:
             "s": self.s[idx, env[:, None]],
             "s1": self.s1[idx, env[:, None]],
             "a": self.a[idx, env[:, None]],
+            "a_prev": self.a_prev[idx, env[:, None]],
             "xi": self.xi[idx, env[:, None]],
+            "f": self.f[idx, env[:, None]],
         }
 
     def sample_starts(self, batch: int, hist: int) -> dict[str, torch.Tensor]:
