@@ -18,11 +18,15 @@ from .mdp import (
     INV_DIM,
     N_CONTACT,
     NUM_J,
+    PELVIS_FEAT_DIM,
     PRIV_DIM,
+    WM_FRAMES,
     XI_DIM,
     WorldModelState,
     heading_body_pos,
     invariant_features,
+    pelvis_body_pos,
+    pelvis_features,
 )
 
 # Set by the trainer. None keeps fp32. bf16 covers the MLP GEMMs only; callers
@@ -102,6 +106,7 @@ class InputNorms(nn.Module):
     def __init__(self, obs_dim: int):
         super().__init__()
         self.state = RunningNorm(INV_DIM)
+        self.dyn = RunningNorm(PELVIS_FEAT_DIM)
         self.obs = RunningNorm(obs_dim)
         self.goal = RunningNorm(GOAL_DIM)
         self.action = RunningNorm(NUM_J)
@@ -171,12 +176,16 @@ class WorldModel(nn.Module):
 
     out_dim = 3 + 3 + 3 + 3 + NUM_J + NUM_J + N_CONTACT
 
-    def __init__(self, norm: str = "none", residual: bool = False):
+    def __init__(self, norm: str = "none", residual: bool = False, frame: str = "heading"):
         super().__init__()
-        from .mdp import INV_DIM, XI_DIM
+        if frame not in WM_FRAMES:
+            raise ValueError(f"wm frame must be one of {WM_FRAMES}, got {frame!r}.")
+        self.frame = frame
+        from .mdp import XI_DIM
 
+        feat_dim = PELVIS_FEAT_DIM if frame == "pelvis" else INV_DIM
         self.net = MLP(
-            INV_DIM + NUM_J + XI_DIM + BODY_POS_DIM + N_CONTACT,
+            feat_dim + NUM_J + XI_DIM + BODY_POS_DIM + N_CONTACT,
             [2048, 2048, 2048],
             self.out_dim,
             norm,
@@ -196,27 +205,30 @@ class WorldModel(nn.Module):
     ) -> tuple[WorldModelState, torch.Tensor]:
         """Advance one step. ``contact`` is a per-body probability in ``[0, 1]``.
 
-        The network reads heading-frame body positions of the current state (from
-        ``state.body_pos``, or from FK when that is missing) and predicts the
-        root-and-joint increment plus the next contact. The returned state carries
-        FK of that next pose. The caller passes ``sigmoid(logits)`` into the
-        following step.
+        The network reads body positions of the current state in ``self.frame``
+        (heading or the full pelvis) and predicts the root-and-joint increment
+        plus the next contact. The returned state carries FK of that next pose.
+        The caller passes ``sigmoid(logits)`` into the following step.
         """
         p, quat, v, w, q, qd = state.root()
         body_pos = state.body_pos
         if body_pos is None:
-            # body_pos, _, _, _ = mdp.bodies(p, quat, v, w, q, qd)
             raise ValueError("state.body_pos is required for WorldModel.step.")
-        body = heading_body_pos(p, quat, body_pos)
-        feat = torch.cat(
-            (norms.wm(invariant_features(p, quat, v, w, q, qd), action, xi_n, body), contact),
-            dim=-1,
-        )
+        if self.frame == "pelvis":
+            feat_in = pelvis_features(p, quat, v, w, q, qd)
+            body = pelvis_body_pos(p, quat, body_pos)
+            state_n = norms.dyn(feat_in)
+            rotate = quat
+        else:
+            feat_in = invariant_features(p, quat, v, w, q, qd)
+            body = heading_body_pos(p, quat, body_pos)
+            state_n = norms.state(feat_in)
+            rotate = yaw_quat(quat)
+        feat = torch.cat((state_n, norms.action(action), norms.xi(xi_n), norms.body(body), contact), dim=-1)
         dp, drot, dv, dw, dq, dqd, contact_logit = self.net(feat).split(
             (3, 3, 3, 3, NUM_J, NUM_J, N_CONTACT), dim=-1
         )
-        yaw = yaw_quat(quat)
-        nxt_p = p + quat_apply(yaw, dp)
+        nxt_p = p + quat_apply(rotate, dp)
         nxt_quat = quat_normalize(quat_mul(quat, rotvec_to_quat(drot)))
         nxt_v = v + quat_apply(quat, dv)
         nxt_w = w + quat_apply(quat, dw)

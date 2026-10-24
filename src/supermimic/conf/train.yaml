@@ -67,6 +67,9 @@ critic_ensemble: 2
 lr_decay_iters: 250000
 wm_norm: rms
 wm_residual: false
+# heading keeps the yaw frame. pelvis writes features and the position increment
+# in the full pelvis frame, so crawling does not cross the yaw cut.
+wm_frame: heading
 stochastic_actor: false
 # Grad clipping. null / <=0 disables. Norms always logged (grad/wm, grad/pi, grad/v).
 grad_clip_norm: 1.0

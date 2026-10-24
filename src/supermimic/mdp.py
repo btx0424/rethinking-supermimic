@@ -23,6 +23,10 @@ from .motion import CONTROL_DT, GOAL_PER_FRAME, MotionLib
 NUM_J = 29
 XI_DIM = 1 + NUM_J + 3
 INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
+# Pelvis-frame world-model features: height, gravity in the pelvis, body-frame twist, joints.
+# Three fewer than INV_DIM because gravity replaces the 6D yaw-removed tilt.
+PELVIS_FEAT_DIM = 1 + 3 + 3 + 3 + NUM_J + NUM_J
+WM_FRAMES = ("heading", "pelvis")
 STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J
 # Critic-only tracking errors: joint position, heading-frame anchored body position,
 # heading-frame root position, 6D root orientation.
@@ -266,6 +270,36 @@ def invariant_features(p, quat, v, w, q, qd) -> torch.Tensor:
     )
 
 
+def pelvis_features(p, quat, v, w, q, qd) -> torch.Tensor:
+    """World-model features in the pelvis frame: height, gravity, body-frame twist, joints.
+
+    Horizontal translation and yaw cancel. Gravity replaces the yaw-removed tilt, so
+    the features stay continuous when the pelvis is horizontal.
+    """
+    gravity = quat.new_tensor(GRAVITY).expand(v.shape)
+    return torch.cat(
+        (
+            p[..., 2:3],
+            quat_apply_inverse(quat, gravity),
+            quat_apply_inverse(quat, v),
+            quat_apply_inverse(quat, w),
+            q,
+            qd,
+        ),
+        dim=-1,
+    )
+
+
+def pelvis_body_pos(p, quat, body_p) -> torch.Tensor:
+    """Tracked-body positions in the pelvis frame, relative to the pelvis.
+
+    ``R_pelvisᵀ (p_body − p_pelvis)``. Same invariance as ``heading_body_pos``, without
+    the yaw cut.
+    """
+    local = quat_apply_inverse(quat.unsqueeze(-2), body_p - p.unsqueeze(-2))
+    return local.flatten(-2)
+
+
 def heading_body_pos(p, quat, body_p) -> torch.Tensor:
     """Tracked-body positions in the root heading frame, relative to the root.
 
@@ -285,12 +319,16 @@ def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
     )
 
 
-def local_state_error(p, quat, v, w, q, qd, p_hat, quat_hat, v_hat, w_hat, q_hat, qd_hat) -> torch.Tensor:
-    """State error of the hat quantities, expressed in the true state's frames."""
-    yaw = yaw_quat(quat)
+def local_state_error(p, quat, v, w, q, qd, p_hat, quat_hat, v_hat, w_hat, q_hat, qd_hat, frame: str = "heading") -> torch.Tensor:
+    """State error of the hat quantities, expressed in the true state's frames.
+
+    ``frame="heading"`` writes the position error in the yaw frame. ``frame="pelvis"``
+    writes it in the full pelvis frame, matching that integration.
+    """
+    pos_frame = quat if frame == "pelvis" else yaw_quat(quat)
     return torch.cat(
         (
-            quat_apply_inverse(yaw, p_hat - p),
+            quat_apply_inverse(pos_frame, p_hat - p),
             quat_to_rotvec(quat_mul(quat_inv(quat), quat_hat)),
             quat_apply_inverse(quat, v_hat - v),
             quat_apply_inverse(quat, w_hat - w),

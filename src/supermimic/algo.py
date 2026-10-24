@@ -33,6 +33,8 @@ from .mdp import (
     XI_DIM,
     invariant_features,
     local_state_error,
+    pelvis_body_pos,
+    pelvis_features,
     nominal_error,
     normalize_xi,
     unflatten_state,
@@ -69,6 +71,8 @@ class TrainConfig:
     lr_decay_iters: int = 250_000
     wm_norm: str = "none"
     wm_residual: bool | float = 0.0
+    # heading: yaw frame. pelvis: full pelvis frame, continuous when crawling.
+    wm_frame: str = "heading"
     stochastic_actor: bool = False
     # Encoder and decoder widths. Depth is the list length. Paper Table A.4 is four layers.
     policy_z_dim: int = 32
@@ -359,7 +363,7 @@ def world_model_step(
     """
     state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     true = unflatten_state(s1)
-    error = local_state_error(*true, *state.root())
+    error = local_state_error(*true, *state.root(), frame=wm.frame)
     return state, error, state.flatten(), logit
 
 
@@ -399,7 +403,7 @@ def world_model_window(
         state, logit = wm.step(state, actions[:, j], xi_n, norms, carried, mdp)
         carried = logit.sigmoid()
         true = unflatten_state(s1[:, j])
-        errors.append(local_state_error(*true, *state.root()))
+        errors.append(local_state_error(*true, *state.root(), frame=wm.frame))
         preds.append(state.flatten())
         logits.append(logit)
     pred = torch.stack(preds, dim=0)
@@ -660,7 +664,7 @@ class Trainer:
         )
         self.r_max = self.sim.mdp.max_step_reward
         obs_dim = self.sim.mdp.obs_dim
-        self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual).to(self.device)
+        self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual, cfg.wm_frame).to(self.device)
         # WM: compile the whole K-window or one step (eager K-loop). Imagination
         # always compiles a single step; the H-loop stays eager. Inductor default
         # (not reduce-overhead): CUDA graphs hurt the real multi-batch WM update.
@@ -916,7 +920,11 @@ class Trainer:
             if not self.wm_frozen:
                 self.norms.state.update(invariant_features(p, quat, v, w, q, qd))
                 self.norms.xi.update(xi_n)
-                self.norms.body.update(self.sim.mdp.heading_bodies(p, quat, v, w, q, qd, bodies[0]))
+                if self.wm.frame == "pelvis":
+                    self.norms.dyn.update(pelvis_features(p, quat, v, w, q, qd))
+                    self.norms.body.update(pelvis_body_pos(p, quat, bodies[0]))
+                else:
+                    self.norms.body.update(self.sim.mdp.heading_bodies(p, quat, v, w, q, qd, bodies[0]))
             with torch.no_grad():
                 action = self.policy(
                     self.obs_hist, goal, self.norms, deterministic=not cfg.stochastic_actor
@@ -1540,7 +1548,7 @@ class Trainer:
             kept = [
                 key
                 for key in own
-                if key.startswith(("state.", "action.", "xi.", "body.")) and key in norms
+                if key.startswith(("state.", "action.", "xi.", "body.", "dyn.")) and key in norms
             ]
             for key in kept:
                 own[key] = norms[key]

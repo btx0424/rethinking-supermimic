@@ -42,6 +42,7 @@ def main(cfg: DictConfig) -> None:
         lr_decay_iters=int(cfg.lr_decay_iters),
         wm_norm=str(cfg.wm_norm),
         wm_residual=bool(cfg.wm_residual),
+        wm_frame=str(cfg.wm_frame),
         stochastic_actor=bool(cfg.stochastic_actor),
         policy_kind=str(cfg.actor.kind),
         policy_z_dim=int(cfg.actor.get("z_dim", 32)),
