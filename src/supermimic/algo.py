@@ -40,7 +40,16 @@ from .mdp import (
     unflatten_state,
 )
 from . import network
-from .network import Critic, InputNorms, MLP, Policy, WorldModel, WorldModelState
+from .network import (
+    ClassificationCritic,
+    InputNorms,
+    MLP,
+    Policy,
+    ScalarCritic,
+    WorldModel,
+    WorldModelState,
+    critic_forward,
+)
 from .reward_norm import RewardNormalizer
 
 
@@ -127,6 +136,15 @@ class TrainConfig:
     # adam | muon. Muon covers hidden 2D weights of the world model and the policy.
     # The first Linear, the output head, biases, and the critic stay Adam.
     optim: str = "muon"
+    # ``scalar`` regresses with MSE. ``classification`` is HL-Gauss cross-entropy;
+    # GAE and the policy bootstrap use the expected atom value.
+    critic_kind: str = "scalar"
+    critic_atoms: int = 51
+    critic_v_min: float = -2.0
+    critic_v_max: float = 15.0
+    critic_sigma_ratio: float = 0.75
+    # When false, the actor loss is the H-step return only. The critic still trains.
+    policy_bootstrap: bool = True
 
 
 @contextmanager
@@ -477,7 +495,7 @@ def imagine_step(
 def imagine_horizon(
     policy: Policy,
     wm: WorldModel,
-    critic: Critic,
+    critic: nn.Module,
     norms: InputNorms,
     mdp,
     hist_s: torch.Tensor,
@@ -498,6 +516,7 @@ def imagine_horizon(
     gamma: float,
     deterministic: bool,
     step=imagine_step,
+    bootstrap_grad: bool = True,
 ):
     """H-step imagination. ``step`` may be a compiled single step.
 
@@ -576,15 +595,20 @@ def imagine_horizon(
     step_return = weighted * reward
     returns = step_return.sum(0)
     # Heads stay separate through GAE. The actor follows the mean value.
-    head_values = critic(
-        norms.critic(
-            invariant_features(*states[-1].root()),
-            goals[-1],
-            xi_n,
-            mdp.privileged(*states[-1].root(), frames[-1]),
+    head_values = critic.expected_values(
+        critic_forward(
+            critic,
+            norms.critic(
+                invariant_features(*states[-1].root()),
+                goals[-1],
+                xi_n,
+                mdp.privileged(*states[-1].root(), frames[-1]),
+            ),
         )
     )
     bootstrap = gamma**horizon * alive[-1] * head_values.mean(-1)
+    if not bootstrap_grad:
+        bootstrap = bootstrap.detach()
     # Diagnostics read the per-head values. Training leaves this unset.
     trace = getattr(critic, "_head_trace", None)
     if trace is not None:
@@ -711,15 +735,44 @@ class Trainer:
             norm=cfg.policy_norm,
             kind=cfg.policy_kind,
         ).to(self.device)
-        self.critic = Critic(
-            INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM, ensemble=cfg.critic_ensemble
-        ).to(self.device)
+        in_dim = INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM
+        if cfg.critic_kind == "classification":
+            v_min, v_max = cfg.critic_v_min, cfg.critic_v_max
+            if cfg.normalize_reward:
+                # Step reward ≤ r_max, so a raw return is ≤ G_max = r_max/(1-γ).
+                # Normalization divides by S = max(√Var(G), G_r_max/G_max). The floor
+                # maps every return with |G| ≤ G_r_max into [-G_max, G_max], and
+                # G_r_max tracks |G|, so that is the support the critic has to cover.
+                g_max = self.r_max / (1.0 - cfg.gamma)
+                v_min, v_max = -g_max, g_max
+                print(
+                    f"classification critic support [{v_min:.4g}, {v_max:.4g}] "
+                    f"from r_max={self.r_max:.4g} gamma={cfg.gamma}",
+                    flush=True,
+                )
+            self.critic = ClassificationCritic(
+                in_dim,
+                ensemble=cfg.critic_ensemble,
+                num_atoms=cfg.critic_atoms,
+                v_min=v_min,
+                v_max=v_max,
+                sigma_ratio=cfg.critic_sigma_ratio,
+            ).to(self.device)
+        elif cfg.critic_kind == "scalar":
+            self.critic = ScalarCritic(in_dim, ensemble=cfg.critic_ensemble).to(self.device)
+        else:
+            raise ValueError(f"critic_kind must be 'scalar' or 'classification', got {cfg.critic_kind!r}.")
         self.norms = InputNorms(obs_dim).to(self.device)
         from .optim import build_optimizer
 
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
         self.opt_pi = build_optimizer(self.policy, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95))
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.v_lr)
+        # One region for both heads. Compiling the module forward would re-enter
+        # each MLP's own autocast and split the GEMMs apart.
+        self._critic_fwd = (
+            torch.compile(critic_forward, mode="default", dynamic=False) if cfg.compile else critic_forward
+        )
         self.buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, self.device)
         self.mse_loss = MSELoss(self.device).to(self.device)
         self.reward_l1 = RewardL1Loss(self.sim.mdp)
@@ -755,6 +808,7 @@ class Trainer:
             "err": [],
             "pi": [],
             "v": [],
+            "value_mean": [],
             "score": [],
             "surv": [],
             "gn_wm": [],
@@ -801,7 +855,7 @@ class Trainer:
         )
         grad_r_cols = ",".join(f"grad_r_{n}" for n in REWARD_TERM_NAMES)
         self._log_f.write(
-            "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,imag_score,imag_survival,"
+            "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,value_mean,imag_score,imag_survival,"
             "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
@@ -867,7 +921,7 @@ class Trainer:
             self.timing["policy"].append(timed.last)
 
         with timed(self.device):
-            v_loss, gn_v = self.update_critic(critic_batch)
+            v_loss, gn_v, value_mean = self.update_critic(critic_batch)
         self.timing["critic"].append(timed.last)
 
         # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
@@ -880,6 +934,7 @@ class Trainer:
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
+        self.agg["value_mean"].append(value_mean.detach() if isinstance(value_mean, torch.Tensor) else value_mean)
         self.agg["score"].append(imag_score.detach() if isinstance(imag_score, torch.Tensor) else imag_score)
         self.agg["surv"].append(survival.detach() if isinstance(survival, torch.Tensor) else survival)
         self.agg["gn_wm"].append(gn_wm)
@@ -1182,6 +1237,7 @@ class Trainer:
             cfg.gamma,
             not cfg.stochastic_actor,
             self._imagine_step,
+            cfg.policy_bootstrap,
         )
         term_losses = {name: term_loss[i] for i, name in enumerate(REWARD_TERM_NAMES)}
         term_losses["bootstrap"] = -bootstrap.mean()
@@ -1312,10 +1368,14 @@ class Trainer:
                     term_losses[name], params, retain_graph=True, allow_unused=True
                 )
                 self.agg["reward_grads"][name].append(_grads_norm(list(grads)))
-            boot_grads = torch.autograd.grad(
-                term_losses["bootstrap"], params, retain_graph=True, allow_unused=True
-            )
-            self.agg["reward_grad_boot"].append(_grads_norm(list(boot_grads)))
+            bootstrap_loss = term_losses["bootstrap"]
+            if bootstrap_loss.requires_grad:
+                boot_grads = torch.autograd.grad(
+                    bootstrap_loss, params, retain_graph=True, allow_unused=True
+                )
+                self.agg["reward_grad_boot"].append(_grads_norm(list(boot_grads)))
+            else:
+                self.agg["reward_grad_boot"].append(0.0)
         self.opt_pi.zero_grad(set_to_none=True)
         pi_loss.backward()
         grad_norm = _clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_value)
@@ -1323,7 +1383,7 @@ class Trainer:
             self.opt_pi.step()
         return grad_norm
 
-    def update_critic(self, batch: dict) -> tuple[torch.Tensor, float]:
+    def update_critic(self, batch: dict) -> tuple[torch.Tensor, float, torch.Tensor]:
         cfg = self.cfg
         horizon, n = batch["reward"].shape
         flat = _unflatten_time(batch["states"], horizon + 1)
@@ -1335,7 +1395,10 @@ class Trainer:
         ensemble = self.critic.ensemble
         with torch.no_grad():
             # One λ-return per head, from that head's own bootstrap.
-            values = self.critic(features).view(horizon + 1, n, ensemble)
+            values = self.critic.expected_values(self._critic_fwd(self.critic, features)).view(
+                horizon + 1, n, ensemble
+            )
+            value_mean = values.mean()
             target = values[-1]
             targets = []
             reward = batch["reward"].unsqueeze(-1)
@@ -1355,17 +1418,16 @@ class Trainer:
             order = torch.randperm(count, device=pred_in.device)
             for i in range(cfg.critic_minibatches):
                 idx = order[i * minibatch : (i + 1) * minibatch]
-                pred = self.critic(pred_in[idx])
-                last = (pred - target_flat[idx]).square().mean()
+                pred = self._critic_fwd(self.critic, pred_in[idx])
+                last = self.critic.compute_loss(pred, target_flat[idx])
                 self.opt_v.zero_grad(set_to_none=True)
                 last.backward()
-                # Clip each head on its own so one head's norm does not rescale the other.
                 head_norms = [
                     _clip_grads(head.parameters(), cfg.grad_clip_norm) for head in self.critic.heads
                 ]
                 norms.append(sum(head_norms) / len(head_norms))
                 self.opt_v.step()
-        return last.detach(), _mean(norms)
+        return last.detach(), _mean(norms), value_mean.detach()
 
     def _log(self, iteration: int, lr: float, pi_lr: float) -> None:
         cfg = self.cfg
@@ -1392,6 +1454,7 @@ class Trainer:
             _mean(self.agg["err"]),
             _mean(self.agg["pi"]),
             _mean(self.agg["v"]),
+            _mean(self.agg["value_mean"]),
             _mean(self.agg["score"]),
             _mean(self.agg["surv"]),
             _mean(self.stats["r"]),
@@ -1440,12 +1503,13 @@ class Trainer:
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
-            "train/imag_score": row[6],
-            "train/imag_survival": row[7],
-            "train/sim_score": row[8],
-            "train/ep_score": row[9],
+            "train/value_mean": row[6],
+            "train/imag_score": row[7],
+            "train/imag_survival": row[8],
+            "train/sim_score": row[9],
+            "train/ep_score": row[10],
             "train/term_frac": term,
-            "train/it_per_s": row[11],
+            "train/it_per_s": row[12],
             "train/lr": lr,
             "train/pi_lr": pi_lr,
             "grad/wm": gn_wm,
@@ -1490,10 +1554,10 @@ class Trainer:
         )
         print(
             f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} e8 {row[3]:.4f} | "
-            f"pi {row[4]:.3f} v {row[5]:.4f} imag {row[6]:.3f} surv {row[7]:.3f} | "
-            f"sim {row[8]:.3f} ep {row[9]:.3f} term {term:.2f} | "
+            f"pi {row[4]:.3f} v {row[5]:.4f} V {row[6]:.3f} imag {row[7]:.3f} surv {row[8]:.3f} | "
+            f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
-            f"{ent_s} {row[11]:.2f} it/s | pi_lr {pi_lr:.2e} | "
+            f"{ent_s} {row[12]:.2f} it/s | pi_lr {pi_lr:.2e} | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
             f"D loss {disc_loss:.3f} real {disc_real:.2f} fake {disc_fake:.2f} acc {disc_acc:.2f} | "
@@ -1519,6 +1583,7 @@ class Trainer:
             "err": [],
             "pi": [],
             "v": [],
+            "value_mean": [],
             "score": [],
             "surv": [],
             "gn_wm": [],

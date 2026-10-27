@@ -39,6 +39,11 @@ def main(cfg: DictConfig) -> None:
         critic_epochs=int(cfg.critic_epochs),
         critic_minibatches=int(cfg.critic_minibatches),
         critic_ensemble=int(cfg.critic_ensemble),
+        critic_kind=str(cfg.critic_kind),
+        critic_atoms=int(cfg.critic_atoms),
+        critic_v_min=float(cfg.critic_v_min),
+        critic_v_max=float(cfg.critic_v_max),
+        critic_sigma_ratio=float(cfg.critic_sigma_ratio),
         lr_decay_iters=int(cfg.lr_decay_iters),
         wm_norm=str(cfg.wm_norm),
         wm_residual=bool(cfg.wm_residual),
@@ -74,6 +79,7 @@ def main(cfg: DictConfig) -> None:
         wm_ckpt=None if cfg.wm_ckpt is None else str(cfg.wm_ckpt),
         wm_tune=str(cfg.wm_tune),
         optim=str(cfg.optim),
+        policy_bootstrap=bool(cfg.policy_bootstrap),
     )
     run(train_cfg, run_dir)
 

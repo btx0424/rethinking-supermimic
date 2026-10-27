@@ -44,6 +44,173 @@ def _norm(kind: str, dim: int) -> nn.Module:
     raise ValueError(f"Unknown normalization {kind!r}.")
 
 
+class EnsembleLinear(nn.Module):
+    """``ensemble`` independent linears in one einsum.
+
+    Each weight is a separate ``(out, in)`` parameter, so Muon sees a matrix per
+    member. Bias stays 1D and is left to AdamW. ``x`` is ``(ensemble, ..., in)``;
+    the caller expands a shared input. The output is ``(ensemble, ..., out)``.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        ensemble: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if ensemble < 1:
+            raise ValueError(f"ensemble must be >= 1, got {ensemble}.")
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.ensemble = int(ensemble)
+        factory = {"device": device, "dtype": dtype}
+        self.weight = nn.ParameterList(
+            nn.Parameter(torch.empty(self.out_features, self.in_features, **factory))
+            for _ in range(self.ensemble)
+        )
+        if bias:
+            self.bias = nn.ParameterList(
+                nn.Parameter(torch.empty(self.out_features, **factory)) for _ in range(self.ensemble)
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        bound = 1.0 / math.sqrt(self.in_features) if self.in_features else 0.0
+        for weight in self.weight:
+            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        if self.bias is not None:
+            for bias in self.bias:
+                nn.init.uniform_(bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = torch.stack(tuple(self.weight), dim=0)
+        y = torch.einsum("eoi,e...i->e...o", weight, x)
+        if self.bias is not None:
+            bias = torch.stack(tuple(self.bias), dim=0)
+            y = y + bias.view(self.ensemble, *([1] * (y.dim() - 2)), self.out_features)
+        return y
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"ensemble={self.ensemble}, bias={self.bias is not None}"
+        )
+
+
+class EnsembleLayerNorm(nn.Module):
+    """``ensemble`` independent layer norms over ``normalized_shape``.
+
+    Affine parameters are marked off Muon: a scale of shape ``(ensemble, *normalized_shape)``
+    is not a hidden matrix. ``x`` is ``(ensemble, ..., *normalized_shape)``.
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int | tuple[int, ...],
+        ensemble: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if ensemble < 1:
+            raise ValueError(f"ensemble must be >= 1, got {ensemble}.")
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(int(n) for n in normalized_shape)
+        self.ensemble = int(ensemble)
+        self.eps = float(eps)
+        self.elementwise_affine = bool(elementwise_affine)
+        factory = {"device": device, "dtype": dtype}
+        if self.elementwise_affine:
+            shape = (self.ensemble, *self.normalized_shape)
+            self.weight = nn.Parameter(torch.empty(shape, **factory))
+            self.weight._non_muon = True  # type: ignore[attr-defined]
+            if bias:
+                self.bias = nn.Parameter(torch.empty(shape, **factory))
+                self.bias._non_muon = True  # type: ignore[attr-defined]
+            else:
+                self.register_parameter("bias", None)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.elementwise_affine:
+            nn.init.ones_(self.weight)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        mean = x.mean(dim=dims, keepdim=True)
+        var = x.var(dim=dims, unbiased=False, keepdim=True)
+        y = (x - mean) * torch.rsqrt(var + self.eps)
+        if self.weight is not None:
+            view = (self.ensemble, *([1] * (y.dim() - 1 - len(self.normalized_shape))), *self.normalized_shape)
+            y = y * self.weight.view(view)
+            if self.bias is not None:
+                y = y + self.bias.view(view)
+        return y
+
+
+class EnsembleRMSNorm(nn.Module):
+    """``ensemble`` independent RMS norms over ``normalized_shape``.
+
+    ``eps=None`` uses the dtype epsilon, as ``nn.RMSNorm`` does. Affine parameters
+    are marked off Muon. ``x`` is ``(ensemble, ..., *normalized_shape)``.
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int | tuple[int, ...],
+        ensemble: int,
+        eps: float | None = None,
+        elementwise_affine: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if ensemble < 1:
+            raise ValueError(f"ensemble must be >= 1, got {ensemble}.")
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(int(n) for n in normalized_shape)
+        self.ensemble = int(ensemble)
+        self.eps = eps
+        self.elementwise_affine = bool(elementwise_affine)
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(
+                torch.empty(self.ensemble, *self.normalized_shape, device=device, dtype=dtype)
+            )
+            self.weight._non_muon = True  # type: ignore[attr-defined]
+        else:
+            self.register_parameter("weight", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.elementwise_affine:
+            nn.init.ones_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        eps = torch.finfo(x.dtype).eps if self.eps is None else self.eps
+        y = x * torch.rsqrt(x.pow(2).mean(dim=dims, keepdim=True) + eps)
+        if self.weight is not None:
+            view = (self.ensemble, *([1] * (y.dim() - 1 - len(self.normalized_shape))), *self.normalized_shape)
+            y = y * self.weight.view(view)
+        return y
+
+
 class Block(nn.Module):
     def __init__(self, din: int, dout: int, norm: str, residual: bool | float):
         super().__init__()
@@ -393,7 +560,7 @@ class Policy(nn.Module):
         return (self.log_std + 0.5 * (1.0 + math.log(2.0 * math.pi))).sum()
 
 
-class Critic(nn.Module):
+class ScalarCritic(nn.Module):
     """Independent value heads. Callers average them only for the policy bootstrap."""
 
     def __init__(
@@ -411,7 +578,7 @@ class Critic(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Values with the ensemble on the last axis, shape ``(*, ensemble)``."""
-        return torch.stack([head(x).squeeze(-1) for head in self.heads], dim=-1)
+        return critic_forward(self, x)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         # Checkpoints from the single critic stored one MLP under ``net``.
@@ -422,3 +589,92 @@ class Critic(nn.Module):
                 ("heads.0." + key.removeprefix("net.")): value for key, value in state_dict.items()
             }
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
+    
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (pred - target).square().mean()
+
+    def expected_values(self, pred: torch.Tensor) -> torch.Tensor:
+        return pred
+
+
+def hl_gauss(values: torch.Tensor, support: torch.Tensor, sigma_ratio: float = 0.75) -> torch.Tensor:
+    """Soft histogram of a scalar onto bin centers. ``values`` is ``(...,)``, result ``(..., atoms)``."""
+    z = support.to(device=values.device, dtype=values.dtype)
+    delta = (z[-1] - z[0]) / (z.numel() - 1)
+    sigma = (sigma_ratio * delta).clamp_min(torch.finfo(values.dtype).tiny * 256)
+    center = values.unsqueeze(-1).clamp(z[0], z[-1])
+    scale = sigma * math.sqrt(2.0)
+    half = 0.5 * delta
+    cdf_hi = 0.5 * (1.0 + torch.erf((z + half - center) / scale))
+    cdf_lo = 0.5 * (1.0 + torch.erf((z - half - center) / scale))
+    probs = (cdf_hi - cdf_lo).clamp_min(0.0)
+    return probs / probs.sum(-1, keepdim=True).clamp_min(1e-8)
+
+
+class ClassificationCritic(nn.Module):
+    """HL-Gauss value classifier (arXiv 2403.03950).
+
+    Each head outputs atom logits. The loss is cross-entropy against the
+    histogram of the scalar target. GAE and the policy bootstrap read
+    ``expected_values``.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        norm: str = "layer",
+        ensemble: int = 2,
+        num_atoms: int = 51,
+        v_min: float = -2.0,
+        v_max: float = 15.0,
+        sigma_ratio: float = 0.75,
+    ):
+        super().__init__()
+        n = int(ensemble)
+        atoms = int(num_atoms)
+        if n < 1:
+            raise ValueError(f"critic ensemble must be >= 1, got {n}")
+        if atoms < 2:
+            raise ValueError(f"num_atoms must be >= 2, got {atoms}")
+        if not v_min < v_max:
+            raise ValueError(f"v_min must be below v_max, got {v_min}, {v_max}")
+        self.ensemble = n
+        self.num_atoms = atoms
+        self.sigma_ratio = float(sigma_ratio)
+        self.heads = nn.ModuleList(MLP(in_dim, [512, 256, 256], atoms, norm=norm) for _ in range(n))
+        self.register_buffer("support", torch.linspace(v_min, v_max, atoms))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Expected values, shape ``(*, ensemble)``. The loss path uses the logits."""
+        return self.expected_values(critic_forward(self, x))
+
+    def expected_values(self, logits: torch.Tensor) -> torch.Tensor:
+        """``logits`` is ``(..., ensemble, atoms)``. Returns ``(..., ensemble)``."""
+        probs = logits.softmax(dim=-1)
+        z = self.support.to(device=logits.device, dtype=logits.dtype)
+        return (probs * z).sum(dim=-1)
+
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Cross-entropy. ``pred`` is logits ``(N, ensemble, atoms)``, ``target`` is ``(N, ensemble)``."""
+        dist = hl_gauss(target, self.support, self.sigma_ratio)
+        log_probs = pred.log_softmax(dim=-1)
+        return -(dist * log_probs).sum(dim=-1).mean()
+
+
+def critic_forward(critic: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Both heads under one autocast, so a compiled call sees every GEMM.
+
+    Each ``MLP.forward`` opens its own autocast, which splits the graph. This
+    runs the blocks directly and casts back to fp32 once.
+    """
+
+    def values(x: torch.Tensor) -> torch.Tensor:
+        outs = [head.head(head.blocks(x)) for head in critic.heads]
+        if getattr(critic, "num_atoms", None):
+            return torch.stack(outs, dim=-2)
+        return torch.stack([out.squeeze(-1) for out in outs], dim=-1)
+
+    if AMP_DTYPE is None or x.device.type == "cpu":
+        return values(x)
+    with torch.autocast(x.device.type, dtype=AMP_DTYPE):
+        return values(x).float()
