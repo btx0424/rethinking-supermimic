@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import N_BODY, N_CONTACT, NUM_J, STATE_DIM, XI_DIM
+from supermimic.mdp import N_BODY, N_CONTACT, NUM_J, STATE_DIM, XI_DIM
 
 
 class ReplayBuffer:

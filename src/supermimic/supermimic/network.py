@@ -11,8 +11,8 @@ import math
 import torch
 import torch.nn as nn
 
-from .math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
-from .mdp import (
+from supermimic.math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
+from supermimic.mdp import (
     BODY_POS_DIM,
     GOAL_DIM,
     INV_DIM,
@@ -348,7 +348,7 @@ class WorldModel(nn.Module):
         if frame not in WM_FRAMES:
             raise ValueError(f"wm frame must be one of {WM_FRAMES}, got {frame!r}.")
         self.frame = frame
-        from .mdp import XI_DIM
+        from supermimic.mdp import XI_DIM
 
         feat_dim = PELVIS_FEAT_DIM if frame == "pelvis" else INV_DIM
         self.net = MLP(

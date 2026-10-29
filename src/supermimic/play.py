@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
@@ -13,11 +15,10 @@ import viser
 from mjviser import ViserMujocoScene
 from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 
-from .kinematics import compile_g1, make_kinematics
-from .mdp import GOAL_DIM, GOAL_FRAMES, HIST, PAPER_OBS_TERMS
-from .motion import MotionLib
-from .mdp import WorldModelState
-from .network import InputNorms, build_policy
+from supermimic.kinematics import compile_g1, make_kinematics
+from supermimic.mdp import GOAL_DIM, GOAL_FRAMES, HIST, NUM_J, PAPER_OBS_TERMS, WorldModelState
+from supermimic.motion import MotionLib
+from supermimic.supermimic.network import InputNorms, build_policy
 
 # Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
 _REF_RGB = (40, 120, 255)
@@ -62,6 +63,126 @@ def _fk(
 
 def _clip_length(motion: MotionLib, clip: int) -> int:
     return int(motion.clip_end[clip] - motion.clip_start[clip])
+
+
+@dataclass
+class PolicyOverlay:
+    algo: str
+    sim: object
+    reset: Callable[[int], None]
+    step: Callable[[], bool]
+    pose: Callable[[], tuple[np.ndarray, np.ndarray, np.ndarray]]
+
+
+def _tracking_sim(ckpt: dict, device: str):
+    from supermimic.sim import TrackingSim
+
+    saved_cfg = ckpt.get("cfg", {})
+    model, joint_names = compile_g1()
+    kin = make_kinematics(model, joint_names, str(saved_cfg.get("fk", "warp")), device)
+    kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
+    motion_dev = MotionLib.load(device=device)
+    sim = TrackingSim(
+        1,
+        motion_dev,
+        kin,
+        device,
+        eval_mode=True,
+        reset_noise=False,
+        anchor=str(saved_cfg.get("anchor", "torso")),
+        obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
+        reward_style=str(saved_cfg.get("reward_style", "gaussian")),
+    )
+    return sim, saved_cfg
+
+
+def _load_policy_overlay(ckpt: Path, device: str) -> PolicyOverlay:
+    saved = torch.load(ckpt, map_location=device, weights_only=False)
+    sim, saved_cfg = _tracking_sim(saved, device)
+
+    def pose_np() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        p, quat, _v, _w, q, _qd = sim.state()
+        return (
+            p[0].detach().cpu().numpy(),
+            quat[0].detach().cpu().numpy(),
+            q[0].detach().cpu().numpy(),
+        )
+
+    def reset_policy(clip: int, motion: MotionLib) -> None:
+        start_f = motion.clip_start[clip].to(device).view(1)
+        sim.reset(torch.zeros(1, dtype=torch.long, device=device), start_f)
+
+    if "pi" in saved:
+        policy = build_policy(sim.mdp.obs_dim, GOAL_DIM, HIST, saved_cfg).to(device)
+        policy.load_state_dict(saved["pi"])
+        policy.eval()
+        norms = InputNorms(sim.mdp.obs_dim).to(device)
+        norms.load_state_dict(saved["norms"])
+        obs_hist = torch.zeros(1, HIST, sim.mdp.obs_dim, device=device)
+
+        def reset(clip: int) -> None:
+            reset_policy(clip, sim.motion)
+            obs_hist.zero_()
+
+        def step() -> bool:
+            p, quat, v, w, q, qd = sim.state()
+            bodies = sim.tracked_bodies()
+            state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+            obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
+            fresh = sim.ep_step == 0
+            obs_hist[:] = torch.where(
+                fresh[:, None, None],
+                obs[:, None, :].expand(-1, HIST, -1),
+                torch.cat((obs_hist[:, 1:], obs[:, None, :]), dim=1),
+            )
+            goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+            with torch.no_grad():
+                action = policy(obs_hist, goal, norms, deterministic=True)
+            out = sim.step(action, auto_reset=False)
+            return not bool(out["done"].any())
+
+        return PolicyOverlay("supermimic", sim, reset, step, pose_np)
+
+    if "actor" in saved:
+        from supermimic.sac.network import NormalActor
+        from supermimic.sac.util import ObsVecNorm
+
+        policy_obs_dim = sim.mdp.obs_dim + GOAL_DIM
+        actor = NormalActor(
+            policy_obs_dim,
+            NUM_J,
+            action_init=str(saved_cfg.get("actor_init", "zeros")),
+        ).to(device)
+        actor.load_state_dict(saved["actor"])
+        actor.eval()
+        use_vecnorm = bool(saved_cfg.get("vecnorm", True))
+        vecnorm = ObsVecNorm(policy_obs_dim).to(device) if use_vecnorm else None
+        if vecnorm is not None and "vecnorm" in saved:
+            vecnorm.load_state_dict(saved["vecnorm"])
+        if vecnorm is not None:
+            vecnorm.eval()
+
+        def reset(clip: int) -> None:
+            reset_policy(clip, sim.motion)
+
+        def step() -> bool:
+            p, quat, v, w, q, qd = sim.state()
+            bodies = sim.tracked_bodies()
+            state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+            obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
+            goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+            policy_obs = torch.cat([obs, goal], dim=-1)
+            with torch.no_grad():
+                obs_n = vecnorm(policy_obs) if vecnorm is not None else policy_obs
+                loc, _scale = actor(obs_n)
+                action = loc
+            out = sim.step(action, auto_reset=False)
+            return not bool(out["done"].any())
+
+        return PolicyOverlay("sac", sim, reset, step, pose_np)
+
+    keys = ", ".join(sorted(saved.keys()))
+    raise ValueError(f"Checkpoint is not SuperMimic (pi) or SAC (actor). Keys: {keys}")
 
 
 class GhostRobot:
@@ -131,32 +252,9 @@ def play(
     clip_names = list(motion.clip_names)
     overlay = ckpt is not None
 
-    policy = norms = sim = obs_hist = None
+    overlay_policy: PolicyOverlay | None = None
     if overlay:
-        from .sim import TrackingSim
-
-        saved = torch.load(ckpt, map_location=device, weights_only=False)
-        saved_cfg = saved.get("cfg", {})
-        kin = make_kinematics(model, joint_names, str(saved_cfg.get("fk", "warp")), device)
-        kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
-        motion_dev = MotionLib.load(device=device)
-        sim = TrackingSim(
-            1,
-            motion_dev,
-            kin,
-            device,
-            eval_mode=True,
-            reset_noise=False,
-            anchor=str(saved_cfg.get("anchor", "torso")),
-            obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
-            reward_style=str(saved_cfg.get("reward_style", "gaussian")),
-        )
-        policy = build_policy(sim.mdp.obs_dim, GOAL_DIM, HIST, saved_cfg).to(device)
-        policy.load_state_dict(saved["pi"])
-        policy.eval()
-        norms = InputNorms(sim.mdp.obs_dim).to(device)
-        norms.load_state_dict(saved["norms"])
-        obs_hist = torch.zeros(1, HIST, sim.mdp.obs_dim, device=device)
+        overlay_policy = _load_policy_overlay(ckpt, device)
 
     server = viser.ViserServer(port=port, label="SuperMimic play")
     # Solid robot: policy when overlaying, otherwise the reference.
@@ -235,39 +333,6 @@ def play(
             gx, gq = _fk(model, data, *ghost_pose, qpos_adr)
             ghost.update(gx, gq)
 
-    def policy_pose_np() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        assert sim is not None
-        p, quat, _v, _w, q, _qd = sim.state()
-        return (
-            p[0].detach().cpu().numpy(),
-            quat[0].detach().cpu().numpy(),
-            q[0].detach().cpu().numpy(),
-        )
-
-    def reset_policy(clip: int) -> None:
-        assert sim is not None and obs_hist is not None
-        start_f = motion.clip_start[clip].to(device).view(1)
-        sim.reset(torch.zeros(1, dtype=torch.long, device=device), start_f)
-        obs_hist.zero_()
-
-    def step_policy() -> bool:
-        assert sim is not None and policy is not None and norms is not None and obs_hist is not None
-        p, quat, v, w, q, qd = sim.state()
-        bodies = sim.tracked_bodies()
-        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
-        obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
-        fresh = sim.ep_step == 0
-        obs_hist[:] = torch.where(
-            fresh[:, None, None],
-            obs[:, None, :].expand(-1, HIST, -1),
-            torch.cat((obs_hist[:, 1:], obs[:, None, :]), dim=1),
-        )
-        goal = sim.motion.goal(sim.f, GOAL_FRAMES)
-        with torch.no_grad():
-            action = policy(obs_hist, goal, norms, deterministic=True)
-        out = sim.step(action, auto_reset=False)
-        return not bool(out["done"].any())
-
     @clip_box.on_update
     def _(_event: viser.GuiEvent) -> None:
         clip = clip_names.index(clip_box.value)
@@ -281,8 +346,11 @@ def play(
     refresh_info(0)
     push_scene(reference_pose(0, 0), None)
     print(f"Viewer at http://localhost:{port} ({hz:g} Hz)", flush=True)
-    if ckpt is not None:
-        print(f"Policy checkpoint: {ckpt}", flush=True)
+    if overlay_policy is not None:
+        print(
+            f"Policy checkpoint ({overlay_policy.algo}): {ckpt}",
+            flush=True,
+        )
 
     if hz <= 0:
         raise ValueError(f"hz must be positive, got {hz}.")
@@ -322,9 +390,9 @@ def play(
                 state["frame"] = 0
                 frame_slider.value = 0
                 ref = reference_pose(clip, 0)
-                if overlay:
-                    reset_policy(clip)
-                    publish(clip, 0, policy_pose_np(), ref, force=True)
+                if overlay_policy is not None:
+                    overlay_policy.reset(clip)
+                    publish(clip, 0, overlay_policy.pose(), ref, force=True)
                 else:
                     publish(clip, 0, ref, None, force=True)
                 accumulator = 0.0
@@ -337,12 +405,13 @@ def play(
                 steps = int(accumulator)
                 if steps > 0:
                     accumulator -= steps
-                    if overlay:
+                    if overlay_policy is not None:
                         alive = True
                         for _ in range(steps):
-                            alive = step_policy()
+                            alive = overlay_policy.step()
                             if not alive:
                                 break
+                        sim = overlay_policy.sim
                         state["frame"] = min(int(sim.ep_step[0].item()), length - 1)  # type: ignore[union-attr]
                         if not alive:
                             if loop.value:
@@ -362,8 +431,8 @@ def play(
                 if draw:
                     local = int(state["frame"])
                     ref = reference_pose(clip, local)
-                    if overlay and sim is not None:
-                        publish(clip, local, policy_pose_np(), ref)
+                    if overlay_policy is not None:
+                        publish(clip, local, overlay_policy.pose(), ref)
                     else:
                         publish(clip, local, ref, None)
             else:
@@ -372,8 +441,8 @@ def play(
                 if draw:
                     local = int(state["frame"])
                     ref = reference_pose(clip, local)
-                    if overlay and sim is not None:
-                        publish(clip, local, policy_pose_np(), ref)
+                    if overlay_policy is not None:
+                        publish(clip, local, overlay_policy.pose(), ref)
                     else:
                         publish(clip, local, ref, None)
 
@@ -387,7 +456,12 @@ def play(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--ckpt", type=Path, default=None, help="Policy checkpoint for overlay.")
+    parser.add_argument(
+        "--ckpt",
+        type=Path,
+        default=None,
+        help="SuperMimic (pi) or SAC (actor) checkpoint for overlay.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--hz", type=float, default=30.0, help="Viewer update rate. The clip and policy still step at 50 Hz.")
     args = parser.parse_args()

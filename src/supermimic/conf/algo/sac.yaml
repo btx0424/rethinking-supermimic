@@ -1,0 +1,27 @@
+# @package _global_
+algo: sac
+
+# SAC update schedule (see sac_rlpd / FlashSAC defaults)
+n_steps: 3
+lr: 5.0e-4
+lr_alpha: 5.0e-4
+weight_decay: 0.02
+warm_up_steps: 200
+actor_lr_warmup_ops: 100
+train_every: 4
+utd_ratio: 4
+critic_batch_size: 2048
+actor_batch_size: 2048
+alpha_init: 4.0e-3
+target_entropy_sigma: 0.15
+entropy_bonus: 1.0
+target_action_noise: 0.01
+max_grad_norm: 1.0
+actor_init: zeros
+vecnorm: true
+use_amp: false
+actor_tau: 0.02
+critic_tau: 0.02
+normalize_reward: true
+ckpt_every: 1000
+pi_ema: 0.995

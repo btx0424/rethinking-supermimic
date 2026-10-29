@@ -1,5 +1,5 @@
 defaults:
-  - actor: deep
+  - algo: supermimic
   - _self_
 
 hydra:
@@ -11,109 +11,40 @@ hydra:
     dir: logs/${swanlab.experiment}/multirun/${now:%Y-%m-%d_%H-%M-%S}
     subdir: ${hydra.job.num}
 
-# Policy observation. Terms are concatenated in this order.
-# The first five are Table A.1. anchor_ori is the 6D reference orientation
-# of the anchor body in the robot anchor frame.
+# Algorithm: set via defaults (`algo=supermimic`) or CLI (`python train.py algo=sac`).
 obs:
   joint_pos: true
   joint_vel: true
   base_ang_vel: true
-  # Body-frame linear velocity. Uni's policy observation does not include it.
   base_lin_vel: false
   projected_gravity: true
   last_action: true
-  # 6D reference orientation of the anchor in the robot anchor frame.
-  # With anchor=pelvis this is the reference root in the robot root, as in Uni.
   anchor_ori: true
-  # Heading-frame position of the reference anchor relative to the robot anchor.
-  # With anchor=pelvis this is the root position error, including xy drift.
   anchor_pos: true
-  # Tracking error of the 14 reward bodies (anchor-aligned). The world model
-  # reads the same kinematics, so these observations are already paid for.
   body_pos: true
   body_ori: true
 
-# Reward anchor and the body used by obs.anchor_ori. torso or pelvis.
 anchor: pelvis
-# Tracking kernel only. Action-rate and joint-limit stay the paper penalties.
-# gaussian | cauchy | gaussian_linear.
 reward_style: gaussian
 
 num_envs: 4096
-iterations: 320000
+iterations: 40000
 buffer_steps: 1000
 utd: 0.4
-horizon: 32
-wm_window: 8
-wm_batches: 10
-wm_batch: 2048
-pi_batch: 4096
-wm_lr: 2.0e-4
-pi_lr: 5.0e-4
-# Actor learning rate ramps 0 → pi_lr, then joins the cosine decay.
-pi_warmup: 50
-v_lr: 5.0e-4
-# adam | muon. Muon on hidden matrices of the world model and the policy.
-# First Linear, output heads, and the critic stay Adam.
-optim: muon
 gamma: 0.99
-lam: 0.95
-action_noise: 0.1
-critic_epochs: 5
-critic_minibatches: 4
-# Independent value heads. Each head has its own GAE target and value loss.
-# The policy bootstrap is the mean across heads. false drops it from the actor loss.
-# The critic still fits its own value targets.
+optim: muon
+
+# Shared critic settings (SuperMimic GAE critic and SAC Q).
 critic_ensemble: 2
-policy_bootstrap: true
-# scalar: MSE. classification: HL-Gauss cross-entropy; GAE uses the expected value.
-# With normalize_reward, classification ignores v_min/v_max and uses ± r_max/(1-γ).
 critic_kind: scalar
 critic_atoms: 51
 critic_v_min: -2.0
 critic_v_max: 15.0
 critic_sigma_ratio: 0.75
-lr_decay_iters: 250000
-wm_norm: rms
-wm_residual: false
-# heading keeps the yaw frame. pelvis writes features and the position increment
-# in the full pelvis frame, so crawling does not cross the yaw cut.
-wm_frame: pelvis
-stochastic_actor: false
-# Grad clipping. null / <=0 disables. Norms always logged (grad/wm, grad/pi, grad/v).
-grad_clip_norm: 1.0
-grad_clip_value: null  # policy only; null disables
-# Running return-based reward scale for policy/critic (FlashSAC-style). Off by default.
-# G_max is MAX_STEP_REWARD/(1-γ) from the MDP, not a hyperparameter.
-normalize_reward: false
-# torch.compile the world model and one imagination step. false runs both eager.
-compile: true
-# World-model compile unit: window (whole K-loop) or step (one transition; K-loop eager).
-compile_wm: window
-# MLP GEMMs in bf16; state integration stays fp32. none is fp32.
-amp: bf16
-# Reward / world-model FK. torch compiles with the imagination graph; warp does not.
-fk: torch
-# Weight of the LSGAN generator loss added to the world-model MSE. 0 disables it.
-adv_coef: 0.0
-# Weight of the L1 reward match added to the world-model MSE. 0 disables it.
-reward_coef: 0.0
-# Per-body ground-contact BCE added to the world-model MSE. The predicted
-# probability is also an input of the next increment. 0 drops the BCE only.
-contact_coef: 0.01
+
 device: cuda
 log_every: 50
-ckpt_every: 1000
 seed: 0
-# Path to a checkpoint to continue from. null starts fresh.
-# Older checkpoints may omit modules (disc, reward_norm, …); those stay at init.
-resume: null
-# Checkpoint to load only the world model from (a previous run's ckpt or last.pt).
-# null trains the world model from scratch. Policy and critic always start fresh.
-wm_ckpt: null
-# frozen: loaded weights and their state/action/ξ normalizers stay fixed.
-# tunable: keep training the loaded world model.
-wm_tune: tunable
 
 swanlab:
   project: rethinking-supermimic

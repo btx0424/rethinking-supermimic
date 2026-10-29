@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import time
 from contextlib import contextmanager
@@ -18,8 +19,9 @@ torch_logging.set_logs(dynamo=logging.INFO, inductor=logging.INFO)
 
 from torch.utils.tensorboard import SummaryWriter
 
-from .buffer import ReplayBuffer
-from .mdp import (
+from supermimic.algos.buffer import ReplayBuffer
+from supermimic.sac.util import soft_copy_
+from supermimic.mdp import (
     CONTROL_DT,
     GOAL_DIM,
     GOAL_FRAMES,
@@ -39,8 +41,8 @@ from .mdp import (
     normalize_xi,
     unflatten_state,
 )
-from . import network
-from .network import (
+from supermimic.algos import network
+from supermimic.algos.network import (
     ClassificationCritic,
     InputNorms,
     MLP,
@@ -50,13 +52,13 @@ from .network import (
     WorldModelState,
     critic_forward,
 )
-from .reward_norm import RewardNormalizer
+from supermimic.algos.reward_norm import RewardNormalizer
 
 
 @dataclass
 class TrainConfig:
     num_envs: int = 4096
-    iterations: int = 320_000
+    iterations: int = 40_000
     buffer_steps: int = 1000
     utd: float = 0.4
     horizon: int = 32
@@ -123,7 +125,10 @@ class TrainConfig:
     # loss trains them even at 0. 0.01 keeps BCE on the scale of the state MSE.
     contact_coef: float = 0.01
     log_every: int = 50
-    ckpt_every: int = 2000
+    ckpt_every: int = 500
+    # Polyak EMA of policy weights for eval/checkpoints (instantTrack ``--pi_ema``).
+    # Rollout and BPTT still use the online policy; ``None`` disables EMA.
+    pi_ema: float | None = 0.995
     seed: int = 0
     # Continue from this checkpoint. Missing modules (older runs) are left at init.
     resume: str | None = None
@@ -362,6 +367,22 @@ def contact_bce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Mean of the per-body binary cross-entropies. Both tensors are ``(K, B, bodies)``."""
     per_body = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none")
     return per_body.mean(dim=(0, 1)).mean()
+
+
+@torch.no_grad()
+def contact_precision_recall(
+    logits: torch.Tensor, target: torch.Tensor, *, threshold: float = 0.5
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Micro precision and recall for sparse foot-contact labels ``(K, B, bodies)``."""
+    pred = logits.sigmoid() >= threshold
+    truth = target >= 0.5
+    tp = (pred & truth).sum().to(logits.dtype)
+    fp = (pred & ~truth).sum().to(logits.dtype)
+    fn = (~pred & truth).sum().to(logits.dtype)
+    eps = 1e-8
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    return precision, recall
 
 
 def world_model_step(
@@ -644,9 +665,9 @@ class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from .kinematics import compile_g1, make_kinematics
-        from .motion import MotionLib
-        from .sim import TrackingSim
+        from supermimic.kinematics import compile_g1, make_kinematics
+        from supermimic.motion import MotionLib
+        from supermimic.sim import TrackingSim
 
         self.cfg = cfg
         self.log_dir = Path(log_dir)
@@ -735,6 +756,13 @@ class Trainer:
             norm=cfg.policy_norm,
             kind=cfg.policy_kind,
         ).to(self.device)
+        self.pi_ema_tau = 1.0 - cfg.pi_ema if cfg.pi_ema is not None else None
+        if self.pi_ema_tau is not None:
+            self.policy_ema = copy.deepcopy(self.policy)
+            self.policy_ema.requires_grad_(False)
+            self.policy_ema.eval()
+        else:
+            self.policy_ema = None
         in_dim = INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM
         if cfg.critic_kind == "classification":
             v_min, v_max = cfg.critic_v_min, cfg.critic_v_max
@@ -763,7 +791,7 @@ class Trainer:
         else:
             raise ValueError(f"critic_kind must be 'scalar' or 'classification', got {cfg.critic_kind!r}.")
         self.norms = InputNorms(obs_dim).to(self.device)
-        from .optim import build_optimizer
+        from supermimic.optim import build_optimizer
 
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
         self.opt_pi = build_optimizer(self.policy, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95))
@@ -805,6 +833,8 @@ class Trainer:
             "wm_adv": [],
             "wm_reward": [],
             "wm_contact": [],
+            "wm_contact_prec": [],
+            "wm_contact_recall": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -859,7 +889,7 @@ class Trainer:
             "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
-            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,wm_loss_contact,"
+            "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,wm_loss_contact,wm_contact_prec,wm_contact_recall,"
             "grad_wm,grad_pi,grad_v,"
             "t_collect,t_wm,t_imagine,t_policy,t_critic\n"
         )
@@ -931,6 +961,8 @@ class Trainer:
         self.agg["wm_adv"].append(disc_stats["adv"])
         self.agg["wm_reward"].append(disc_stats["reward"])
         self.agg["wm_contact"].append(disc_stats["contact"])
+        self.agg["wm_contact_prec"].append(disc_stats["contact_prec"])
+        self.agg["wm_contact_recall"].append(disc_stats["contact_recall"])
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -1023,6 +1055,8 @@ class Trainer:
         adv_losses: list[torch.Tensor] = []
         reward_losses: list[torch.Tensor] = []
         contact_losses: list[torch.Tensor] = []
+        contact_precs: list[torch.Tensor] = []
+        contact_recalls: list[torch.Tensor] = []
         disc_losses: list[torch.Tensor] = []
         disc_reals: list[torch.Tensor] = []
         disc_fakes: list[torch.Tensor] = []
@@ -1037,7 +1071,9 @@ class Trainer:
                     batch, detach_pred=not (use_adv or use_reward)
                 )
                 mse, err8 = self.mse_loss(errors)
-                contact_loss = contact_bce(contact_logits, batch["c1"].transpose(0, 1))
+                contact_target = batch["c1"].transpose(0, 1)
+                contact_loss = contact_bce(contact_logits, contact_target)
+                contact_prec, contact_recall = contact_precision_recall(contact_logits, contact_target)
             if use_reward:
                 reward_l1 = self.reward_l1(preds, batch)
             else:
@@ -1065,6 +1101,8 @@ class Trainer:
             mse_losses.append(mse.detach())
             reward_losses.append(reward_l1.detach())
             contact_losses.append(contact_loss.detach())
+            contact_precs.append(contact_prec)
+            contact_recalls.append(contact_recall)
 
             # Features for D are detached. With coef 0 this is also the logged generator loss.
             d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
@@ -1086,6 +1124,8 @@ class Trainer:
             "adv": adv_mean,
             "reward": reward_mean,
             "contact": torch.stack(contact_losses).mean(),
+            "contact_prec": torch.stack(contact_precs).mean(),
+            "contact_recall": torch.stack(contact_recalls).mean(),
         }
         total = mse_mean + cfg.adv_coef * adv_mean + cfg.reward_coef * reward_mean + cfg.contact_coef * disc_stats["contact"]
         return total, err8, _mean(norms), disc_stats
@@ -1381,6 +1421,8 @@ class Trainer:
         grad_norm = _clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_value)
         if math.isfinite(grad_norm):
             self.opt_pi.step()
+            if self.pi_ema_tau is not None and self.policy_ema is not None:
+                soft_copy_(self.policy, self.policy_ema, self.pi_ema_tau)
         return grad_norm
 
     def update_critic(self, batch: dict) -> tuple[torch.Tensor, float, torch.Tensor]:
@@ -1478,7 +1520,22 @@ class Trainer:
         wm_adv = _mean(self.agg["wm_adv"])
         wm_reward = _mean(self.agg["wm_reward"])
         wm_contact = _mean(self.agg["wm_contact"])
-        row.extend((disc_loss, disc_real, disc_fake, disc_acc, wm_mse, wm_adv, wm_reward, wm_contact))
+        wm_contact_prec = _mean(self.agg["wm_contact_prec"])
+        wm_contact_recall = _mean(self.agg["wm_contact_recall"])
+        row.extend(
+            (
+                disc_loss,
+                disc_real,
+                disc_fake,
+                disc_acc,
+                wm_mse,
+                wm_adv,
+                wm_reward,
+                wm_contact,
+                wm_contact_prec,
+                wm_contact_recall,
+            )
+        )
         row.extend(
             (
                 gn_wm,
@@ -1500,6 +1557,8 @@ class Trainer:
             "train/wm_loss_adv": wm_adv,
             "train/wm_loss_reward": wm_reward,
             "train/wm_loss_contact": wm_contact,
+            "train/wm_contact_prec": wm_contact_prec,
+            "train/wm_contact_recall": wm_contact_recall,
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
@@ -1553,7 +1612,8 @@ class Trainer:
             for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
         )
         print(
-            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} e8 {row[3]:.4f} | "
+            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} "
+            f"contact {wm_contact:.4f} P {wm_contact_prec:.2f} R {wm_contact_recall:.2f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} V {row[6]:.3f} imag {row[7]:.3f} surv {row[8]:.3f} | "
             f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
@@ -1580,6 +1640,8 @@ class Trainer:
             "wm_adv": [],
             "wm_reward": [],
             "wm_contact": [],
+            "wm_contact_prec": [],
+            "wm_contact_recall": [],
             "err": [],
             "pi": [],
             "v": [],
@@ -1632,7 +1694,6 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         modules = {
             "wm": self.wm,
-            "pi": self.policy,
             "critic": self.critic,
             "disc": self.adv_loss,
             "norms": self.norms,
@@ -1645,6 +1706,36 @@ class Trainer:
         }
         loaded: list[str] = []
         absent: list[str] = []
+        if "pi" in ckpt or "pi_live" in ckpt:
+            live = ckpt.get("pi_live", ckpt.get("pi"))
+            if live is not None:
+                try:
+                    missing, unexpected = self.policy.load_state_dict(live, strict=False)
+                    loaded.append("pi_live" if "pi_live" in ckpt else "pi")
+                    if missing or unexpected:
+                        print(
+                            f"resume pi_live: missing={list(missing)} unexpected={list(unexpected)}",
+                            flush=True,
+                        )
+                except (ValueError, RuntimeError) as exc:
+                    absent.append("pi_live")
+                    print(f"resume skip pi_live: {exc}", flush=True)
+            if self.policy_ema is not None and "pi" in ckpt:
+                try:
+                    missing, unexpected = self.policy_ema.load_state_dict(ckpt["pi"], strict=False)
+                    loaded.append("pi_ema")
+                    if missing or unexpected:
+                        print(
+                            f"resume pi_ema: missing={list(missing)} unexpected={list(unexpected)}",
+                            flush=True,
+                        )
+                except (ValueError, RuntimeError) as exc:
+                    absent.append("pi_ema")
+                    print(f"resume skip pi_ema: {exc}", flush=True)
+            elif self.policy_ema is not None and live is not None:
+                self.policy_ema.load_state_dict(self.policy.state_dict(), strict=False)
+        else:
+            absent.append("pi")
         for key, module in modules.items():
             if key not in ckpt:
                 absent.append(key)
@@ -1685,9 +1776,15 @@ class Trainer:
         )
 
     def save_checkpoint(self, iteration: int) -> None:
+        if self.policy_ema is not None:
+            pi_state = self.policy_ema.state_dict()
+            pi_live_state = self.policy.state_dict()
+        else:
+            pi_state = self.policy.state_dict()
+            pi_live_state = None
         ckpt = {
             "wm": self.wm.state_dict(),
-            "pi": self.policy.state_dict(),
+            "pi": pi_state,
             "critic": self.critic.state_dict(),
             "disc": self.adv_loss.state_dict(),
             "norms": self.norms.state_dict(),
@@ -1698,6 +1795,8 @@ class Trainer:
             "iteration": iteration,
             "cfg": self.cfg.__dict__,
         }
+        if pi_live_state is not None:
+            ckpt["pi_live"] = pi_live_state
         if self.reward_norm is not None:
             ckpt["reward_norm"] = self.reward_norm.state_dict()
         path = self.log_dir / f"ckpt_{iteration:06d}.pt"

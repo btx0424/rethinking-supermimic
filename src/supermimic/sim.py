@@ -42,6 +42,7 @@ class TrackingSim:
         anchor: str = "torso",
         obs_terms: tuple[str, ...] | None = None,
         reward_style: str = "gaussian",
+        survival_bonus: float = 0.0,
     ):
         self.device = device
         # Keep the captured step graph's pool. A sync otherwise returns it to the
@@ -119,7 +120,9 @@ class TrackingSim:
         self._init_contact_index()
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
         self._default_ipos = self.sim.get_default_field("body_ipos").clone()
-        self.G_max = max_step_reward(reward_style) / (1.0 - gamma)
+        self.survival_bonus = float(survival_bonus)
+        self.r_max = max_step_reward(reward_style) + self.survival_bonus
+        self.G_max = self.r_max / (1.0 - gamma)
         self.bin_G = torch.zeros(motion.num_bins, device=device)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=device)
         n = num_envs
@@ -265,6 +268,8 @@ class TrackingSim:
             bodies=bodies1,
         )
         hard = self.mdp.termination(p1, quat1, f_next)
+        if self.survival_bonus:
+            reward = reward + self.survival_bonus * (~hard).float()
         self.ep_step += 1
         self.lifetime += 1
         timeout = self.ep_step >= self.max_steps

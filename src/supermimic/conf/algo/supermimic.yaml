@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - /actor: trunk
+
+algo: supermimic
+
+horizon: 32
+wm_window: 8
+wm_batches: 10
+wm_batch: 2048
+pi_batch: 4096
+wm_lr: 2.0e-4
+pi_lr: 5.0e-4
+pi_warmup: 50
+v_lr: 5.0e-4
+lam: 0.95
+action_noise: 0.1
+critic_epochs: 5
+critic_minibatches: 4
+policy_bootstrap: true
+lr_decay_iters: 250000
+wm_norm: rms
+wm_residual: false
+wm_frame: pelvis
+stochastic_actor: false
+grad_clip_norm: 1.0
+grad_clip_value: null
+normalize_reward: false
+compile: true
+compile_wm: window
+amp: bf16
+fk: torch
+adv_coef: 0.0
+reward_coef: 1.0
+contact_coef: 0.01
+ckpt_every: 500
+# instantTrack-style Polyak policy average for eval checkpoints (null = off).
+pi_ema: 0.995
+resume: null
+wm_ckpt: null
+wm_tune: tunable
