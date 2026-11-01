@@ -12,7 +12,14 @@ from mjlab.terrains import TerrainEntityCfg
 
 from .kinematics import TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
+from .mdp import (
+    MDP,
+    PAPER_OBS_TERMS,
+    flatten_object,
+    flatten_state,
+    max_step_reward,
+    reward_term_names,
+)
 from .motion import BIN_FRAMES, MotionLib
 from .tasks import TaskSpec, get_task
 
@@ -58,11 +65,14 @@ class TrackingSim:
         self.reward_style = reward_style
         kin.set_anchor(anchor)
         self.max_steps = 10**9 if eval_mode else MAX_EPISODE_STEPS
+        entities = {"robot": self.task.robot_cfg()}
+        if self.task.has_object:
+            entities["object"] = self.task.object_cfg()
         scene_cfg = SceneCfg(
             num_envs=num_envs,
             env_spacing=2.0,
             terrain=TerrainEntityCfg(terrain_type="plane"),
-            entities={"robot": self.task.robot_cfg()},
+            entities=entities,
         )
         self.scene = Scene(scene_cfg, device)
         sim_cfg = SimulationCfg(
@@ -78,6 +88,11 @@ class TrackingSim:
         )
         self.scene.initialize(self.sim.mj_model, self.sim.model, self.sim.data)
         self.robot = self.scene["robot"]
+        self.object = self.scene["object"] if self.task.has_object else None
+        if self.task.has_object and getattr(motion, "object_p", None) is None:
+            raise RuntimeError(
+                f"Task {self.task.name} expects object fields on the motion library."
+            )
         if tuple(self.robot.joint_names) != motion.joint_names:
             raise RuntimeError(
                 f"Motion joint order does not match the {self.task.name} robot: "
@@ -120,7 +135,7 @@ class TrackingSim:
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
         self._default_ipos = self.sim.get_default_field("body_ipos").clone()
         self.survival_bonus = float(survival_bonus)
-        self.r_max = max_step_reward(reward_style) + self.survival_bonus
+        self.r_max = max_step_reward(reward_style, self.task) + self.survival_bonus
         self.G_max = self.r_max / (1.0 - gamma)
         self.bin_G = torch.zeros(motion.num_bins, device=device)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=device)
@@ -134,7 +149,7 @@ class TrackingSim:
         self.start_bin = torch.zeros(n, dtype=torch.long, device=device)
         self.ep_disc = torch.zeros(n, device=device)
         self.ep_ret = torch.zeros(n, device=device)
-        self.ep_term = {name: torch.zeros(n, device=device) for name in REWARD_TERM_NAMES}
+        self.ep_term = {name: torch.zeros(n, device=device) for name in reward_term_names(self.task)}
         self._ep_counter = 0
         ground = 1.0 if eval_mode else 0.3
         self.sim.model.geom_friction[:, self._terrain_ids, 0] = ground
@@ -207,6 +222,17 @@ class TrackingSim:
         vel = data.root_link_vel_w
         return p, quat, vel[:, :3], vel[:, 3:6], data.joint_pos, data.joint_vel
 
+    def object_state(self):
+        """Object pose and twist with the environment origin removed."""
+        if self.object is None:
+            raise RuntimeError("This task has no object entity.")
+        data = self.object.data
+        pose = data.root_link_pose_w
+        p = pose[:, :3] - self.scene.env_origins
+        quat = pose[:, 3:7]
+        vel = data.root_link_vel_w
+        return p, quat, vel[:, :3], vel[:, 3:6]
+
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None) -> None:
         if env_ids.numel() == 0:
             return
@@ -236,6 +262,7 @@ class TrackingSim:
         p, quat, v, w, q, qd = self.state()
         s = flatten_state(p, quat, v, w, q, qd)
         body_pos, body_quat, _, _ = self.tracked_bodies()
+        obj = self.object_state() if self.object is not None else None
         contact = self.ground_contact()
         a_prev = self.a_prev
         f = self.f
@@ -250,6 +277,7 @@ class TrackingSim:
         self.sim.forward()
         p1, quat1, v1, w1, q1, qd1 = self.state()
         bodies1 = self.tracked_bodies()
+        obj1 = self.object_state() if self.object is not None else None
         contact_next = self.ground_contact()
         last = self.motion.clip_end[self.motion.clip_id[f]] - 1
         f_next = torch.minimum(f + 1, last)
@@ -265,6 +293,7 @@ class TrackingSim:
             a_prev,
             terms=True,
             bodies=bodies1,
+            object_state=obj1,
         )
         hard = self.mdp.termination(p1, quat1, f_next)
         if self.survival_bonus:
@@ -303,6 +332,9 @@ class TrackingSim:
             "ep_term": {name: value.clone() for name, value in self.ep_term.items()},
             "ep_len": self.ep_step.clone(),
         }
+        if obj is not None and obj1 is not None:
+            out["obj"] = flatten_object(*obj).detach()
+            out["obj1"] = flatten_object(*obj1).detach()
         if auto_reset and bool(done.any()):
             self.reset(done.nonzero(as_tuple=False).flatten())
         return out
@@ -360,6 +392,12 @@ class TrackingSim:
         w = motion.root_w[frames].clone()
         q = motion.q[frames].clone()
         qd = motion.qd[frames].clone()
+        obj_p = obj_quat = obj_v = obj_w = None
+        if self.object is not None:
+            obj_p = motion.object_p[frames].clone()
+            obj_quat = motion.object_quat[frames].clone()
+            obj_v = motion.object_v[frames].clone()
+            obj_w = motion.object_w[frames].clone()
         if self.reset_noise:
             n = env_ids.numel()
             dev = self.device
@@ -382,12 +420,25 @@ class TrackingSim:
             v = v + vel[:, 0:3]
             w = w + vel[:, 3:6]
             q = q + torch.empty_like(q).uniform_(-0.1, 0.1)
+            if obj_p is not None:
+                # Same xy / yaw noise as the robot so relative object pose stays coherent.
+                obj_p = obj_p + pose[:, 0:3]
+                obj_quat = quat_mul(
+                    quat_from_euler_xyz(torch.zeros(n, device=dev), torch.zeros(n, device=dev), pose[:, 5]),
+                    obj_quat,
+                )
         q = torch.maximum(torch.minimum(q, self.mdp.soft_hi), self.mdp.soft_lo)
         origin = self.scene.env_origins[env_ids]
         self.robot.write_root_link_pose_to_sim(torch.cat((p + origin, quat), dim=-1), env_ids=env_ids)
         self.robot.write_root_link_velocity_to_sim(torch.cat((v, w), dim=-1), env_ids=env_ids)
         self.robot.write_joint_state_to_sim(q, qd, env_ids=env_ids)
         self.robot.set_joint_position_target(q, env_ids=env_ids)
+        if self.object is not None:
+            assert obj_p is not None and obj_quat is not None and obj_v is not None and obj_w is not None
+            self.object.write_root_state_to_sim(
+                torch.cat((obj_p + origin, obj_quat, obj_v, obj_w), dim=-1),
+                env_ids=env_ids,
+            )
 
     def _close_bins(self, env_ids: torch.Tensor) -> None:
         # The first reset has no return to record. ep_step stays 0 until a step lands.

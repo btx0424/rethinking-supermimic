@@ -23,8 +23,11 @@ obs:
   anchor_pos: true
   body_pos: true
   body_ori: true
+  # Auto-enabled for weave (has_object). Leave false for lafan1.
+  object_pos: false
+  object_ori: false
 
-# lafan1: mjlab G1, 29 hinges. weave: inspire-hand G1 plus an object.
+# lafan1: mjlab G1, 29 hinges. weave: inspire-hand G1 plus a free-joint object.
 task: lafan1
 anchor: pelvis
 reward_style: gaussian

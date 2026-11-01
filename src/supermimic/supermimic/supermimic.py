@@ -24,14 +24,17 @@ from supermimic.mdp import (
     CONTROL_DT,
     GOAL_FRAMES,
     HIST,
-    REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
     invariant_features,
+    local_object_error,
     local_state_error,
+    object_features,
     pelvis_body_pos,
     pelvis_features,
     nominal_error,
     normalize_xi,
+    reward_term_names,
+    unflatten_object,
     unflatten_state,
 )
 from supermimic.algos import network
@@ -200,12 +203,29 @@ def _stack(xs: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(xs).reshape(-1, *xs[0].shape[1:])
 
 
-def _flatten_time(states: list[tuple]) -> tuple:
+def _flatten_time(states: list) -> tuple:
     return tuple(torch.stack([s[i] for s in states]).reshape(-1, states[0][i].shape[-1]) for i in range(6))
+
+
+def _flatten_object_time(states: list) -> tuple:
+    return tuple(
+        torch.stack([s.object()[i] for s in states]).reshape(-1, states[0].object()[i].shape[-1])
+        for i in range(4)
+    )
 
 
 def _unflatten_time(flat: tuple, steps: int) -> tuple:
     return tuple(t.view(steps, -1, t.shape[-1]).reshape(-1, t.shape[-1]) for t in flat)
+
+
+def _wm_state_error(true_root, pred: WorldModelState, frame: str, true_obj=None) -> torch.Tensor:
+    err = local_state_error(*true_root, *pred.root(), frame=frame)
+    if true_obj is not None:
+        err = torch.cat(
+            (err, local_object_error(*true_obj, *pred.object(), pred.quat, frame=frame)),
+            dim=-1,
+        )
+    return err
 
 
 def _mean(xs: list) -> float:
@@ -344,8 +364,13 @@ class RewardL1Loss(nn.Module):
         super().__init__()
         self.mdp = mdp
 
-    def forward(self, preds: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """``preds`` is ``(K, B, STATE)`` from one world-model window."""
+    def forward(
+        self,
+        preds: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        obj_preds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``preds`` is ``(K, B, STATE)``; ``obj_preds`` is ``(K, B, 13)`` for HOI."""
         steps, batch_size = preds.shape[0], preds.shape[1]
         pred = preds.reshape(steps * batch_size, -1)
         true = batch["s1"].transpose(0, 1).reshape(steps * batch_size, -1)
@@ -354,9 +379,19 @@ class RewardL1Loss(nn.Module):
         frame = torch.minimum(frame + 1, last)
         action = batch["a"].transpose(0, 1).reshape(steps * batch_size, -1)
         a_prev = batch["a_prev"].transpose(0, 1).reshape(steps * batch_size, -1)
-        reward_pred = self.mdp.reward(*unflatten_state(pred), frame, action, a_prev)
+        obj_pred = obj_true = None
+        if self.mdp.task.has_object:
+            if obj_preds is None or "obj1" not in batch:
+                raise ValueError("Object reward-L1 needs obj_preds and batch['obj1'].")
+            obj_pred = unflatten_object(obj_preds.reshape(steps * batch_size, -1))
+            obj_true = unflatten_object(batch["obj1"].transpose(0, 1).reshape(steps * batch_size, -1))
+        reward_pred = self.mdp.reward(
+            *unflatten_state(pred), frame, action, a_prev, object_state=obj_pred
+        )
         with torch.no_grad():
-            reward_true = self.mdp.reward(*unflatten_state(true), frame, action, a_prev)
+            reward_true = self.mdp.reward(
+                *unflatten_state(true), frame, action, a_prev, object_state=obj_true
+            )
         return (reward_pred - reward_true).abs().mean()
 
 
@@ -391,6 +426,7 @@ def world_model_step(
     contact: torch.Tensor,
     s1: torch.Tensor,
     mdp,
+    obj1: torch.Tensor | None = None,
 ) -> tuple[WorldModelState, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One autoregressive WM step (optionally compiled; the K-loop may stay eager).
 
@@ -399,8 +435,14 @@ def world_model_step(
     """
     state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     true = unflatten_state(s1)
-    error = local_state_error(*true, *state.root(), frame=wm.frame)
+    true_obj = unflatten_object(obj1) if obj1 is not None else None
+    error = _wm_state_error(true, state, wm.frame, true_obj)
     return state, error, state.flatten(), logit
+
+
+def _init_wm_state(s0, body_pos0, body_quat0, obj0=None) -> WorldModelState:
+    obj = unflatten_object(obj0) if obj0 is not None else (None, None, None, None)
+    return WorldModelState(*unflatten_state(s0), body_pos0, body_quat0, *obj)
 
 
 def world_model_window(
@@ -415,23 +457,32 @@ def world_model_window(
     body_quat: torch.Tensor,
     mdp,
     detach_pred: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    obj: torch.Tensor | None = None,
+    obj1: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Autoregressive WM window (compile this for ``compile_wm=window``).
 
     Returns MSE errors ``(B, K, D)``, detached start states, predicted states
-    ``(K, B, STATE)``, and contact logits ``(K, B, bodies)``. The contact fed
-    into step ``j+1`` is the sigmoid of step ``j``, not the recorded bit.
-    Predicted states stay on the graph when ``detach_pred`` is false so the
-    generator loss can train the world model. The K loop is unrolled in-graph
-    (Inductor times out if the body is factored through a ``step`` callable).
-    ``body_pos`` / ``body_quat`` are the buffered tracked-body poses for ``s``.
+    ``(K, B, STATE)``, contact logits ``(K, B, bodies)``, and optional object
+    predictions ``(K, B, 13)``. The contact fed into step ``j+1`` is the sigmoid
+    of step ``j``, not the recorded bit. Predicted states stay on the graph when
+    ``detach_pred`` is false so the generator loss can train the world model.
+    The K loop is unrolled in-graph (Inductor times out if the body is factored
+    through a ``step`` callable). ``body_pos`` / ``body_quat`` are the buffered
+    tracked-body poses for ``s``.
     """
-    state = WorldModelState(*unflatten_state(s[:, 0]), body_pos[:, 0], body_quat[:, 0])
+    state = _init_wm_state(
+        s[:, 0],
+        body_pos[:, 0],
+        body_quat[:, 0],
+        None if obj is None else obj[:, 0],
+    )
     xi_n = normalize_xi(xi[:, 0])
     carried = contact[:, 0]
     errors = []
     starts = []
     preds = []
+    obj_preds = []
     logits = []
     for j in range(actions.shape[1]):
         starts.append(state.flatten())
@@ -439,13 +490,25 @@ def world_model_window(
         state, logit = wm.step(state, actions[:, j], xi_n, norms, carried, mdp)
         carried = logit.sigmoid()
         true = unflatten_state(s1[:, j])
-        errors.append(local_state_error(*true, *state.root(), frame=wm.frame))
+        true_obj = None if obj1 is None else unflatten_object(obj1[:, j])
+        errors.append(_wm_state_error(true, state, wm.frame, true_obj))
         preds.append(state.flatten())
+        if mdp.task.has_object:
+            obj_preds.append(state.flatten_object())
         logits.append(logit)
     pred = torch.stack(preds, dim=0)
+    obj_pred = torch.stack(obj_preds, dim=0) if obj_preds else None
     if detach_pred:
         pred = pred.detach()
-    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred, torch.stack(logits, dim=0)
+        if obj_pred is not None:
+            obj_pred = obj_pred.detach()
+    return (
+        torch.stack(errors, dim=1),
+        torch.stack(starts, dim=0).detach(),
+        pred,
+        torch.stack(logits, dim=0),
+        obj_pred,
+    )
 
 
 def world_model_window_steps(
@@ -461,28 +524,55 @@ def world_model_window_steps(
     mdp,
     detach_pred: bool,
     step,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    obj: torch.Tensor | None = None,
+    obj1: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Eager K-loop that calls a (possibly compiled) ``world_model_step``."""
-    state = WorldModelState(*unflatten_state(s[:, 0]), body_pos[:, 0], body_quat[:, 0])
+    state = _init_wm_state(
+        s[:, 0],
+        body_pos[:, 0],
+        body_quat[:, 0],
+        None if obj is None else obj[:, 0],
+    )
     xi_n = normalize_xi(xi[:, 0])
     carried = contact[:, 0]
     errors = []
     starts = []
     preds = []
+    obj_preds = []
     logits = []
     for j in range(actions.shape[1]):
         starts.append(state.flatten())
         state, error, pred, logit = step(
-            wm, norms, state, actions[:, j], xi_n, carried, s1[:, j], mdp
+            wm,
+            norms,
+            state,
+            actions[:, j],
+            xi_n,
+            carried,
+            s1[:, j],
+            mdp,
+            None if obj1 is None else obj1[:, j],
         )
         carried = logit.sigmoid()
         errors.append(error)
         preds.append(pred)
+        if mdp.task.has_object:
+            obj_preds.append(state.flatten_object())
         logits.append(logit)
     pred = torch.stack(preds, dim=0)
+    obj_pred = torch.stack(obj_preds, dim=0) if obj_preds else None
     if detach_pred:
         pred = pred.detach()
-    return torch.stack(errors, dim=1), torch.stack(starts, dim=0).detach(), pred, torch.stack(logits, dim=0)
+        if obj_pred is not None:
+            obj_pred = obj_pred.detach()
+    return (
+        torch.stack(errors, dim=1),
+        torch.stack(starts, dim=0).detach(),
+        pred,
+        torch.stack(logits, dim=0),
+        obj_pred,
+    )
 
 
 def imagine_step(
@@ -535,6 +625,8 @@ def imagine_horizon(
     deterministic: bool,
     step=imagine_step,
     bootstrap_grad: bool = True,
+    hist_obj: torch.Tensor | None = None,
+    obj: torch.Tensor | None = None,
 ):
     """H-step imagination. ``step`` may be a compiled single step.
 
@@ -544,8 +636,18 @@ def imagine_horizon(
     """
     batch = s.shape[0]
     device = s.device
+    term_names = mdp.term_names
     p, quat, v, w, q, qd = unflatten_state(hist_s)
     hist_n = p.shape[0] * p.shape[1]
+    hist_obj_fields = (None, None, None, None)
+    if hist_obj is not None:
+        op, oq, ov, ow = unflatten_object(hist_obj)
+        hist_obj_fields = (
+            op.reshape(hist_n, 3),
+            oq.reshape(hist_n, 4),
+            ov.reshape(hist_n, 3),
+            ow.reshape(hist_n, 3),
+        )
     hist_state = WorldModelState(
         p.reshape(hist_n, 3),
         quat.reshape(hist_n, 4),
@@ -555,6 +657,7 @@ def imagine_horizon(
         qd.reshape(hist_n, -1),
         hist_body_pos.reshape(hist_n, hist_body_pos.shape[-2], 3),
         hist_body_quat.reshape(hist_n, hist_body_quat.shape[-2], 4),
+        *hist_obj_fields,
     )
     obs = mdp.obs(
         hist_state,
@@ -563,7 +666,7 @@ def imagine_horizon(
         hist_f.reshape(hist_n),
     )
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
-    state = WorldModelState(*unflatten_state(s), body_pos, body_quat)
+    state = _init_wm_state(s, body_pos, body_quat, obj)
     xi_n = normalize_xi(xi)
     goal = mdp.motion.goal(frame, GOAL_FRAMES)
     states = [state]
@@ -595,13 +698,19 @@ def imagine_horizon(
         frames.append(frame)
         goals.append(goal)
     flat = _flatten_time(states[1:])
+    object_state = _flatten_object_time(states[1:]) if mdp.task.has_object else None
     reward, term_parts = mdp.reward(
-        *flat, _stack(frames[1:]), _stack(actions), _stack(prev_actions), terms=True
+        *flat,
+        _stack(frames[1:]),
+        _stack(actions),
+        _stack(prev_actions),
+        terms=True,
+        object_state=object_state,
     )
     done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
     reward = reward.view(horizon, batch)
     done = done.view(horizon, batch)
-    term_raw = torch.stack([term_parts[name] for name in REWARD_TERM_NAMES]).view(len(REWARD_TERM_NAMES), horizon, batch)
+    term_raw = torch.stack([term_parts[name] for name in term_names]).view(len(term_names), horizon, batch)
     term_mean = term_raw.detach().mean(dim=(1, 2))
     reward_mean = reward.detach().mean()
     reward = reward / reward_scale
@@ -612,15 +721,19 @@ def imagine_horizon(
     weighted = discount[:, None] * survival
     step_return = weighted * reward
     returns = step_return.sum(0)
+    last = states[-1]
+    last_obj = last.object() if mdp.task.has_object else None
+    last_obj_feat = object_features(*last.root()[:2], *last_obj) if last_obj is not None else None
     # Heads stay separate through GAE. The actor follows the mean value.
     head_values = critic.expected_values(
         critic_forward(
             critic,
             norms.critic(
-                invariant_features(*states[-1].root()),
+                invariant_features(*last.root()),
                 goals[-1],
                 xi_n,
-                mdp.privileged(*states[-1].root(), frames[-1]),
+                mdp.privileged(*last.root(), frames[-1], object_state=last_obj),
+                last_obj_feat,
             ),
         )
     )
@@ -637,6 +750,9 @@ def imagine_horizon(
         if action.requires_grad:
             action.retain_grad()
     critic_states = tuple(t.detach() for t in _flatten_time(states))
+    critic_objects = (
+        tuple(t.detach() for t in _flatten_object_time(states)) if mdp.task.has_object else None
+    )
     return (
         policy_loss,
         step_return,
@@ -650,6 +766,7 @@ def imagine_horizon(
         reward_mean.detach(),
         term_mean,
         critic_states,
+        critic_objects,
         _stack(frames).detach(),
         _stack(goals).detach(),
         xi.detach(),
@@ -726,7 +843,19 @@ class Trainer:
                 compiled_step = torch.compile(world_model_step, mode="default", dynamic=False)
 
                 def _wm_rollout_steps(
-                    wm, norms, s, s1, actions, xi, contact, body_pos, body_quat, mdp, detach_pred=True
+                    wm,
+                    norms,
+                    s,
+                    s1,
+                    actions,
+                    xi,
+                    contact,
+                    body_pos,
+                    body_quat,
+                    mdp,
+                    detach_pred=True,
+                    obj=None,
+                    obj1=None,
                 ):
                     return world_model_window_steps(
                         wm,
@@ -741,6 +870,8 @@ class Trainer:
                         mdp,
                         detach_pred,
                         compiled_step,
+                        obj=obj,
+                        obj1=obj1,
                     )
 
                 self._wm_rollout = _wm_rollout_steps
@@ -768,7 +899,14 @@ class Trainer:
             self.policy_ema.eval()
         else:
             self.policy_ema = None
-        in_dim = self.task.inv_dim + self.task.goal_dim + self.task.xi_dim + self.task.priv_dim
+        self.term_names = reward_term_names(self.task)
+        in_dim = (
+            self.task.inv_dim
+            + self.task.object_feat_dim
+            + self.task.goal_dim
+            + self.task.xi_dim
+            + self.task.priv_dim
+        )
         if cfg.critic_kind == "classification":
             v_min, v_max = cfg.critic_v_min, cfg.critic_v_max
             if cfg.normalize_reward:
@@ -829,8 +967,8 @@ class Trainer:
             "ep": [],
             "term": [],
             "done_n": [],
-            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "sim_terms": {name: [] for name in self.term_names},
+            "ep_terms": {name: [] for name in self.term_names},
         }
         self.agg = {
             "wm": [],
@@ -853,8 +991,8 @@ class Trainer:
             "disc_real": [],
             "disc_fake": [],
             "disc_acc": [],
-            "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
+            "imag_terms": {name: [] for name in self.term_names},
+            "reward_grads": {name: [] for name in self.term_names},
             "reward_grad_boot": [],
         }
         self.timing = {"collect": [], "wm": [], "imagine": [], "policy": [], "critic": []}
@@ -886,9 +1024,9 @@ class Trainer:
         print(f"tensorboard={tb_dir}", flush=True)
         self._log_f = (self.log_dir / "train_log.csv").open("w")
         term_cols = ",".join(
-            f"sim_{n},ep_{n},imag_{n}" for n in REWARD_TERM_NAMES
+            f"sim_{n},ep_{n},imag_{n}" for n in self.term_names
         )
-        grad_r_cols = ",".join(f"grad_r_{n}" for n in REWARD_TERM_NAMES)
+        grad_r_cols = ",".join(f"grad_r_{n}" for n in self.term_names)
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,value_mean,imag_score,imag_survival,"
             "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
@@ -994,7 +1132,18 @@ class Trainer:
         for _ in range(n_steps):
             p, quat, v, w, q, qd = self.sim.state()
             bodies = self.sim.tracked_bodies()
-            state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+            obj = self.sim.object_state() if self.task.has_object else None
+            state = WorldModelState(
+                p,
+                quat,
+                v,
+                w,
+                q,
+                qd,
+                bodies[0],
+                bodies[1],
+                *(obj if obj is not None else (None, None, None, None)),
+            )
             obs = self.sim.mdp.add_noise(
                 self.sim.mdp.obs(state, self.sim.a_prev, self.sim.xi, self.sim.f)
             )
@@ -1017,6 +1166,8 @@ class Trainer:
                     self.norms.body.update(pelvis_body_pos(p, quat, bodies[0]))
                 else:
                     self.norms.body.update(self.sim.mdp.heading_bodies(p, quat, v, w, q, qd, bodies[0]))
+                if obj is not None and self.norms.obj is not None:
+                    self.norms.obj.update(object_features(p, quat, *obj))
             with torch.no_grad():
                 action = self.policy(
                     self.obs_hist, goal, self.norms, deterministic=not cfg.stochastic_actor
@@ -1072,7 +1223,7 @@ class Trainer:
             batch = self.buffer.sample_windows(cfg.wm_batch, cfg.wm_window)
             grad_ctx = torch.no_grad() if self.wm_frozen else contextlib.nullcontext()
             with grad_ctx:
-                errors, saved, preds, contact_logits = self.world_model_rollout(
+                errors, saved, preds, contact_logits, obj_preds = self.world_model_rollout(
                     batch, detach_pred=not (use_adv or use_reward)
                 )
                 mse, err8 = self.mse_loss(errors)
@@ -1080,10 +1231,14 @@ class Trainer:
                 contact_loss = contact_bce(contact_logits, contact_target)
                 contact_prec, contact_recall = contact_precision_recall(contact_logits, contact_target)
             if use_reward:
-                reward_l1 = self.reward_l1(preds, batch)
+                reward_l1 = self.reward_l1(preds, batch, obj_preds)
             else:
                 with torch.no_grad():
-                    reward_l1 = self.reward_l1(preds.detach(), batch)
+                    reward_l1 = self.reward_l1(
+                        preds.detach(),
+                        batch,
+                        None if obj_preds is None else obj_preds.detach(),
+                    )
             self.opt_wm.zero_grad(set_to_none=True)
             loss = mse
             if use_adv:
@@ -1176,14 +1331,21 @@ class Trainer:
 
     def world_model_rollout(
         self, batch: dict[str, torch.Tensor], detach_pred: bool = True
-    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        list[dict[str, torch.Tensor]],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         """Autoregressive WM window.
 
-        Returns MSE errors, detached states for D, predicted states, and contact
-        logits ``(K, B, bodies)``. Predicted states require grad only when
-        ``detach_pred`` is false. Contact logits stay on the graph.
+        Returns MSE errors, detached states for D, predicted states, contact
+        logits ``(K, B, bodies)``, and optional object predictions ``(K, B, 13)``.
+        Predicted states require grad only when ``detach_pred`` is false.
+        Contact logits stay on the graph.
         """
-        errors, starts, preds, contact_logits = self._wm_rollout(
+        errors, starts, preds, contact_logits, obj_preds = self._wm_rollout(
             self.wm,
             self.norms,
             batch["s"],
@@ -1195,6 +1357,8 @@ class Trainer:
             batch["body_quat"],
             self.sim.mdp,
             detach_pred,
+            obj=batch.get("obj"),
+            obj1=batch.get("obj1"),
         )
         xi_n = normalize_xi(batch["xi"][:, 0]).detach()
         saved = []
@@ -1209,10 +1373,10 @@ class Trainer:
                     "xi_n": xi_n,
                 }
             )
-        return errors, saved, preds, contact_logits
+        return errors, saved, preds, contact_logits, obj_preds
 
     def world_model_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        errors, _saved, _preds, _contact = self.world_model_rollout(batch)
+        errors, _saved, _preds, _contact, _obj = self.world_model_rollout(batch)
         return self.mse_loss(errors)
 
     def sample_policy_starts(self) -> dict[str, torch.Tensor]:
@@ -1253,6 +1417,7 @@ class Trainer:
             reward_mean,
             term_mean,
             critic_states,
+            critic_objects,
             frames,
             goals,
             xi,
@@ -1283,14 +1448,17 @@ class Trainer:
             not cfg.stochastic_actor,
             self._imagine_step,
             cfg.policy_bootstrap,
+            hist_obj=start.get("hist_obj"),
+            obj=start.get("obj"),
         )
-        term_losses = {name: term_loss[i] for i, name in enumerate(REWARD_TERM_NAMES)}
+        term_losses = {name: term_loss[i] for i, name in enumerate(self.term_names)}
         term_losses["bootstrap"] = -bootstrap.mean()
         imag_terms = {
-            name: _term_score(name, term_mean[i], cfg.reward_style) for i, name in enumerate(REWARD_TERM_NAMES)
+            name: _term_score(name, term_mean[i], cfg.reward_style) for i, name in enumerate(self.term_names)
         }
         critic_batch = {
             "states": critic_states,
+            "objects": critic_objects,
             "frames": frames,
             "goals": goals,
             "xi": xi.unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
@@ -1376,8 +1544,8 @@ class Trainer:
                 cosine.append(_cosine(_flat_grad(weighted), full_flat))
                 enc_norm.append(_grads_norm(weighted[:n_enc]))
                 dec_norm.append(_grads_norm(weighted[n_enc : n_enc + len(decoder)]))
-            terms = {name: [] for name in REWARD_TERM_NAMES}
-            for index, name in enumerate(REWARD_TERM_NAMES):
+            terms = {name: [] for name in self.term_names}
+            for index, name in enumerate(self.term_names):
                 for t in range(horizon):
                     terms[name].append(_grads_norm(grads_of(-term_weighted[index, t].mean())))
             g["policy_loss"].backward()
@@ -1408,7 +1576,7 @@ class Trainer:
         cfg = self.cfg
         params = [p for p in self.policy.parameters() if p.requires_grad]
         if diagnose_reward and term_losses is not None:
-            for name in REWARD_TERM_NAMES:
+            for name in self.term_names:
                 grads = torch.autograd.grad(
                     term_losses[name], params, retain_graph=True, allow_unused=True
                 )
@@ -1434,10 +1602,21 @@ class Trainer:
         cfg = self.cfg
         horizon, n = batch["reward"].shape
         flat = _unflatten_time(batch["states"], horizon + 1)
-        priv = self.sim.mdp.privileged(*flat, batch["frames"])
+        obj_flat = None
+        obj_feat = None
+        if batch.get("objects") is not None:
+            obj_flat = _unflatten_time(batch["objects"], horizon + 1)
+            obj_feat = object_features(flat[0], flat[1], *obj_flat)
+            if self.norms.obj is not None:
+                self.norms.obj.update(obj_feat.detach())
+        priv = self.sim.mdp.privileged(*flat, batch["frames"], object_state=obj_flat)
         self.norms.priv.update(priv.detach())
         features = self.norms.critic(
-            invariant_features(*flat), batch["goals"], normalize_xi(batch["xi"]), priv
+            invariant_features(*flat),
+            batch["goals"],
+            normalize_xi(batch["xi"]),
+            priv,
+            obj_feat,
         )
         ensemble = self.critic.ensemble
         with torch.no_grad():
@@ -1489,10 +1668,10 @@ class Trainer:
             if cfg.stochastic_actor and self.policy.log_std is not None
             else float("nan")
         )
-        sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in REWARD_TERM_NAMES}
-        ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in REWARD_TERM_NAMES}
-        imag_terms = {name: _mean(self.agg["imag_terms"][name]) for name in REWARD_TERM_NAMES}
-        reward_grads = {name: _mean(self.agg["reward_grads"][name]) for name in REWARD_TERM_NAMES}
+        sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in self.term_names}
+        ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in self.term_names}
+        imag_terms = {name: _mean(self.agg["imag_terms"][name]) for name in self.term_names}
+        reward_grads = {name: _mean(self.agg["reward_grads"][name]) for name in self.term_names}
         reward_grad_boot = _mean(self.agg["reward_grad_boot"])
         row = [
             iteration,
@@ -1512,9 +1691,9 @@ class Trainer:
             pi_lr,
             entropy,
         ]
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             row.extend((sim_terms[name], ep_terms[name], imag_terms[name]))
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             row.append(reward_grads[name])
         row.append(reward_grad_boot)
         disc_loss = _mean(self.agg["disc"])
@@ -1585,7 +1764,7 @@ class Trainer:
             "time/policy_s": seconds["policy"],
             "time/critic_s": seconds["critic"],
         }
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             metrics[f"score/sim_{name}"] = sim_terms[name]
             metrics[f"score/ep_{name}"] = ep_terms[name]
             metrics[f"score/imag_{name}"] = imag_terms[name]
@@ -1636,8 +1815,8 @@ class Trainer:
             "ep": [],
             "term": [],
             "done_n": [],
-            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "sim_terms": {name: [] for name in self.term_names},
+            "ep_terms": {name: [] for name in self.term_names},
         }
         self.agg = {
             "wm": [],
@@ -1660,8 +1839,8 @@ class Trainer:
             "disc_real": [],
             "disc_fake": [],
             "disc_acc": [],
-            "imag_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "reward_grads": {name: [] for name in REWARD_TERM_NAMES},
+            "imag_terms": {name: [] for name in self.term_names},
+            "reward_grads": {name: [] for name in self.term_names},
             "reward_grad_boot": [],
         }
         self.timing = {key: [] for key in self.timing}

@@ -17,6 +17,25 @@ if TYPE_CHECKING:
 _GROUND_Z = -0.02
 
 
+def _geom_group_kinds(model: mujoco.MjModel) -> tuple[set[int], set[int]]:
+    """Visual-only and collision-only geom groups.
+
+    The two kinds do not share a group: mjlab G1 uses group 2 for meshes and
+    group 3 for collision, and the inspire-hand XML uses group 1 and group 0.
+    """
+    visual: set[int] = set()
+    collision: set[int] = set()
+    for geom_id in range(model.ngeom):
+        group = int(model.geom_group[geom_id])
+        if group >= 6:
+            continue
+        if int(model.geom_contype[geom_id]) or int(model.geom_conaffinity[geom_id]):
+            collision.add(group)
+        else:
+            visual.add(group)
+    return visual - collision, collision - visual
+
+
 def _qpos_addresses(model: mujoco.MjModel, joint_names: tuple[str, ...]) -> list[int]:
     adr: dict[str, int] = {}
     for jid in range(model.njnt):
@@ -131,9 +150,20 @@ def play_viser(
         speed = server.gui.add_slider("Speed", min=0.1, max=4.0, step=0.1, initial_value=1.0)
         max_frame = max(session.clip_info(0).length - 1, 0)
         frame_slider = server.gui.add_slider("Frame", min=0, max=max_frame, step=1, initial_value=0)
+    with server.gui.add_folder("Display"):
+        show_visual = server.gui.add_checkbox("Visual geoms", initial_value=True)
+        show_collision = server.gui.add_checkbox("Collision geoms", initial_value=False)
 
     scene: ViserMujocoScene | None = None
     active_key: str | None = None
+
+    def apply_geom_visibility(vis_scene: ViserMujocoScene, model: mujoco.MjModel) -> None:
+        visual_groups, collision_groups = _geom_group_kinds(model)
+        for group in visual_groups:
+            vis_scene.geom_groups_visible[group] = bool(show_visual.value)
+        for group in collision_groups:
+            vis_scene.geom_groups_visible[group] = bool(show_collision.value)
+        vis_scene._sync_visibilities()
 
     def attach_scene(clip: int) -> ViserMujocoScene:
         nonlocal scene, active_key
@@ -141,9 +171,17 @@ def play_viser(
         if active_key != key or scene is None:
             scene = ViserMujocoScene(server, model, num_envs=1)
             scene.camera_tracking_enabled = False
+            apply_geom_visibility(scene, model)
             layout_cache[key] = (layout_cache[key][0], layout_cache[key][1], layout_cache[key][2], scene)
             active_key = key
         return scene
+
+    def _refresh_geoms(_event: viser.GuiEvent) -> None:
+        if scene is not None and active_key is not None:
+            apply_geom_visibility(scene, model_cache[active_key])
+
+    show_visual.on_update(_refresh_geoms)
+    show_collision.on_update(_refresh_geoms)
 
     def refresh_info(clip: int) -> None:
         meta = session.clip_info(clip)

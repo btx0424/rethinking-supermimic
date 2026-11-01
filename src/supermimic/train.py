@@ -9,10 +9,17 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from supermimic.mdp import resolve_obs_terms
+from supermimic.tasks import get_task
 
 
 def _obs_terms(cfg: DictConfig) -> tuple[str, ...]:
-    return resolve_obs_terms([name for name, enabled in cfg.obs.items() if enabled])
+    task = get_task(str(cfg.get("task", "lafan1")))
+    chosen = [name for name, enabled in cfg.obs.items() if enabled]
+    if task.has_object:
+        for name in ("object_pos", "object_ori"):
+            if name not in chosen:
+                chosen.append(name)
+    return resolve_obs_terms(chosen)
 
 
 def _experiment_name(run_dir: Path) -> str:

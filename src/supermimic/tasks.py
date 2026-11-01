@@ -21,6 +21,7 @@ class TaskSpec:
     contact_bodies: tuple[str, ...]
     has_object: bool
     foot_geom_expr: str
+    object_name: str | None = None
     goal_frames: int = 10
     hist: int = 10
 
@@ -31,6 +32,10 @@ class TaskSpec:
             raise ValueError(f"{self.name}: tracked_bodies is empty.")
         if not self.contact_bodies:
             raise ValueError(f"{self.name}: contact_bodies is empty.")
+        if self.has_object and not self.object_name:
+            raise ValueError(f"{self.name}: has_object requires object_name.")
+        if not self.has_object and self.object_name is not None:
+            raise ValueError(f"{self.name}: object_name set but has_object is False.")
 
     @property
     def n_body(self) -> int:
@@ -59,8 +64,21 @@ class TaskSpec:
         return 3 + 4 + 3 + 3 + self.num_joints + self.num_joints
 
     @property
+    def object_state_dim(self) -> int:
+        """Flat object pose and twist when ``has_object``, else 0."""
+        return 13 if self.has_object else 0
+
+    @property
+    def object_feat_dim(self) -> int:
+        """Yaw-frame object pose and object-local twist for the WM / critic."""
+        return 3 + 6 + 3 + 3 if self.has_object else 0
+
+    @property
     def priv_dim(self) -> int:
-        return self.num_joints + self.n_body * 3 + 3 + 6
+        width = self.num_joints + self.n_body * 3 + 3 + 6
+        if self.has_object:
+            width += 3 + 6
+        return width
 
     @property
     def body_pos_dim(self) -> int:
@@ -80,7 +98,10 @@ class TaskSpec:
 
     @property
     def wm_out_dim(self) -> int:
-        return 3 + 3 + 3 + 3 + self.num_joints + self.num_joints + self.n_contact
+        width = 3 + 3 + 3 + 3 + self.num_joints + self.num_joints + self.n_contact
+        if self.has_object:
+            width += 3 + 3 + 3 + 3
+        return width
 
     def obs_term(self, name: str) -> tuple[int, float]:
         """``(dimension, noise half-width)`` for one observation term."""
@@ -95,6 +116,8 @@ class TaskSpec:
             "anchor_pos": (3, 0.01),
             "body_pos": (self.n_body * 3, 0.01),
             "body_ori": (self.n_body * 6, 0.05),
+            "object_pos": (3, 0.01),
+            "object_ori": (6, 0.05),
         }
         try:
             return terms[name]
@@ -102,7 +125,7 @@ class TaskSpec:
             raise KeyError(f"Unknown observation term {name!r}.") from exc
 
     def nominal_error_groups(self) -> tuple[tuple[int, float], ...]:
-        return (
+        groups = (
             (3, 0.25),
             (3, 0.5),
             (3, 1.0),
@@ -110,6 +133,13 @@ class TaskSpec:
             (self.num_joints, 0.5),
             (self.num_joints, 5.0),
         )
+        if self.has_object:
+            groups = groups + ((3, 0.25), (3, 0.5), (3, 1.0), (3, 3.14))
+        return groups
+
+    def object_cfg(self):
+        """mjlab ``EntityCfg`` for the free-joint object. Only for object tasks."""
+        raise NotImplementedError(f"{self.name} has no object asset.")
 
     def compile_model(self):
         """MuJoCo model and hinge-joint names in qpos order."""
@@ -176,20 +206,22 @@ class Lafan1Task(TaskSpec):
 
 
 class WeaveTask(TaskSpec):
-    """Inspire-hand G1 tracking the robot in a Weave clip.
+    """Inspire-hand G1 plus a free-joint object tracking a Weave clip.
 
-    The object is not in the goal or the scene. Finger hinges are independent
-    position actuators, matching the recorded joint angles.
+    Finger hinges are independent position actuators, matching the recorded
+    joint angles. The scene object mesh matches ``object_name``; the motion
+    cache is built from that object's rollout file.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, object_name: str = "smalltable") -> None:
         super().__init__(
             name="weave",
             num_joints=53,
             tracked_bodies=TRACKED_BODIES,
             contact_bodies=TRACKED_BODIES,
-            has_object=False,
+            has_object=True,
             foot_geom_expr=r"^(left|right)_foot_collision_[1-7]$",
+            object_name=object_name,
         )
 
     def compile_model(self):
@@ -205,6 +237,12 @@ class WeaveTask(TaskSpec):
 
         return robot_cfg()
 
+    def object_cfg(self):
+        from supermimic.robots.object import object_cfg
+
+        assert self.object_name is not None
+        return object_cfg(self.object_name)
+
     def action_scale(self, joint_names: tuple[str, ...]) -> list[float]:
         from supermimic.robots.g1_inspire import action_scale
 
@@ -213,7 +251,8 @@ class WeaveTask(TaskSpec):
     def load_motion(self, device: str):
         from supermimic.motions.weave import WeaveMotion
 
-        return WeaveMotion.load(device=device)
+        assert self.object_name is not None
+        return WeaveMotion.load(device=device, objects=(self.object_name,))
 
 
 _TASKS: dict[str, type[TaskSpec]] = {

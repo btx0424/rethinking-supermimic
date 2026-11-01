@@ -20,7 +20,16 @@ from .base import Motion
 from .vis_types import VisClipInfo, VisFrame, VisSession
 
 DEFAULT_ROOT = Path("/mnt/workspace/btx0424/Weave")
-CACHE_PATH = Path(__file__).resolve().parents[3] / "data" / "weave_g1_hand.npz"
+_DATA_DIR = Path(__file__).resolve().parents[3] / "data"
+# Robot-only cache kept for backward compatibility; object HOI uses a tagged path.
+CACHE_PATH = _DATA_DIR / "weave_g1_hand.npz"
+
+
+def cache_path_for(objects: tuple[str, ...]) -> Path:
+    """One NPZ per object set so smalltable and smallbox do not share a cache."""
+    if not objects:
+        raise ValueError("objects must be non-empty.")
+    return _DATA_DIR / f"weave_g1_hand_{'_'.join(objects)}.npz"
 
 ROBOT_XML = Path(
     "/mnt/workspace/btx0424/aa-projects/object_hoi/src/assets/unitree_g1/"
@@ -201,18 +210,39 @@ class WeaveMotion(Motion):
 
     @classmethod
     def default_cache_path(cls) -> Path:
-        return CACHE_PATH
+        return cache_path_for(("smalltable",))
 
     @classmethod
     def build_cache(
         cls,
         cache_path: Path | None = None,
         root: Path = DEFAULT_ROOT,
-        objects: tuple[str, ...] = ("smalltable", "smallbox"),
+        objects: tuple[str, ...] = ("smalltable",),
         split: str = "train",
         **_,
     ) -> Path:
-        return build_cache(cache_path or CACHE_PATH, root=root, objects=objects, split=split)
+        path = cache_path_for(objects) if cache_path is None else cache_path
+        return build_cache(path, root=root, objects=objects, split=split)
+
+    @classmethod
+    def load(
+        cls,
+        cache_path: Path | None = None,
+        device: str = "cpu",
+        objects: tuple[str, ...] = ("smalltable",),
+        **build_kwargs,
+    ):
+        from supermimic.motion import MotionLib
+
+        path = cache_path_for(objects) if cache_path is None else cache_path
+        if not path.is_file():
+            cls.build_cache(path, objects=objects, **build_kwargs)
+        lib = MotionLib.from_npz(path, device=device)
+        if getattr(lib, "object_p", None) is None:
+            raise RuntimeError(
+                f"{path} has no object fields; delete it and rebuild with WeaveMotion.build_cache."
+            )
+        return lib
 
     @classmethod
     def dataset_joint_names(cls) -> tuple[str, ...]:
@@ -399,16 +429,16 @@ _AVAILABLE_OBJECTS = (
 
 
 def build_cache(
-    cache_path: Path = CACHE_PATH,
+    cache_path: Path | None = None,
     root: Path = DEFAULT_ROOT,
-    objects: tuple[str, ...] = ("smalltable", "smallbox"),
+    objects: tuple[str, ...] = ("smalltable",),
     split: str = "train",
 ) -> Path:
-    """Pack Weave rollouts into the robot-only MotionLib cache.
+    """Pack Weave rollouts into a MotionLib cache with object pose and twist.
 
     Clips are already 50 Hz. Joint columns are reordered onto the inspire-hand
     hinge order. The root is the pelvis, and the 14 tracked bodies are sliced
-    out of the recorded body trajectory. Object pose is not stored.
+    out of the recorded body trajectory.
     """
     from supermimic.kinematics import TRACKED_BODIES
     from supermimic.motion import TARGET_FPS, write_npz_cache
@@ -421,6 +451,7 @@ def build_cache(
         raise ValueError(f"Unknown objects {unknown}. Available: {list(_AVAILABLE_OBJECTS)}.")
     if not objects:
         raise ValueError("Select at least one object.")
+    out_path = cache_path_for(objects) if cache_path is None else cache_path
 
     _model, joint_names = compile_g1_inspire()
     if len(joint_names) != len(DATASET_JOINT_NAMES):
@@ -450,6 +481,10 @@ def build_cache(
     body_quat: list[np.ndarray] = []
     body_v: list[np.ndarray] = []
     body_w: list[np.ndarray] = []
+    object_p: list[np.ndarray] = []
+    object_quat: list[np.ndarray] = []
+    object_v: list[np.ndarray] = []
+    object_w: list[np.ndarray] = []
     clip_names: list[str] = []
     clip_lengths: list[int] = []
     fps: int | None = None
@@ -478,6 +513,10 @@ def build_cache(
             quat = np.asarray(data["body_quat_w"])
             lin = np.asarray(data["body_lin_vel_w"])
             ang = np.asarray(data["body_ang_vel_w"])
+            obj_p = np.asarray(data["object_pos_w"])
+            obj_quat = np.asarray(data["object_quat_w"])
+            obj_v = np.asarray(data["object_lin_vel_w"])
+            obj_w = np.asarray(data["object_ang_vel_w"])
         joint_q.append(q.astype(np.float32, copy=False))
         joint_qd.append(qd.astype(np.float32, copy=False))
         root_p.append(pos[:, pelvis].astype(np.float32, copy=False))
@@ -488,6 +527,10 @@ def build_cache(
         body_quat.append(quat[:, body_perm].astype(np.float32, copy=False))
         body_v.append(lin[:, body_perm].astype(np.float32, copy=False))
         body_w.append(ang[:, body_perm].astype(np.float32, copy=False))
+        object_p.append(obj_p.astype(np.float32, copy=False))
+        object_quat.append(obj_quat.astype(np.float32, copy=False))
+        object_v.append(obj_v.astype(np.float32, copy=False))
+        object_w.append(obj_w.astype(np.float32, copy=False))
         clip_names.extend(str(name) for name in names)
         clip_lengths.extend(int(length) for length in lengths)
 
@@ -507,7 +550,7 @@ def build_cache(
     if int(lengths_arr.sum()) != q_all.shape[0]:
         raise ValueError("motion_lengths do not sum to the flat frame count.")
     write_npz_cache(
-        cache_path,
+        out_path,
         joint_names=joint_names,
         clip_names=clip_names,
         body_names=TRACKED_BODIES,
@@ -524,9 +567,13 @@ def build_cache(
         body_quat=cat(body_quat),
         body_v=cat(body_v),
         body_w=cat(body_w),
+        object_p=cat(object_p),
+        object_quat=cat(object_quat),
+        object_v=cat(object_v),
+        object_w=cat(object_w),
     )
-    print(f"wrote {cache_path} ({q_all.shape[0]} frames, {len(clip_names)} clips)", flush=True)
-    return cache_path
+    print(f"wrote {out_path} ({q_all.shape[0]} frames, {len(clip_names)} clips)", flush=True)
+    return out_path
 
 
 if __name__ == "__main__":

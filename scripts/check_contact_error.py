@@ -90,7 +90,7 @@ def _one(ckpt: Path, args: argparse.Namespace) -> None:
     with torch.no_grad():
         trainer.collect(args.collect)
         batch = trainer.buffer.sample_windows(args.windows, trainer.cfg.wm_window)
-        errors, _, _, _ = world_model_window(
+        errors, _, _, _, _ = world_model_window(
             trainer.wm,
             trainer.norms,
             batch["s"],
@@ -101,6 +101,8 @@ def _one(ckpt: Path, args: argparse.Namespace) -> None:
             batch["body_pos"],
             batch["body_quat"],
             trainer.sim.mdp,
+            obj=batch.get("obj"),
+            obj1=batch.get("obj1"),
         )
         scaled = errors / trainer.mse_loss.nominal
         last = scaled[:, -1]

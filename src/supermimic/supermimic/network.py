@@ -17,6 +17,7 @@ from supermimic.mdp import (
     WorldModelState,
     heading_body_pos,
     invariant_features,
+    object_features,
     pelvis_body_pos,
     pelvis_features,
 )
@@ -265,6 +266,7 @@ class InputNorms(nn.Module):
 
     def __init__(self, obs_dim: int, task: TaskSpec):
         super().__init__()
+        self.has_object = task.has_object
         self.state = RunningNorm(task.inv_dim)
         self.dyn = RunningNorm(task.pelvis_feat_dim)
         self.obs = RunningNorm(obs_dim)
@@ -273,6 +275,7 @@ class InputNorms(nn.Module):
         self.xi = RunningNorm(task.xi_dim)
         self.body = RunningNorm(task.body_pos_dim)
         self.priv = RunningNorm(task.priv_dim)
+        self.obj = RunningNorm(task.object_feat_dim) if task.has_object else None
 
     def wm(
         self,
@@ -280,8 +283,14 @@ class InputNorms(nn.Module):
         action: torch.Tensor,
         xi_n: torch.Tensor,
         body: torch.Tensor,
+        obj: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.cat((self.state(inv), self.action(action), self.xi(xi_n), self.body(body)), dim=-1)
+        parts = [self.state(inv), self.action(action), self.xi(xi_n), self.body(body)]
+        if self.obj is not None:
+            if obj is None:
+                raise ValueError("Object features are required for this world model.")
+            parts.append(self.obj(obj))
+        return torch.cat(parts, dim=-1)
 
     def critic(
         self,
@@ -289,11 +298,15 @@ class InputNorms(nn.Module):
         goal: torch.Tensor,
         xi_n: torch.Tensor,
         priv: torch.Tensor,
+        obj: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.cat(
-            (self.state(inv), self.goal(goal), self.xi(xi_n), self.priv(priv)),
-            dim=-1,
-        )
+        parts = [self.state(inv)]
+        if self.obj is not None:
+            if obj is None:
+                raise ValueError("Object features are required for this critic.")
+            parts.append(self.obj(obj))
+        parts.extend((self.goal(goal), self.xi(xi_n), self.priv(priv)))
+        return torch.cat(parts, dim=-1)
 
     def update(self, inv: torch.Tensor, obs: torch.Tensor, goal: torch.Tensor, action: torch.Tensor, xi_n: torch.Tensor) -> None:
         self.state.update(inv)
@@ -349,7 +362,12 @@ class WorldModel(nn.Module):
         self.out_dim = task.wm_out_dim
         feat_dim = task.pelvis_feat_dim if frame == "pelvis" else task.inv_dim
         self.net = MLP(
-            feat_dim + task.num_joints + task.xi_dim + task.body_pos_dim + task.n_contact,
+            feat_dim
+            + task.num_joints
+            + task.xi_dim
+            + task.body_pos_dim
+            + task.n_contact
+            + task.object_feat_dim,
             [2048, 2048, 2048],
             self.out_dim,
             norm,
@@ -371,8 +389,9 @@ class WorldModel(nn.Module):
 
         The network reads body positions of the current state in ``self.frame``
         (heading or the full pelvis) and predicts the root-and-joint increment
-        plus the next contact. The returned state carries FK of that next pose.
-        The caller passes ``sigmoid(logits)`` into the following step.
+        plus the next contact. Object tasks also read and predict object pose.
+        The returned state carries FK of that next pose. The caller passes
+        ``sigmoid(logits)`` into the following step.
         """
         p, quat, v, w, q, qd = state.root()
         body_pos = state.body_pos
@@ -388,11 +407,18 @@ class WorldModel(nn.Module):
             body = heading_body_pos(p, quat, body_pos)
             state_n = norms.state(feat_in)
             rotate = yaw_quat(quat)
-        feat = torch.cat((state_n, norms.action(action), norms.xi(xi_n), norms.body(body), contact), dim=-1)
+        parts = [state_n, norms.action(action), norms.xi(xi_n), norms.body(body), contact]
+        if self.task.has_object:
+            obj_feat = object_features(p, quat, *state.object())
+            assert norms.obj is not None
+            parts.append(norms.obj(obj_feat))
+        feat = torch.cat(parts, dim=-1)
         nj = self.task.num_joints
-        dp, drot, dv, dw, dq, dqd, contact_logit = self.net(feat).split(
-            (3, 3, 3, 3, nj, nj, self.task.n_contact), dim=-1
-        )
+        widths = [3, 3, 3, 3, nj, nj, self.task.n_contact]
+        if self.task.has_object:
+            widths.extend((3, 3, 3, 3))
+        chunks = self.net(feat).split(tuple(widths), dim=-1)
+        dp, drot, dv, dw, dq, dqd, contact_logit = chunks[:7]
         nxt_p = p + quat_apply(rotate, dp)
         nxt_quat = quat_normalize(quat_mul(quat, rotvec_to_quat(drot)))
         nxt_v = v + quat_apply(quat, dv)
@@ -400,8 +426,26 @@ class WorldModel(nn.Module):
         nxt_q = q + dq
         nxt_qd = qd + dqd
         nxt_body_pos, nxt_body_quat, _, _ = mdp.bodies(nxt_p, nxt_quat, nxt_v, nxt_w, nxt_q, nxt_qd)
+        nxt_obj = (None, None, None, None)
+        if self.task.has_object:
+            obj_p, obj_quat, obj_v, obj_w = state.object()
+            odp, odrot, odv, odw = chunks[7:]
+            nxt_obj = (
+                obj_p + quat_apply(rotate, odp),
+                quat_normalize(quat_mul(obj_quat, rotvec_to_quat(odrot))),
+                obj_v + quat_apply(obj_quat, odv),
+                obj_w + quat_apply(obj_quat, odw),
+            )
         nxt = WorldModelState(
-            nxt_p, nxt_quat, nxt_v, nxt_w, nxt_q, nxt_qd, nxt_body_pos, nxt_body_quat
+            nxt_p,
+            nxt_quat,
+            nxt_v,
+            nxt_w,
+            nxt_q,
+            nxt_qd,
+            nxt_body_pos,
+            nxt_body_quat,
+            *nxt_obj,
         )
         return nxt, contact_logit
 

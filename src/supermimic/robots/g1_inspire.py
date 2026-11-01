@@ -2,7 +2,9 @@
 
 The recorded clips treat every finger hinge as an independent angle, so the
 mimic equalities are removed and each hinge gets a position actuator. The 29
-body joints reuse the mjlab G1 gains. The object is not part of this asset.
+body joints reuse the mjlab G1 gains. The free-joint object lives in
+``supermimic.robots.object`` and is added by ``TrackingSim`` when the task
+sets ``has_object``.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import re
 
 import mujoco
+import numpy as np
 from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
     G1_ACTUATOR_4010,
@@ -25,6 +28,9 @@ from mjlab.utils.string import resolve_expr
 from supermimic.motions.weave import ROBOT_XML
 
 _EQUALITY = re.compile(r"<equality>.*?</equality>", re.DOTALL)
+# Visual shells with a token mass and no joint. The mjlab G1 keeps these as geoms
+# on the parent. Head and hand bases stay bodies: they carry real inertia.
+_DUMMY_BODIES = ("pelvis_contour_link", "logo_link")
 
 _FINGER_DRIVER = BuiltinPositionActuatorCfg(
     target_names_expr=(
@@ -78,6 +84,63 @@ for _actuator in ARTICULATION.actuators:
         ACTION_SCALE[_pattern] = 0.25 * _actuator.effort_limit / _actuator.stiffness
 
 
+def _quat_mul(q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    w0, x0, y0, z0 = q
+    w1, x1, y1, z1 = r
+    return np.array(
+        [
+            w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+            w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+            w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+            w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+        ]
+    )
+
+
+def _quat_apply(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    xyz = q[1:]
+    t = 2.0 * np.cross(xyz, v)
+    return v + q[0] * t + np.cross(xyz, t)
+
+
+def _find_body(root: mujoco.MjsBody, name: str) -> mujoco.MjsBody | None:
+    for child in root.bodies:
+        if child.name == name:
+            return child
+        found = _find_body(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _merge_dummy_bodies(spec: mujoco.MjSpec) -> None:
+    """Move a jointless visual body onto its parent and delete the body."""
+    for name in _DUMMY_BODIES:
+        body = _find_body(spec.worldbody, name)
+        if body is None:
+            continue
+        if len(list(body.joints)) or len(list(body.bodies)):
+            raise RuntimeError(f"{name} is not a jointless leaf, so it cannot be merged.")
+        parent = body.parent
+        parent_quat = np.asarray(body.quat, dtype=np.float64)
+        parent_pos = np.asarray(body.pos, dtype=np.float64)
+        for geom in list(body.geoms):
+            merged = parent.add_geom()
+            merged.name = geom.name or name
+            merged.type = geom.type
+            merged.meshname = geom.meshname
+            merged.material = geom.material
+            merged.pos = parent_pos + _quat_apply(parent_quat, np.asarray(geom.pos, dtype=np.float64))
+            merged.quat = _quat_mul(parent_quat, np.asarray(geom.quat, dtype=np.float64))
+            merged.size = geom.size
+            merged.rgba = geom.rgba
+            merged.group = geom.group
+            merged.contype = geom.contype
+            merged.conaffinity = geom.conaffinity
+            merged.density = 0.0
+        spec.delete(body)
+
+
 def inspire_spec() -> mujoco.MjSpec:
     """MJCF with mimic equalities removed so each recorded finger angle is free."""
     if not ROBOT_XML.is_file():
@@ -85,6 +148,7 @@ def inspire_spec() -> mujoco.MjSpec:
     text = _EQUALITY.sub("", ROBOT_XML.read_text())
     spec = mujoco.MjSpec.from_string(text)
     spec.compiler.meshdir = str(ROBOT_XML.parent.resolve())
+    _merge_dummy_bodies(spec)
     return spec
 
 

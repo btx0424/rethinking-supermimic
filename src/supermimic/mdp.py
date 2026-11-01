@@ -61,6 +61,9 @@ OBS_SPEC = (
     # Tracking error of the reward bodies, not their world pose.
     ("body_pos", len(TRACKED_BODIES) * 3, 0.01),
     ("body_ori", len(TRACKED_BODIES) * 6, 0.05),
+    # Object pose in the robot yaw frame (Weave HOI). Absolute relative state, not error.
+    ("object_pos", 3, 0.01),
+    ("object_ori", 6, 0.05),
 )
 PAPER_OBS_TERMS = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
 # Per-component scale of a state error. Eq. 1 is an unweighted square, which is
@@ -93,6 +96,13 @@ REWARD_TERM_NAMES = (
     "action_rate",
     "joint_limit",
 )
+# Object HOI extras. Same σ / weights as root pose and body twist in object_hoi.
+OBJECT_REWARD_TERM_NAMES = (
+    "object_pos",
+    "object_ori",
+    "object_lin_vel",
+    "object_ang_vel",
+)
 # Shared length-scales (σ). Tracking uses the paper values; regularizers are style-specific uses.
 REWARD_TERM_SCALE = {
     "body_pos": 0.3,
@@ -101,41 +111,30 @@ REWARD_TERM_SCALE = {
     "body_ang_vel": 3.14,
     "root_pos": 0.3,
     "root_ori": 0.4,
+    "object_pos": 0.3,
+    "object_ori": 0.4,
+    "object_lin_vel": 1.0,
+    "object_ang_vel": 3.14,
     "action_rate": 1.0,
     "joint_limit": 0.1,
 }
 # Peak |weight| before ×dt. Tracking weights match the paper; cauchy joint_limit is a bonus.
+_TRACKING_WEIGHTS = {
+    "body_pos": 1.0,
+    "body_ori": 1.0,
+    "body_lin_vel": 1.0,
+    "body_ang_vel": 1.0,
+    "root_pos": 0.5,
+    "root_ori": 0.5,
+    "object_pos": 1.0,
+    "object_ori": 1.0,
+    "object_lin_vel": 1.0,
+    "object_ang_vel": 1.0,
+}
 REWARD_TERM_WEIGHT = {
-    "gaussian": {
-        "body_pos": 1.0,
-        "body_ori": 1.0,
-        "body_lin_vel": 1.0,
-        "body_ang_vel": 1.0,
-        "root_pos": 0.5,
-        "root_ori": 0.5,
-        "action_rate": 0.1,
-        "joint_limit": 2.0,
-    },
-    "cauchy": {
-        "body_pos": 1.0,
-        "body_ori": 1.0,
-        "body_lin_vel": 1.0,
-        "body_ang_vel": 1.0,
-        "root_pos": 0.5,
-        "root_ori": 0.5,
-        "action_rate": 0.1,
-        "joint_limit": 0.5,
-    },
-    "gaussian_linear": {
-        "body_pos": 1.0,
-        "body_ori": 1.0,
-        "body_lin_vel": 1.0,
-        "body_ang_vel": 1.0,
-        "root_pos": 0.5,
-        "root_ori": 0.5,
-        "action_rate": 0.1,
-        "joint_limit": 0.5,
-    },
+    "gaussian": {**_TRACKING_WEIGHTS, "action_rate": 0.1, "joint_limit": 2.0},
+    "cauchy": {**_TRACKING_WEIGHTS, "action_rate": 0.1, "joint_limit": 0.5},
+    "gaussian_linear": {**_TRACKING_WEIGHTS, "action_rate": 0.1, "joint_limit": 0.5},
 }
 
 
@@ -145,11 +144,21 @@ def resolve_reward_style(style: str) -> str:
     return style
 
 
-def max_step_reward(style: str = "gaussian") -> float:
+def reward_term_names(task: TaskSpec | None = None) -> tuple[str, ...]:
+    """Reward terms that sum to the step reward for this task."""
+    if task is not None and task.has_object:
+        # Object terms sit with the other tracking kernels, before the penalties.
+        base = REWARD_TERM_NAMES[:-2]
+        return base + OBJECT_REWARD_TERM_NAMES + REWARD_TERM_NAMES[-2:]
+    return REWARD_TERM_NAMES
+
+
+def max_step_reward(style: str = "gaussian", task: TaskSpec | None = None) -> float:
     """Upper bound on the positive tracking reward (penalties are ≤ 0 in every style)."""
     resolve_reward_style(style)
     weights = REWARD_TERM_WEIGHT[style]
-    return sum(weights[name] for name in REWARD_TERM_NAMES if name not in ("action_rate", "joint_limit")) * CONTROL_DT
+    names = reward_term_names(task)
+    return sum(weights[name] for name in names if name not in ("action_rate", "joint_limit")) * CONTROL_DT
 
 
 # Default = paper Gaussian (backward-compatible import site).
@@ -217,6 +226,10 @@ def flatten_state(p, quat, v, w, q, qd) -> torch.Tensor:
     return torch.cat((p, quat, v, w, q, qd), dim=-1)
 
 
+def flatten_object(obj_p, obj_quat, obj_v, obj_w) -> torch.Tensor:
+    return torch.cat((obj_p, obj_quat, obj_v, obj_w), dim=-1)
+
+
 def unflatten_state(s: torch.Tensor, num_joints: int | None = None):
     """Split a flat robot state. Joint count is inferred when the vector is robot-only."""
     if num_joints is None:
@@ -239,12 +252,20 @@ def unflatten_state(s: torch.Tensor, num_joints: int | None = None):
     )
 
 
+def unflatten_object(obj: torch.Tensor):
+    """Split a flat object state ``(p, quat, v, w)`` of width 13."""
+    if obj.shape[-1] != 13:
+        raise ValueError(f"Object state width {obj.shape[-1]} is not 13.")
+    return obj[..., 0:3], obj[..., 3:7], obj[..., 7:10], obj[..., 10:13]
+
+
 class WorldModelState(NamedTuple):
-    """Root pose and twist in the world frame, plus the 29 hinge joints.
+    """Root pose and twist in the world frame, plus hinge joints.
 
     ``body_pos`` / ``body_quat`` are tracked-body poses from forward kinematics
     (or from the simulator). ``MDP.obs`` reads them and does not run FK.
     ``WorldModel.step`` fills them on the returned next state.
+    Object fields are set for HOI tasks; LAFAN1 leaves them ``None``.
     """
 
     p: torch.Tensor
@@ -256,20 +277,37 @@ class WorldModelState(NamedTuple):
     w: torch.Tensor
     """World angular velocity, (..., 3)."""
     q: torch.Tensor
-    """Joint positions, (..., 29)."""
+    """Joint positions, (..., num_joints)."""
     qd: torch.Tensor
-    """Joint velocities, (..., 29)."""
+    """Joint velocities, (..., num_joints)."""
     body_pos: torch.Tensor | None = None
-    """World-frame tracked-body positions, (..., 14, 3)."""
+    """World-frame tracked-body positions, (..., n_body, 3)."""
     body_quat: torch.Tensor | None = None
-    """World-frame tracked-body orientations, (..., 14, 4)."""
+    """World-frame tracked-body orientations, (..., n_body, 4)."""
+    obj_p: torch.Tensor | None = None
+    """World-frame object position, (..., 3)."""
+    obj_quat: torch.Tensor | None = None
+    """World-frame object orientation as wxyz, (..., 4)."""
+    obj_v: torch.Tensor | None = None
+    """World-frame object linear velocity, (..., 3)."""
+    obj_w: torch.Tensor | None = None
+    """World-frame object angular velocity, (..., 3)."""
 
     def root(self) -> tuple[torch.Tensor, ...]:
         """The six root-and-joint tensors the buffer stores."""
         return (self.p, self.quat, self.v, self.w, self.q, self.qd)
 
+    def object(self) -> tuple[torch.Tensor, ...]:
+        """Object pose and twist. Raises if any object field is missing."""
+        if self.obj_p is None or self.obj_quat is None or self.obj_v is None or self.obj_w is None:
+            raise ValueError("WorldModelState is missing object fields.")
+        return (self.obj_p, self.obj_quat, self.obj_v, self.obj_w)
+
     def flatten(self) -> torch.Tensor:
         return torch.cat(self.root(), dim=-1)
+
+    def flatten_object(self) -> torch.Tensor:
+        return flatten_object(*self.object())
 
 
 def invariant_features(p, quat, v, w, q, qd) -> torch.Tensor:
@@ -331,6 +369,51 @@ def heading_body_pos(p, quat, body_p) -> torch.Tensor:
     return local.flatten(-2)
 
 
+def object_features(p, quat, obj_p, obj_quat, obj_v, obj_w) -> torch.Tensor:
+    """Object pose in the robot yaw frame and twist in the object body frame.
+
+    Matches the object block of ``MotionLib.goal`` so the critic / WM see the
+    same layout as the future reference.
+    """
+    yaw = yaw_quat(quat)
+    dp = quat_apply_inverse(yaw, obj_p - p)
+    relative = quat_mul(quat_inv(yaw), obj_quat)
+    return torch.cat(
+        (
+            dp,
+            mat_to_6d(quat_to_mat(relative)),
+            quat_apply_inverse(obj_quat, obj_v),
+            quat_apply_inverse(obj_quat, obj_w),
+        ),
+        dim=-1,
+    )
+
+
+def local_object_error(
+    obj_p,
+    obj_quat,
+    obj_v,
+    obj_w,
+    obj_p_hat,
+    obj_quat_hat,
+    obj_v_hat,
+    obj_w_hat,
+    root_quat,
+    frame: str = "heading",
+) -> torch.Tensor:
+    """Object-state error of the hat quantities in the true robot's frames."""
+    pos_frame = root_quat if frame == "pelvis" else yaw_quat(root_quat)
+    return torch.cat(
+        (
+            quat_apply_inverse(pos_frame, obj_p_hat - obj_p),
+            quat_to_rotvec(quat_mul(quat_inv(obj_quat), obj_quat_hat)),
+            quat_apply_inverse(obj_quat, obj_v_hat - obj_v),
+            quat_apply_inverse(obj_quat, obj_w_hat - obj_w),
+        ),
+        dim=-1,
+    )
+
+
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
     """Friction, encoder bias, torso COM. Joint count is ``xi.shape[-1] - 4``."""
     num_joints = xi.shape[-1] - 4
@@ -384,7 +467,8 @@ class MDP:
         self.obs_terms = resolve_obs_terms(obs_terms)
         self.reward_style = resolve_reward_style(reward_style)
         self.term_weight = REWARD_TERM_WEIGHT[self.reward_style]
-        self.max_step_reward = max_step_reward(self.reward_style)
+        self.term_names = reward_term_names(self.task)
+        self.max_step_reward = max_step_reward(self.reward_style, self.task)
         layout = {name: self.task.obs_term(name) for name in self.obs_terms}
         self.obs_dim = sum(dim for dim, _noise in layout.values())
         self.noise = torch.cat(
@@ -399,6 +483,10 @@ class MDP:
             and self.anchor != self.kin.pelvis_index
         )
 
+    def needs_object(self) -> bool:
+        """Whether observation terms or the task require object pose."""
+        return self.task.has_object or "object_pos" in self.obs_terms or "object_ori" in self.obs_terms
+
     def obs(self, state: WorldModelState, a_prev, xi, frame=None) -> torch.Tensor:
         """Noise-free proprioception. ``xi`` supplies the encoder offset.
 
@@ -406,7 +494,7 @@ class MDP:
         must fill those (simulator or ``WorldModel.step``); this method does not run FK.
         """
         p, quat, v, w, q, qd = state.root()
-        measured = q + xi[..., 1:30]
+        measured = q + xi[..., 1 : 1 + self.task.num_joints]
         parts = {
             "joint_pos": measured - self.default_q,
             "joint_vel": qd,
@@ -418,6 +506,18 @@ class MDP:
         body_p, body_quat = state.body_pos, state.body_quat
         if self.needs_body_pose() and (body_p is None or body_quat is None):
             raise ValueError("Observation terms need state.body_pos and state.body_quat; fill them before obs.")
+        if self.needs_object() and (
+            state.obj_p is None or state.obj_quat is None or state.obj_v is None or state.obj_w is None
+        ):
+            raise ValueError("Object observation terms need state.obj_*; fill them before obs.")
+        if "object_pos" in self.obs_terms or "object_ori" in self.obs_terms:
+            assert state.obj_p is not None and state.obj_quat is not None
+            yaw = yaw_quat(quat)
+            if "object_pos" in self.obs_terms:
+                parts["object_pos"] = quat_apply_inverse(yaw, state.obj_p - p)
+            if "object_ori" in self.obs_terms:
+                relative = quat_mul(quat_inv(yaw), state.obj_quat)
+                parts["object_ori"] = mat_to_6d(quat_to_mat(relative))
         if "anchor_ori" in self.obs_terms:
             if frame is None:
                 raise ValueError("The anchor_ori observation needs the reference frame.")
@@ -467,13 +567,28 @@ class MDP:
             body_p = self.bodies(p, quat, v, w, q, qd)[0]
         return heading_body_pos(p, quat, body_p)
 
-    def reward(self, p, quat, v, w, q, qd, frame, action, a_prev, terms: bool = False, bodies=None):
+    def reward(
+        self,
+        p,
+        quat,
+        v,
+        w,
+        q,
+        qd,
+        frame,
+        action,
+        a_prev,
+        terms: bool = False,
+        bodies=None,
+        object_state=None,
+    ):
         """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
 
         Action-rate and joint-limit are always the paper penalties
         ``-w · ||Δa||² · dt`` and ``-w · relu_violation · dt``.
 
         With ``terms=True``, also return a name→tensor dict that sums to the reward.
+        ``object_state`` is ``(obj_p, obj_quat, obj_v, obj_w)`` for HOI tasks.
         """
         if bodies is None:
             body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
@@ -496,16 +611,26 @@ class MDP:
             "root_pos": (self.motion.root_p[frame] - p).square().sum(-1),
             "root_ori": quat_error_angle(self.motion.root_quat[frame], quat).square(),
         }
-        w = self.term_weight
+        if self.task.has_object:
+            if object_state is None:
+                raise ValueError("Object reward needs object_state=(obj_p, obj_quat, obj_v, obj_w).")
+            obj_p, obj_quat, obj_v, obj_w = object_state
+            motion = self.motion
+            errors["object_pos"] = (motion.object_p[frame] - obj_p).square().sum(-1)
+            errors["object_ori"] = quat_error_angle(motion.object_quat[frame], obj_quat).square()
+            errors["object_lin_vel"] = (motion.object_v[frame] - obj_v).square().sum(-1)
+            errors["object_ang_vel"] = (motion.object_w[frame] - obj_w).square().sum(-1)
+        weight = self.term_weight
         s = REWARD_TERM_SCALE
         pen = REWARD_TERM_WEIGHT["gaussian"]
         parts = {
-            name: w[name] * kernel(errors[name], s[name]) * CONTROL_DT for name in errors
+            name: weight[name] * kernel(errors[name], s[name]) * CONTROL_DT for name in errors
         }
         parts["action_rate"] = -pen["action_rate"] * (action - a_prev).square().sum(-1) * CONTROL_DT
         parts["joint_limit"] = -pen["joint_limit"] * hard_joint_violation(q, self.soft_lo, self.soft_hi) * CONTROL_DT
-        reward = parts["body_pos"]
-        for name in REWARD_TERM_NAMES[1:]:
+        names = self.term_names
+        reward = parts[names[0]]
+        for name in names[1:]:
             reward = reward + parts[name]
         if terms:
             return reward, parts
@@ -532,12 +657,13 @@ class MDP:
         tilt = (g_ref[..., 2] - g_robot[..., 2]).abs()
         return height, tilt
 
-    def privileged(self, p, quat, v, w, q, qd, frame) -> torch.Tensor:
+    def privileged(self, p, quat, v, w, q, qd, frame, object_state=None) -> torch.Tensor:
         """Tracking errors the policy does not observe.
 
         Joint position error, anchored body-position error and root-position error
         in the robot heading frame, and the 6D reference-root orientation in the
-        robot root frame. The anchor matches the reward.
+        robot root frame. The anchor matches the reward. Object tasks append
+        heading-frame object position error and 6D object orientation error.
         """
         body_p, body_quat, _, _ = self.bodies(p, quat, v, w, q, qd)
         anchored_p, _ = _anchor_relative(
@@ -547,26 +673,33 @@ class MDP:
         body_error = quat_apply_inverse(yaw.unsqueeze(-2), anchored_p - body_p).flatten(-2)
         root_error = quat_apply_inverse(yaw, self.motion.root_p[frame] - p)
         relative = quat_mul(quat_inv(quat), self.motion.root_quat[frame])
-        return torch.cat(
-            (
-                self.motion.q[frame] - q,
-                body_error,
-                root_error,
-                mat_to_6d(quat_to_mat(relative)),
-            ),
-            dim=-1,
-        )
+        parts = [
+            self.motion.q[frame] - q,
+            body_error,
+            root_error,
+            mat_to_6d(quat_to_mat(relative)),
+        ]
+        if self.task.has_object:
+            if object_state is None:
+                raise ValueError("Privileged object features need object_state.")
+            obj_p, obj_quat, _, _ = object_state
+            parts.append(quat_apply_inverse(yaw, self.motion.object_p[frame] - obj_p))
+            obj_rel = quat_mul(quat_inv(obj_quat), self.motion.object_quat[frame])
+            parts.append(mat_to_6d(quat_to_mat(obj_rel)))
+        return torch.cat(parts, dim=-1)
 
-    def critic_input(self, p, quat, v, w, q, qd, goal, xi, frame) -> torch.Tensor:
-        return torch.cat(
-            (
-                invariant_features(p, quat, v, w, q, qd),
-                goal,
-                normalize_xi(xi),
-                self.privileged(p, quat, v, w, q, qd, frame),
-            ),
-            dim=-1,
-        )
+    def critic_input(self, p, quat, v, w, q, qd, goal, xi, frame, object_state=None) -> torch.Tensor:
+        parts = [
+            invariant_features(p, quat, v, w, q, qd),
+            goal,
+            normalize_xi(xi),
+            self.privileged(p, quat, v, w, q, qd, frame, object_state=object_state),
+        ]
+        if self.task.has_object:
+            if object_state is None:
+                raise ValueError("Critic object features need object_state.")
+            parts.insert(1, object_features(p, quat, *object_state))
+        return torch.cat(parts, dim=-1)
 
 
 def _anchor_relative(robot_p, robot_quat, ref_p, ref_quat, anchor: int):
@@ -585,8 +718,3 @@ def _anchor_relative(robot_p, robot_quat, ref_p, ref_quat, anchor: int):
     ori = quat_mul(dori.expand(*ref_quat.shape[:-1], 4), ref_quat)
     return pos, ori
 
-
-class HoiMDP:
-    """
-    Motion tracking but using WEAVE motions and g1_inspire_hand.
-    """

@@ -12,6 +12,7 @@ class ReplayBuffer:
         self.capacity = capacity
         self.num_envs = num_envs
         self.device = device
+        self.has_object = task.has_object
         shape = (capacity, num_envs)
         self.s = torch.zeros(*shape, task.state_dim, device=device)
         self.s1 = torch.zeros(*shape, task.state_dim, device=device)
@@ -25,6 +26,12 @@ class ReplayBuffer:
         self.f = torch.zeros(*shape, dtype=torch.long, device=device)
         self.ep = torch.full(shape, -1, dtype=torch.long, device=device)
         self.step = torch.zeros(*shape, dtype=torch.long, device=device)
+        if task.has_object:
+            self.obj = torch.zeros(*shape, task.object_state_dim, device=device)
+            self.obj1 = torch.zeros(*shape, task.object_state_dim, device=device)
+        else:
+            self.obj = None
+            self.obj1 = None
         self.ptr = 0
         self.filled = 0
 
@@ -42,6 +49,9 @@ class ReplayBuffer:
         self.f[i] = batch["f"]
         self.ep[i] = batch["ep"]
         self.step[i] = batch["step"]
+        if self.obj is not None:
+            self.obj[i] = batch["obj"]
+            self.obj1[i] = batch["obj1"]
         self.ptr = (self.ptr + 1) % self.capacity
         self.filled = min(self.filled + 1, self.capacity)
 
@@ -85,7 +95,7 @@ class ReplayBuffer:
             idx = time[:, None] + torch.arange(k, device=self.device)
         else:
             idx = (time[:, None] + torch.arange(k, device=self.device)) % self.capacity
-        return {
+        out = {
             "s": self.s[idx, env[:, None]],
             "s1": self.s1[idx, env[:, None]],
             "body_pos": self.body_pos[idx, env[:, None]],
@@ -97,6 +107,10 @@ class ReplayBuffer:
             "c1": self.c1[idx, env[:, None]],
             "f": self.f[idx, env[:, None]],
         }
+        if self.obj is not None:
+            out["obj"] = self.obj[idx, env[:, None]]
+            out["obj1"] = self.obj1[idx, env[:, None]]
+        return out
 
     def sample_starts(self, batch: int, hist: int) -> dict[str, torch.Tensor]:
         """Current transitions plus an observation history, oldest frame first."""
@@ -118,7 +132,7 @@ class ReplayBuffer:
         for col in range(hist - 2, -1, -1):
             bad = ~valid[:, col]
             raw[bad, col] = raw[bad, col + 1]
-        return {
+        out = {
             "s": self.s[time, env],
             "body_pos": self.body_pos[time, env],
             "body_quat": self.body_quat[time, env],
@@ -133,3 +147,7 @@ class ReplayBuffer:
             "hist_xi": self.xi[raw, env[:, None]],
             "hist_f": self.f[raw, env[:, None]],
         }
+        if self.obj is not None:
+            out["obj"] = self.obj[time, env]
+            out["hist_obj"] = self.obj[raw, env[:, None]]
+        return out

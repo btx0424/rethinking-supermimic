@@ -91,6 +91,10 @@ class TorchKinematics:
             body_quat[i] = model.body_quat[i]
             jadr = int(model.body_jntadr[i])
             jnum = int(model.body_jntnum[i])
+            if jnum == 0:
+                # Fixed to the parent. Head and hand bases are welded this way.
+                kind[i] = 2
+                continue
             if jnum != 1:
                 raise NotImplementedError(
                     f"Body {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)} "
@@ -115,11 +119,16 @@ class TorchKinematics:
             raise NotImplementedError("Expected a single free joint on body 1 (pelvis).")
         self._free_id = int(free_ids[0])
 
-        hinge_layers: list[np.ndarray] = []
+        hinge_layers: list[tuple[np.ndarray, bool]] = []
         for d in range(2, int(depth.max()) + 1):
-            ids = np.nonzero((depth == d) & (kind == 1))[0]
-            if ids.size:
-                hinge_layers.append(ids.astype(np.int64))
+            # Fixed bodies at this depth first, so a later hinge can use them as parents
+            # only across depths. Siblings do not depend on each other.
+            fixed = np.nonzero((depth == d) & (kind == 2))[0]
+            hinges = np.nonzero((depth == d) & (kind == 1))[0]
+            if fixed.size:
+                hinge_layers.append((fixed.astype(np.int64), True))
+            if hinges.size:
+                hinge_layers.append((hinges.astype(np.int64), False))
 
         # G1 (and most humanoids) place each hinge at the child body origin with
         # qpos0=0. That drops the anchor translation from the hinge step.
@@ -147,17 +156,21 @@ class TorchKinematics:
                 "pos": body_pos[i].copy(),
                 "quat": body_quat[i].copy(),
                 "joints": (
-                    [{"kind": "free", "q_index": -1, "axis": axis[i].copy(), "anchor": anchor[i].copy(), "qpos0": 0.0}]
-                    if kind[i] == 0
-                    else [
-                        {
-                            "kind": "hinge",
-                            "q_index": int(q_index[i]),
-                            "axis": axis[i].copy(),
-                            "anchor": anchor[i].copy(),
-                            "qpos0": float(qpos0[i]),
-                        }
-                    ]
+                    []
+                    if kind[i] == 2
+                    else (
+                        [{"kind": "free", "q_index": -1, "axis": axis[i].copy(), "anchor": anchor[i].copy(), "qpos0": 0.0}]
+                        if kind[i] == 0
+                        else [
+                            {
+                                "kind": "hinge",
+                                "q_index": int(q_index[i]),
+                                "axis": axis[i].copy(),
+                                "anchor": anchor[i].copy(),
+                                "qpos0": float(qpos0[i]),
+                            }
+                        ]
+                    )
                 ),
             }
             for i in range(1, self.nbody)
@@ -183,7 +196,7 @@ class TorchKinematics:
             return torch.as_tensor(x, device=device, dtype=dt)
 
         layers = []
-        for ids in c["hinge_layers"]:
+        for ids, fixed in c["hinge_layers"]:
             layers.append(
                 {
                     "body": torch.as_tensor(ids, device=device, dtype=torch.long),
@@ -194,6 +207,7 @@ class TorchKinematics:
                     "anchor": t(c["anchor"][ids]),
                     "qpos0": t(c["qpos0"][ids]),
                     "q_index": torch.as_tensor(c["q_index"][ids], device=device, dtype=torch.long),
+                    "fixed": fixed,
                 }
             )
         cached = {
@@ -260,6 +274,12 @@ class TorchKinematics:
             xpos = quat_apply(p_rot, local_pos_b) + p_pos
             xquat_pre = quat_normalize(quat_mul(p_rot, local_quat_b))
             v_b = p_lin + torch.cross(p_ang, xpos - p_pos, dim=-1)
+            if layer["fixed"]:
+                pos[:, body] = xpos
+                rot[:, body] = xquat_pre
+                lin[:, body] = v_b
+                ang[:, body] = p_ang
+                continue
             angle = q[:, q_idx] - layer["qpos0"]
             rate = qd[:, q_idx]
             # Joint axis lives in the pre-hinge body frame (MuJoCo).
