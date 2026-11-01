@@ -11,22 +11,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import einops
-import swanlab
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
+from supermimic import experiment_log
 from supermimic.mdp import (
     CONTROL_DT,
-    GOAL_DIM,
     GOAL_FRAMES,
-    INV_DIM,
-    NUM_J,
-    PRIV_DIM,
     REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
-    XI_DIM,
     invariant_features,
     normalize_xi,
     resolve_obs_terms,
@@ -45,8 +40,6 @@ from supermimic.sac.util import (
 )
 from supermimic.supermimic.network import InputNorms
 from supermimic.supermimic.reward_norm import RewardNormalizer
-
-CRITIC_FEAT_DIM = INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM
 
 
 @contextmanager
@@ -134,6 +127,7 @@ class TrainConfig:
     vecnorm: bool = True
     use_amp: bool = True
 
+    task: str = "lafan1"
     anchor: str = "pelvis"
     obs_terms: tuple[str, ...] = ()
     reward_style: str = "gaussian"
@@ -466,9 +460,9 @@ class Trainer:
     """Environment loop + :class:`SACAgent` (tracking sim, dict transitions)."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from supermimic.kinematics import compile_g1, make_kinematics
-        from supermimic.motion import MotionLib
+        from supermimic.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
+        from supermimic.tasks import get_task
 
         self.cfg = cfg
         self.log_dir = Path(log_dir)
@@ -476,8 +470,9 @@ class Trainer:
         self.device = torch.device(cfg.device)
         torch.manual_seed(cfg.seed)
 
-        self.motion = MotionLib.load(device=str(self.device))
-        model, names = compile_g1()
+        self.task = get_task(cfg.task)
+        self.motion = self.task.load_motion(str(self.device))
+        model, names = self.task.compile_model()
         self.kin = make_kinematics(model, names, "torch", str(self.device))
         obs_terms = cfg.obs_terms or resolve_obs_terms(())
         self.sim = TrackingSim(
@@ -490,16 +485,18 @@ class Trainer:
             obs_terms=obs_terms,
             reward_style=cfg.reward_style,
             survival_bonus=1.0,
+            task=self.task,
         )
         self.r_max = self.sim.r_max
-        self.policy_obs_dim = self.sim.mdp.obs_dim + GOAL_DIM
-        assert CRITIC_FEAT_DIM == INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM
-        self.norms = InputNorms(self.sim.mdp.obs_dim).to(self.device)
+        self.policy_obs_dim = self.sim.mdp.obs_dim + self.task.goal_dim
+        self.critic_dim = self.task.inv_dim + self.task.goal_dim + self.task.xi_dim + self.task.priv_dim
+        critic_dim = self.critic_dim
+        self.norms = InputNorms(self.sim.mdp.obs_dim, self.task).to(self.device)
         self.agent = SACAgent(
             cfg,
             self.policy_obs_dim,
-            CRITIC_FEAT_DIM,
-            NUM_J,
+            critic_dim,
+            self.task.num_joints,
             self.device,
             r_max=self.r_max,
         )
@@ -507,8 +504,8 @@ class Trainer:
             cfg.buffer_steps,
             cfg.num_envs,
             self.policy_obs_dim,
-            CRITIC_FEAT_DIM,
-            NUM_J,
+            critic_dim,
+            self.task.num_joints,
             self.device,
         )
         self._step_acc = 0.0
@@ -683,7 +680,7 @@ class Trainer:
         if self.agent.reward_norm is not None:
             metrics["train/reward_scale"] = float(self.agent.reward_norm.scale())
 
-        swanlab.log(metrics, step=iteration)
+        experiment_log.log(metrics, step=iteration)
         if self._tb is not None:
             for key, value in metrics.items():
                 if math.isfinite(value):
@@ -749,14 +746,14 @@ class Trainer:
         logged_cfg = {
             key: list(value) if isinstance(value, tuple) else value for key, value in cfg.__dict__.items()
         }
-        swanlab.init(
+        experiment_log.init(
             project=cfg.swanlab_project,
             name=cfg.swanlab_experiment or None,
             config={
                 **logged_cfg,
                 "algo": "sac",
                 "policy_obs_dim": self.policy_obs_dim,
-                "critic_feat_dim": CRITIC_FEAT_DIM,
+                "critic_feat_dim": self.critic_dim,
                 "obs_dim": self.sim.mdp.obs_dim,
                 "anchor_body": self.kin.anchor_name,
             },
@@ -790,7 +787,7 @@ class Trainer:
                 if (iteration + 1) % cfg.ckpt_every == 0 or iteration + 1 == cfg.iterations:
                     self.save_checkpoint(iteration + 1)
         finally:
-            swanlab.finish()
+            experiment_log.finish()
             if self._tb is not None:
                 self._tb.close()
             if self._log_f is not None:

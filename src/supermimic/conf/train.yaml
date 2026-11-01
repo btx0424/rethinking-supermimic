@@ -24,6 +24,8 @@ obs:
   body_pos: true
   body_ori: true
 
+# lafan1: mjlab G1, 29 hinges. weave: inspire-hand G1 plus an object.
+task: lafan1
 anchor: pelvis
 reward_style: gaussian
 

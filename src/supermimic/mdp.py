@@ -7,6 +7,7 @@ from typing import NamedTuple
 import torch
 
 from .kinematics import TRACKED_BODIES, TorchKinematics
+from .tasks import Lafan1Task, TaskSpec
 from .math_utils import (
     mat_to_6d,
     quat_apply,
@@ -18,27 +19,29 @@ from .math_utils import (
     quat_to_rotvec,
     yaw_quat,
 )
-from .motion import CONTROL_DT, GOAL_PER_FRAME, MotionLib
+from .motion import CONTROL_DT, MotionLib
 
-NUM_J = 29
-XI_DIM = 1 + NUM_J + 3
-INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
+# LAFAN1 widths. Training reads ``TaskSpec``; these aliases keep analysis scripts working.
+_LAFAN1 = Lafan1Task()
+NUM_J = _LAFAN1.num_joints
+XI_DIM = _LAFAN1.xi_dim
+INV_DIM = _LAFAN1.inv_dim
 # Pelvis-frame world-model features: height, gravity in the pelvis, body-frame twist, joints.
 # Three fewer than INV_DIM because gravity replaces the 6D yaw-removed tilt.
-PELVIS_FEAT_DIM = 1 + 3 + 3 + 3 + NUM_J + NUM_J
+PELVIS_FEAT_DIM = _LAFAN1.pelvis_feat_dim
 WM_FRAMES = ("heading", "pelvis")
-STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J
+STATE_DIM = _LAFAN1.state_dim
 # Critic-only tracking errors: joint position, heading-frame anchored body position,
 # heading-frame root position, 6D root orientation.
-PRIV_DIM = NUM_J + len(TRACKED_BODIES) * 3 + 3 + 6
+PRIV_DIM = _LAFAN1.priv_dim
 # One ground-contact bit per tracked body. The world model reads it and predicts the next one.
-N_CONTACT = len(TRACKED_BODIES)
-N_BODY = len(TRACKED_BODIES)
+N_CONTACT = _LAFAN1.n_contact
+N_BODY = _LAFAN1.n_body
 # Heading-frame body positions. The world model reads them and does not predict them.
-BODY_POS_DIM = N_BODY * 3
-HIST = 10
-GOAL_FRAMES = 10
-GOAL_DIM = GOAL_PER_FRAME * GOAL_FRAMES
+BODY_POS_DIM = _LAFAN1.body_pos_dim
+HIST = _LAFAN1.hist
+GOAL_FRAMES = _LAFAN1.goal_frames
+GOAL_DIM = _LAFAN1.goal_dim
 GRAVITY = (0.0, 0.0, -1.0)
 # Hard termination. Height is |root z − reference z|. Tilt is the projected-gravity z error.
 TERM_HEIGHT = 0.25
@@ -199,9 +202,14 @@ def resolve_obs_terms(terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     return tuple(name for name, _, _ in OBS_SPEC if name in chosen)
 
 
-def nominal_error(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def nominal_error(
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    task: TaskSpec | None = None,
+) -> torch.Tensor:
+    groups = NOMINAL_ERROR if task is None else task.nominal_error_groups()
     return torch.cat(
-        [torch.full((n,), scale, device=device, dtype=dtype) for n, scale in NOMINAL_ERROR]
+        [torch.full((n,), scale, device=device, dtype=dtype) for n, scale in groups]
     )
 
 
@@ -209,14 +217,25 @@ def flatten_state(p, quat, v, w, q, qd) -> torch.Tensor:
     return torch.cat((p, quat, v, w, q, qd), dim=-1)
 
 
-def unflatten_state(s: torch.Tensor):
+def unflatten_state(s: torch.Tensor, num_joints: int | None = None):
+    """Split a flat robot state. Joint count is inferred when the vector is robot-only."""
+    if num_joints is None:
+        extra = s.shape[-1] - 13
+        if extra < 2 or extra % 2 != 0:
+            raise ValueError(f"State width {s.shape[-1]} is not 13 + 2 * num_joints.")
+        num_joints = extra // 2
+    j0 = 13
+    j1 = j0 + num_joints
+    j2 = j1 + num_joints
+    if s.shape[-1] < j2:
+        raise ValueError(f"State width {s.shape[-1]} is shorter than {j2}.")
     return (
         s[..., 0:3],
         s[..., 3:7],
         s[..., 7:10],
         s[..., 10:13],
-        s[..., 13:42],
-        s[..., 42:71],
+        s[..., j0:j1],
+        s[..., j1:j2],
     )
 
 
@@ -313,8 +332,12 @@ def heading_body_pos(p, quat, body_p) -> torch.Tensor:
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
+    """Friction, encoder bias, torso COM. Joint count is ``xi.shape[-1] - 4``."""
+    num_joints = xi.shape[-1] - 4
+    bias = slice(1, 1 + num_joints)
+    com = slice(1 + num_joints, None)
     return torch.cat(
-        ((xi[..., :1] - 0.75) / 0.45, xi[..., 1:30] / 0.01, xi[..., 30:33] / 0.05),
+        ((xi[..., :1] - 0.75) / 0.45, xi[..., bias] / 0.01, xi[..., com] / 0.05),
         dim=-1,
     )
 
@@ -349,7 +372,9 @@ class MDP:
         soft_hi: torch.Tensor,
         obs_terms: tuple[str, ...] = PAPER_OBS_TERMS,
         reward_style: str = "gaussian",
+        task: TaskSpec | None = None,
     ):
+        self.task = _LAFAN1 if task is None else task
         self.kin = kin
         self.motion = motion
         self.default_q = default_q
@@ -360,10 +385,10 @@ class MDP:
         self.reward_style = resolve_reward_style(reward_style)
         self.term_weight = REWARD_TERM_WEIGHT[self.reward_style]
         self.max_step_reward = max_step_reward(self.reward_style)
-        spec = {name: (dim, noise) for name, dim, noise in OBS_SPEC}
-        self.obs_dim = sum(spec[name][0] for name in self.obs_terms)
+        layout = {name: self.task.obs_term(name) for name in self.obs_terms}
+        self.obs_dim = sum(dim for dim, _noise in layout.values())
         self.noise = torch.cat(
-            [torch.full((spec[name][0],), spec[name][1], device=default_q.device) for name in self.obs_terms]
+            [torch.full((dim,), noise, device=default_q.device) for dim, noise in layout.values()]
         )
         self.gravity = default_q.new_tensor(GRAVITY)
 
@@ -559,3 +584,9 @@ def _anchor_relative(robot_p, robot_quat, ref_p, ref_quat, anchor: int):
     pos = dpos + quat_apply(dori.expand(*ref_p.shape[:-1], 4), ref_p - ref_anchor)
     ori = quat_mul(dori.expand(*ref_quat.shape[:-1], 4), ref_quat)
     return pos, ori
+
+
+class HoiMDP:
+    """
+    Motion tracking but using WEAVE motions and g1_inspire_hand.
+    """

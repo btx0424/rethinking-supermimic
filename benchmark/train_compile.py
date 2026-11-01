@@ -150,11 +150,11 @@ def _setup_wm(batch: int, k: int, device: torch.device, amp: str, optim: str, wm
     with torch.no_grad():
         kin.forward(*unflatten_state(torch.zeros(1, STATE_DIM, device=device)))
 
-    wm = WorldModel("rms", False).to(device)
-    norms = InputNorms(mdp.obs_dim).to(device)
+    wm = WorldModel(mdp.task, "rms", False).to(device)
+    norms = InputNorms(mdp.obs_dim, mdp.task).to(device)
     with torch.no_grad():
         wm.net.head.weight.normal_(0, 0.01)
-    mse_loss = MSELoss(device).to(device)
+    mse_loss = MSELoss(device, mdp.task).to(device)
     opt = build_optimizer(wm, wm_lr, optim)
 
     def rand_quat(shape: tuple[int, ...]) -> torch.Tensor:

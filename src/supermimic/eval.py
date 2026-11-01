@@ -8,12 +8,10 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from supermimic.kinematics import compile_g1, make_kinematics
+from supermimic.kinematics import make_kinematics
 from supermimic.mdp import (
-    GOAL_DIM,
     GOAL_FRAMES,
     HIST,
-    NUM_J,
     PAPER_OBS_TERMS,
     TERM_HEIGHT,
     TERM_TILT,
@@ -21,12 +19,14 @@ from supermimic.mdp import (
 )
 from supermimic.motion import CONTROL_DT, MotionLib
 from supermimic.sim import TrackingSim
+from supermimic.tasks import get_task
 from supermimic.supermimic.network import InputNorms, build_policy
 
 
 def _build_sim(saved_cfg: dict, num_envs: int, device: str) -> TrackingSim:
-    motion = MotionLib.load(device=device)
-    model, names = compile_g1()
+    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    motion = task.load_motion(device)
+    model, names = task.compile_model()
     kin = make_kinematics(model, names, str(saved_cfg.get("fk", "warp")), device)
     kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
     return TrackingSim(
@@ -39,6 +39,7 @@ def _build_sim(saved_cfg: dict, num_envs: int, device: str) -> TrackingSim:
         anchor=str(saved_cfg.get("anchor", "torso")),
         obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
         reward_style=str(saved_cfg.get("reward_style", "gaussian")),
+        task=task,
     )
 
 
@@ -101,13 +102,17 @@ def evaluate_supermimic(
     live: bool,
     progress: bool,
 ) -> None:
-    motion = MotionLib.load(device=device)
+    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    motion = task.load_motion(device)
     n = motion.num_clips
     sim = _build_sim(saved_cfg, n, device)
-    policy = build_policy(sim.mdp.obs_dim, GOAL_DIM, HIST, saved_cfg).to(device)
+    motion = sim.motion
+    policy = build_policy(
+        sim.mdp.obs_dim, sim.mdp.task.goal_dim, HIST, saved_cfg, sim.mdp.task.num_joints
+    ).to(device)
     policy.load_state_dict(_policy_state_dict(saved, live=live))
     policy.eval()
-    norms = InputNorms(sim.mdp.obs_dim).to(device)
+    norms = InputNorms(sim.mdp.obs_dim, sim.mdp.task).to(device)
     norms.load_state_dict(saved["norms"])
     obs_hist = torch.zeros(n, HIST, sim.mdp.obs_dim, device=device)
 
@@ -137,13 +142,15 @@ def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progr
     from supermimic.sac.network import NormalActor
     from supermimic.sac.util import ObsVecNorm
 
-    motion = MotionLib.load(device=device)
+    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    motion = task.load_motion(device)
     n = motion.num_clips
     sim = _build_sim(saved_cfg, n, device)
-    policy_obs_dim = sim.mdp.obs_dim + GOAL_DIM
+    motion = sim.motion
+    policy_obs_dim = sim.mdp.obs_dim + sim.mdp.task.goal_dim
     actor = NormalActor(
         policy_obs_dim,
-        NUM_J,
+        sim.mdp.task.num_joints,
         action_init=str(saved_cfg.get("actor_init", "zeros")),
     ).to(device)
     actor.load_state_dict(_policy_state_dict(saved, live=live))
@@ -154,7 +161,7 @@ def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progr
         vecnorm.load_state_dict(saved["vecnorm"])
     if vecnorm is not None:
         vecnorm.eval()
-    norms = InputNorms(sim.mdp.obs_dim).to(device)
+    norms = InputNorms(sim.mdp.obs_dim, sim.mdp.task).to(device)
     if "norms" in saved:
         norms.load_state_dict(saved["norms"])
 

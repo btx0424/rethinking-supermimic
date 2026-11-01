@@ -5,17 +5,16 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
-from mjlab.utils.string import resolve_expr
 
-from .kinematics import TRACKED_BODIES, TorchKinematics
+from .kinematics import TorchKinematics
 from .math_utils import quat_from_euler_xyz, quat_mul
-from .mdp import MDP, N_CONTACT, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
+from .mdp import MDP, PAPER_OBS_TERMS, REWARD_TERM_NAMES, flatten_state, max_step_reward
 from .motion import BIN_FRAMES, MotionLib
+from .tasks import TaskSpec, get_task
 
 DECIMATION = 4
 MAX_EPISODE_STEPS = 500  # 10 s at 50 Hz.
@@ -43,7 +42,9 @@ class TrackingSim:
         obs_terms: tuple[str, ...] | None = None,
         reward_style: str = "gaussian",
         survival_bonus: float = 0.0,
+        task: TaskSpec | None = None,
     ):
+        self.task = get_task("lafan1") if task is None else task
         self.device = device
         # Keep the captured step graph's pool. A sync otherwise returns it to the
         # driver, and the next launch fails once PyTorch has taken the memory.
@@ -61,7 +62,7 @@ class TrackingSim:
             num_envs=num_envs,
             env_spacing=2.0,
             terrain=TerrainEntityCfg(terrain_type="plane"),
-            entities={"robot": get_g1_robot_cfg()},
+            entities={"robot": self.task.robot_cfg()},
         )
         self.scene = Scene(scene_cfg, device)
         sim_cfg = SimulationCfg(
@@ -79,7 +80,7 @@ class TrackingSim:
         self.robot = self.scene["robot"]
         if tuple(self.robot.joint_names) != motion.joint_names:
             raise RuntimeError(
-                "Motion joint order does not match the mjlab G1: "
+                f"Motion joint order does not match the {self.task.name} robot: "
                 f"{motion.joint_names} vs {tuple(self.robot.joint_names)}"
             )
         default = self.robot.data.default_joint_pos
@@ -95,24 +96,22 @@ class TrackingSim:
             limits[:, 1].clone(),
             obs_terms=PAPER_OBS_TERMS if obs_terms is None else obs_terms,
             reward_style=reward_style,
+            task=self.task,
         )
-        scale = resolve_expr(G1_ACTION_SCALE, tuple(self.robot.joint_names))
-        if any(value is None for value in scale):
-            missing = [name for name, value in zip(self.robot.joint_names, scale) if value is None]
-            raise KeyError(f"No action scale for joints {missing}")
+        scale = self.task.action_scale(tuple(self.robot.joint_names))
         self.action_scale = torch.tensor(scale, device=device, dtype=torch.float32)
-        foot_local, foot_names = self.robot.find_geoms(r"^(left|right)_foot[1-7]_collision$")
+        foot_local, foot_names = self.robot.find_geoms(self.task.foot_geom_expr)
         if not foot_names:
             raise RuntimeError("The G1 model has no foot collision geoms.")
         self._foot_ids = self.robot.indexing.geom_ids[foot_local]
         torso_local = self.robot.body_names.index("torso_link")
         self._torso_id = int(self.robot.indexing.body_ids[torso_local])
-        # mjlab body tensors follow robot.body_names. TRACKED_BODIES is the FK order.
-        missing = [name for name in TRACKED_BODIES if name not in self.robot.body_names]
+        # mjlab body tensors follow robot.body_names. The task list is the FK order.
+        missing = [name for name in self.task.tracked_bodies if name not in self.robot.body_names]
         if missing:
-            raise KeyError(f"mjlab G1 is missing tracked bodies: {missing}")
+            raise KeyError(f"The robot is missing tracked bodies: {missing}")
         self._tracked_local = torch.tensor(
-            [self.robot.body_names.index(name) for name in TRACKED_BODIES],
+            [self.robot.body_names.index(name) for name in self.task.tracked_bodies],
             dtype=torch.long,
             device=device,
         )
@@ -151,7 +150,7 @@ class TrackingSim:
         mj = self.sim.mj_model
         body_of_geom = torch.tensor(mj.geom_bodyid, device=self.device, dtype=torch.long)
         body_slot = torch.full((mj.nbody,), -1, device=self.device, dtype=torch.long)
-        for slot, name in enumerate(TRACKED_BODIES):
+        for slot, name in enumerate(self.task.contact_bodies):
             local = self.robot.body_names.index(name)
             body_slot[int(self.robot.indexing.body_ids[local])] = slot
         self._geom_tracked = body_slot[body_of_geom]
@@ -182,7 +181,7 @@ class TrackingSim:
         robot = torch.where(terrain0, g1, g0)
         slot = self._geom_tracked[robot]
         ground = ground & (slot >= 0)
-        bits = dist.new_zeros(self.num_envs, N_CONTACT)
+        bits = dist.new_zeros(self.num_envs, self.task.n_contact)
         if bool(ground.any()):
             bits[world[ground], slot[ground]] = 1
         return bits
@@ -331,21 +330,25 @@ class TrackingSim:
             self.xi[env_ids, 1:] = 0
             return
         self.xi[env_ids, 0] = torch.empty(n, device=dev).uniform_(0.3, 1.2)
-        self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
-        self.xi[env_ids, 30] = torch.empty(n, device=dev).uniform_(-0.025, 0.025)
-        self.xi[env_ids, 31] = torch.empty(n, device=dev).uniform_(-0.05, 0.05)
-        self.xi[env_ids, 32] = torch.empty(n, device=dev).uniform_(-0.05, 0.05)
+        num_joints = self.task.num_joints
+        self.xi[env_ids, 1 : 1 + num_joints] = torch.empty(n, num_joints, device=dev).uniform_(-0.01, 0.01)
+        com = 1 + num_joints
+        self.xi[env_ids, com] = torch.empty(n, device=dev).uniform_(-0.025, 0.025)
+        self.xi[env_ids, com + 1] = torch.empty(n, device=dev).uniform_(-0.05, 0.05)
+        self.xi[env_ids, com + 2] = torch.empty(n, device=dev).uniform_(-0.05, 0.05)
 
     def _apply_xi(self, env_ids: torch.Tensor) -> None:
         mu = self.xi[env_ids, 0]
         self.sim.model.geom_friction[env_ids[:, None], self._foot_ids, 0] = mu[:, None]
-        self.robot.data.encoder_bias[env_ids] = self.xi[env_ids, 1:30]
+        num_joints = self.task.num_joints
+        self.robot.data.encoder_bias[env_ids] = self.xi[env_ids, 1 : 1 + num_joints]
         base = self._default_ipos
         if base.ndim == 2:
             ipos = base.unsqueeze(0).expand(env_ids.numel(), -1, -1).clone()
         else:
             ipos = base[env_ids].clone()
-        ipos[:, self._torso_id] = ipos[:, self._torso_id] + self.xi[env_ids, 30:33]
+        com = 1 + self.task.num_joints
+        ipos[:, self._torso_id] = ipos[:, self._torso_id] + self.xi[env_ids, com : com + 3]
         self.sim.model.body_ipos[env_ids] = ipos
         self.sim.recompute_constants(RecomputeLevel.set_const)
 

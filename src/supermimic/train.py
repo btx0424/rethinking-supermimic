@@ -84,6 +84,7 @@ def _build_supermimic_cfg(cfg: DictConfig, run_dir: Path):
         optim=str(cfg.optim),
         policy_bootstrap=bool(cfg.policy_bootstrap),
         pi_ema=_parse_pi_ema(cfg),
+        task=str(cfg.get("task", "lafan1")),
     )
 
 
@@ -141,6 +142,7 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment=_experiment_name(run_dir),
         pi_ema=_parse_pi_ema(cfg),
+        task=str(cfg.get("task", "lafan1")),
     )
 
 

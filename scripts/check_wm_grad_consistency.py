@@ -30,6 +30,7 @@ def _load_wm(trainer: Trainer, path: Path) -> None:
     saved = torch.load(path, map_location=trainer.device, weights_only=False)
     cfg = saved.get("cfg", {})
     wm = WorldModel(
+        trainer.task,
         norm=str(cfg.get("wm_norm", "none")),
         residual=cfg.get("wm_residual", False),
         frame=str(cfg.get("wm_frame", "heading")),

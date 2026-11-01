@@ -16,7 +16,7 @@ from mjviser import ViserMujocoScene
 from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 
 from supermimic.kinematics import compile_g1, make_kinematics
-from supermimic.mdp import GOAL_DIM, GOAL_FRAMES, HIST, NUM_J, PAPER_OBS_TERMS, WorldModelState
+from supermimic.mdp import GOAL_FRAMES, HIST, PAPER_OBS_TERMS, WorldModelState
 from supermimic.motion import MotionLib
 from supermimic.supermimic.network import InputNorms, build_policy
 
@@ -76,12 +76,14 @@ class PolicyOverlay:
 
 def _tracking_sim(ckpt: dict, device: str):
     from supermimic.sim import TrackingSim
+    from supermimic.tasks import get_task
 
     saved_cfg = ckpt.get("cfg", {})
-    model, joint_names = compile_g1()
+    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    model, joint_names = task.compile_model()
     kin = make_kinematics(model, joint_names, str(saved_cfg.get("fk", "warp")), device)
     kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
-    motion_dev = MotionLib.load(device=device)
+    motion_dev = task.load_motion(device)
     sim = TrackingSim(
         1,
         motion_dev,
@@ -92,6 +94,7 @@ def _tracking_sim(ckpt: dict, device: str):
         anchor=str(saved_cfg.get("anchor", "torso")),
         obs_terms=tuple(saved_cfg.get("obs_terms", PAPER_OBS_TERMS)),
         reward_style=str(saved_cfg.get("reward_style", "gaussian")),
+        task=task,
     )
     return sim, saved_cfg
 
@@ -113,10 +116,12 @@ def _load_policy_overlay(ckpt: Path, device: str) -> PolicyOverlay:
         sim.reset(torch.zeros(1, dtype=torch.long, device=device), start_f)
 
     if "pi" in saved:
-        policy = build_policy(sim.mdp.obs_dim, GOAL_DIM, HIST, saved_cfg).to(device)
+        policy = build_policy(
+            sim.mdp.obs_dim, sim.mdp.task.goal_dim, HIST, saved_cfg, sim.mdp.task.num_joints
+        ).to(device)
         policy.load_state_dict(saved["pi"])
         policy.eval()
-        norms = InputNorms(sim.mdp.obs_dim).to(device)
+        norms = InputNorms(sim.mdp.obs_dim, sim.mdp.task).to(device)
         norms.load_state_dict(saved["norms"])
         obs_hist = torch.zeros(1, HIST, sim.mdp.obs_dim, device=device)
 
@@ -147,10 +152,10 @@ def _load_policy_overlay(ckpt: Path, device: str) -> PolicyOverlay:
         from supermimic.sac.network import NormalActor
         from supermimic.sac.util import ObsVecNorm
 
-        policy_obs_dim = sim.mdp.obs_dim + GOAL_DIM
+        policy_obs_dim = sim.mdp.obs_dim + sim.mdp.task.goal_dim
         actor = NormalActor(
             policy_obs_dim,
-            NUM_J,
+            sim.mdp.task.num_joints,
             action_init=str(saved_cfg.get("actor_init", "zeros")),
         ).to(device)
         actor.load_state_dict(saved["actor"])

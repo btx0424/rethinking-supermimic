@@ -11,6 +11,7 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.11.2",
     "mjlab>=1.6.0",
+    "mujoco>=3.11.0,<3.12",
     "torch>=2.7.0",
     "torchvision",
     "warp-lang>=1.14.0",

@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-import swanlab
 import torch
 import torch.nn as nn
 import torch._logging as torch_logging
@@ -23,16 +22,10 @@ from supermimic.algos.buffer import ReplayBuffer
 from supermimic.sac.util import soft_copy_
 from supermimic.mdp import (
     CONTROL_DT,
-    GOAL_DIM,
     GOAL_FRAMES,
     HIST,
-    INV_DIM,
-    PRIV_DIM,
-    NUM_J,
     REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
-    STATE_DIM,
-    XI_DIM,
     invariant_features,
     local_state_error,
     pelvis_body_pos,
@@ -53,6 +46,8 @@ from supermimic.algos.network import (
     critic_forward,
 )
 from supermimic.algos.reward_norm import RewardNormalizer
+from supermimic.tasks import TaskSpec, get_task
+from supermimic import experiment_log
 
 
 @dataclass
@@ -94,6 +89,7 @@ class TrainConfig:
     # ``split`` is the tanh encoder-decoder. ``trunk`` is one MLP on goal and history.
     policy_kind: str = "split"
     policy_trunk: tuple[int, ...] = (512, 512, 512)
+    task: str = "lafan1"
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -278,9 +274,9 @@ def _clip_grads(params, max_norm: float | None, max_value: float | None = None) 
 class MSELoss(nn.Module):
     """Normalized MSE on frame-local state errors (current SuperMimic WM objective)."""
 
-    def __init__(self, device: torch.device | str):
+    def __init__(self, device: torch.device | str, task: TaskSpec):
         super().__init__()
-        self.register_buffer("nominal", nominal_error(torch.device(device)))
+        self.register_buffer("nominal", nominal_error(torch.device(device), task=task))
 
     def forward(self, errors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``errors`` is ``(B, K, D)`` from ``local_state_error`` over the WM window."""
@@ -299,10 +295,11 @@ class AdversarialLoss(nn.Module):
     ``adv_coef`` times the generator loss. ``adv_coef=0`` leaves MSE unchanged.
     """
 
-    def __init__(self, hidden: list[int] | None = None):
+    def __init__(self, task: TaskSpec, hidden: list[int] | None = None):
         super().__init__()
         hidden = hidden or [512, 512]
-        self.disc = MLP(INV_DIM + NUM_J + XI_DIM + INV_DIM, hidden, 1)
+        width = task.inv_dim + task.num_joints + task.xi_dim + task.inv_dim
+        self.disc = MLP(width, hidden, 1)
 
     def score(
         self,
@@ -665,8 +662,7 @@ class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from supermimic.kinematics import compile_g1, make_kinematics
-        from supermimic.motion import MotionLib
+        from supermimic.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
 
         self.cfg = cfg
@@ -688,15 +684,16 @@ class Trainer:
 
             functorch_config.donated_buffer = False
 
-        self.motion = MotionLib.load(device=self.device)
-        model, names = compile_g1()
+        self.task = get_task(cfg.task)
+        self.motion = self.task.load_motion(self.device)
+        model, names = self.task.compile_model()
         self.kin = make_kinematics(model, names, cfg.fk, self.device)
         # Torch FK caches device tensors on first forward. Prewarm so the first
         # compiled call does not treat as_tensor copies as graph outputs.
         if cfg.fk == "torch":
             with torch.no_grad():
-                zeros = torch.zeros(1, STATE_DIM, device=self.device)
-                self.kin.forward(*unflatten_state(zeros))
+                zeros = torch.zeros(1, self.task.state_dim, device=self.device)
+                self.kin.forward(*unflatten_state(zeros, self.task.num_joints))
         self.sim = TrackingSim(
             cfg.num_envs,
             self.motion,
@@ -706,10 +703,17 @@ class Trainer:
             anchor=cfg.anchor,
             obs_terms=cfg.obs_terms,
             reward_style=cfg.reward_style,
+            task=self.task,
         )
+        probe = self.motion.goal(self.motion.clip_start[:1].to(self.device), self.task.goal_frames)
+        if probe.shape[-1] != self.task.goal_dim:
+            raise RuntimeError(
+                f"Task {self.task.name} expects goal width {self.task.goal_dim}, "
+                f"the motion library produced {probe.shape[-1]}."
+            )
         self.r_max = self.sim.mdp.max_step_reward
         obs_dim = self.sim.mdp.obs_dim
-        self.wm = WorldModel(cfg.wm_norm, cfg.wm_residual, cfg.wm_frame).to(self.device)
+        self.wm = WorldModel(self.task, cfg.wm_norm, cfg.wm_residual, cfg.wm_frame).to(self.device)
         # WM: compile the whole K-window or one step (eager K-loop). Imagination
         # always compiles a single step; the H-loop stays eager. Inductor default
         # (not reduce-overhead): CUDA graphs hurt the real multi-batch WM update.
@@ -746,7 +750,7 @@ class Trainer:
             self._imagine_step = imagine_step
         self.policy = Policy(
             obs_dim,
-            GOAL_DIM,
+            self.task.goal_dim,
             HIST,
             z_dim=cfg.policy_z_dim,
             stochastic=cfg.stochastic_actor,
@@ -755,6 +759,7 @@ class Trainer:
             trunk_hidden=cfg.policy_trunk,
             norm=cfg.policy_norm,
             kind=cfg.policy_kind,
+            action_dim=self.task.num_joints,
         ).to(self.device)
         self.pi_ema_tau = 1.0 - cfg.pi_ema if cfg.pi_ema is not None else None
         if self.pi_ema_tau is not None:
@@ -763,7 +768,7 @@ class Trainer:
             self.policy_ema.eval()
         else:
             self.policy_ema = None
-        in_dim = INV_DIM + GOAL_DIM + XI_DIM + PRIV_DIM
+        in_dim = self.task.inv_dim + self.task.goal_dim + self.task.xi_dim + self.task.priv_dim
         if cfg.critic_kind == "classification":
             v_min, v_max = cfg.critic_v_min, cfg.critic_v_max
             if cfg.normalize_reward:
@@ -790,7 +795,7 @@ class Trainer:
             self.critic = ScalarCritic(in_dim, ensemble=cfg.critic_ensemble).to(self.device)
         else:
             raise ValueError(f"critic_kind must be 'scalar' or 'classification', got {cfg.critic_kind!r}.")
-        self.norms = InputNorms(obs_dim).to(self.device)
+        self.norms = InputNorms(obs_dim, self.task).to(self.device)
         from supermimic.optim import build_optimizer
 
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
@@ -801,11 +806,11 @@ class Trainer:
         self._critic_fwd = (
             torch.compile(critic_forward, mode="default", dynamic=False) if cfg.compile else critic_forward
         )
-        self.buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, self.device)
-        self.mse_loss = MSELoss(self.device).to(self.device)
+        self.buffer = ReplayBuffer(cfg.buffer_steps, cfg.num_envs, self.device, self.task)
+        self.mse_loss = MSELoss(self.device, self.task).to(self.device)
         self.reward_l1 = RewardL1Loss(self.sim.mdp)
         # Discriminator probe only — never added into the WM objective.
-        self.adv_loss = AdversarialLoss().to(self.device)
+        self.adv_loss = AdversarialLoss(self.task).to(self.device)
         self.opt_disc = torch.optim.Adam(self.adv_loss.parameters(), lr=cfg.wm_lr)
         self.reward_norm = (
             RewardNormalizer(
@@ -870,7 +875,7 @@ class Trainer:
         logged_cfg = {
             key: list(value) if isinstance(value, tuple) else value for key, value in cfg.__dict__.items()
         }
-        swanlab.init(
+        experiment_log.init(
             project=cfg.swanlab_project,
             name=cfg.swanlab_experiment or None,
             config={**logged_cfg, "obs_dim": self.sim.mdp.obs_dim, "anchor_body": self.kin.anchor_name},
@@ -899,7 +904,7 @@ class Trainer:
             for iteration in range(self.start_iteration, cfg.iterations):
                 self._step(iteration)
         finally:
-            swanlab.finish()
+            experiment_log.finish()
             if self._tb is not None:
                 self._tb.close()
             if self._log_f is not None:
@@ -1594,7 +1599,7 @@ class Trainer:
             metrics["train/entropy"] = entropy
         if self.reward_norm is not None:
             metrics["train/reward_scale"] = float(self.reward_norm.scale())
-        swanlab.log(metrics, step=iteration)
+        experiment_log.log(metrics, step=iteration)
         if self._tb is not None:
             for key, value in metrics.items():
                 if math.isfinite(value):

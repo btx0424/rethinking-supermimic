@@ -1,24 +1,19 @@
-"""LAFAN1 clips resampled to 50 Hz, with body poses from the mjlab G1."""
+"""Resampled reference motion libraries shared across tracking tasks."""
 
 from __future__ import annotations
 
-import json
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .kinematics import TorchKinematics, compile_g1, verify_kinematics
 from .math_utils import quat_apply_inverse, quat_mul, quat_normalize, quat_to_rotvec, yaw_quat
 
 CONTROL_DT = 0.02
 SOURCE_FPS = 30
 TARGET_FPS = 50
 BIN_FRAMES = 50  # 1 s bins at the control rate.
-
-RAW_DIR = Path("/mnt/workspace/btx0424/aa-projects/aa-bfm/data/lafan1/raw/g1")
-META_PATH = Path("/mnt/workspace/btx0424/aa-projects/aa-bfm/data/lafan1/meta.json")
-CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "lafan1_g1.npz"
 
 GOAL_PER_FRAME = 3 + 6 + 3 + 3 + 29 + 29
 
@@ -75,6 +70,52 @@ def quat_inv_batch(q: torch.Tensor) -> torch.Tensor:
     out = q.clone()
     out[..., 1:] = -out[..., 1:]
     return out / q.square().sum(-1, keepdim=True).clamp(min=1e-8)
+
+
+def write_npz_cache(
+    cache_path: Path,
+    *,
+    joint_names: Sequence[str],
+    clip_names: Sequence[str],
+    body_names: Sequence[str],
+    fps: int,
+    starts: Sequence[int],
+    ends: Sequence[int],
+    root_p: np.ndarray,
+    root_quat: np.ndarray,
+    root_v: np.ndarray,
+    root_w: np.ndarray,
+    q: np.ndarray,
+    qd: np.ndarray,
+    body_p: np.ndarray,
+    body_quat: np.ndarray,
+    body_v: np.ndarray,
+    body_w: np.ndarray,
+    **extra: np.ndarray,
+) -> Path:
+    """Write the standard humanoid motion NPZ (optional extra arrays for object HOI)."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(
+        joint_names=np.array(joint_names),
+        clip_names=np.array(clip_names),
+        body_names=np.array(body_names),
+        fps=np.int64(fps),
+        starts=np.asarray(starts, dtype=np.int64),
+        ends=np.asarray(ends, dtype=np.int64),
+        root_p=root_p,
+        root_quat=root_quat,
+        root_v=root_v,
+        root_w=root_w,
+        q=q,
+        qd=qd,
+        body_p=body_p,
+        body_quat=body_quat,
+        body_v=body_v,
+        body_w=body_w,
+        **extra,
+    )
+    np.savez(cache_path, **payload)
+    return cache_path
 
 
 class MotionLib:
@@ -136,13 +177,10 @@ class MotionLib:
         self.bin_start = torch.tensor(bin_start, dtype=torch.long)
         self.frame_bin = frame_bin
         self.num_bins = len(bin_clip)
-        # Yaw-frame root velocity used by the goal encoder. Built lazily per device.
         self._goal_ready = False
 
     @classmethod
-    def load(cls, cache_path: Path = CACHE_PATH, device: str | torch.device = "cpu") -> "MotionLib":
-        if not cache_path.is_file():
-            build_cache(cache_path)
+    def from_npz(cls, cache_path: Path, device: str | torch.device = "cpu") -> MotionLib:
         data = np.load(cache_path, allow_pickle=False)
         lib = cls(
             joint_names=data["joint_names"].tolist(),
@@ -162,9 +200,31 @@ class MotionLib:
             body_v=torch.tensor(data["body_v"]),
             body_w=torch.tensor(data["body_w"]),
         )
+        if "object_p" in data.files:
+            lib.object_p = torch.tensor(data["object_p"])
+            lib.object_quat = torch.tensor(data["object_quat"])
+            lib.object_v = torch.tensor(data["object_v"])
+            lib.object_w = torch.tensor(data["object_w"])
         return lib.to(device)
 
-    def to(self, device: str | torch.device) -> "MotionLib":
+    @classmethod
+    def load(
+        cls,
+        cache_path: Path | None = None,
+        device: str | torch.device = "cpu",
+        *,
+        build: Callable[[Path], Path] | None = None,
+    ) -> MotionLib:
+        """Load LAFAN1 G1 cache by default (see :mod:`supermimic.motions.lafan1`)."""
+        from .motions.lafan1 import CACHE_PATH, build_cache
+
+        path = CACHE_PATH if cache_path is None else cache_path
+        if not path.is_file():
+            builder = build_cache if build is None else build
+            builder(path)
+        return cls.from_npz(path, device)
+
+    def to(self, device: str | torch.device) -> MotionLib:
         for name, value in list(self.__dict__.items()):
             if torch.is_tensor(value):
                 setattr(self, name, value.to(device))
@@ -174,12 +234,14 @@ class MotionLib:
     def _prepare_goal(self) -> None:
         root_v_local = quat_apply_inverse(self.root_quat, self.root_v)
         root_w_local = quat_apply_inverse(self.root_quat, self.root_w)
-        # 6D root rotation in the world frame; the goal shifts it into the current yaw frame.
         from .math_utils import mat_to_6d, quat_to_mat
 
         self.root_rot6 = mat_to_6d(quat_to_mat(self.root_quat))
         self.root_v_local = root_v_local
         self.root_w_local = root_w_local
+        if getattr(self, "object_p", None) is not None:
+            self.object_v_local = quat_apply_inverse(self.object_quat, self.object_v)
+            self.object_w_local = quat_apply_inverse(self.object_quat, self.object_w)
         self._goal_ready = True
 
     def future_frames(self, f: torch.Tensor, k: int) -> torch.Tensor:
@@ -190,7 +252,7 @@ class MotionLib:
         return torch.minimum(future, last[:, None])
 
     def goal(self, f: torch.Tensor, k: int) -> torch.Tensor:
-        """Frames f+1..f+k in the current reference yaw frame. Shape (B, K * 73).
+        """Frames f+1..f+k in the current reference yaw frame. Shape (B, K * width).
 
         Joint velocity is scaled by 0.1 so it does not swamp the root displacement.
         """
@@ -199,7 +261,6 @@ class MotionLib:
         future = self.future_frames(f, k)
         yaw = yaw_quat(self.root_quat[f])
         dp = quat_apply_inverse(yaw.unsqueeze(1), self.root_p[future] - self.root_p[f].unsqueeze(1))
-        # Reference orientation of each future frame, expressed in the current yaw frame.
         from .math_utils import mat_to_6d, quat_inv, quat_to_mat
 
         relative = quat_mul(quat_inv(yaw).unsqueeze(1).expand_as(self.root_quat[future]), self.root_quat[future])
@@ -215,102 +276,47 @@ class MotionLib:
             ),
             dim=-1,
         )
+        object_p = getattr(self, "object_p", None)
+        if object_p is not None:
+            from .math_utils import mat_to_6d, quat_inv, quat_to_mat
+
+            obj_dp = quat_apply_inverse(yaw.unsqueeze(1), object_p[future] - self.root_p[f].unsqueeze(1))
+            obj_rel = quat_mul(
+                quat_inv(yaw).unsqueeze(1).expand_as(self.object_quat[future]),
+                self.object_quat[future],
+            )
+            obj_rot6 = mat_to_6d(quat_to_mat(obj_rel))
+            feats = torch.cat(
+                (
+                    feats,
+                    obj_dp,
+                    obj_rot6,
+                    self.object_v_local[future],
+                    self.object_w_local[future],
+                ),
+                dim=-1,
+            )
         return feats.reshape(f.shape[0], -1)
 
 
-def build_cache(cache_path: Path = CACHE_PATH, raw_dir: Path = RAW_DIR) -> Path:
-    """Resample the 40 raw 30 Hz CSVs and store torch-FK body trajectories."""
-    meta = json.loads(META_PATH.read_text())
-    csv_joint_names = list(meta["joint_names"])
-    clip_names = list(meta["clip_names"])
-    model, joint_names = compile_g1()
-    if list(joint_names) != csv_joint_names:
-        # CSVs follow meta.json. Reorder columns onto the compiled model's hinge order.
-        src = {name: i for i, name in enumerate(csv_joint_names)}
-        missing = [name for name in joint_names if name not in src]
-        if missing:
-            raise KeyError(f"CSV joints do not cover the G1 model: {missing}")
-        perm = [src[name] for name in joint_names]
-    else:
-        perm = list(range(len(joint_names)))
-    kin = TorchKinematics(model, joint_names)
-    verify_kinematics(kin, model)
+def build_cache(cache_path: Path | None = None) -> Path:
+    """Backward-compatible entry point; delegates to LAFAN1."""
+    from .motions.lafan1 import CACHE_PATH, build_cache as _build
 
-    root_p, root_quat, root_v, root_w, joint_q, joint_qd = [], [], [], [], [], []
-    starts, ends = [], []
-    cursor = 0
-    for name in clip_names:
-        path = raw_dir / f"{name}.csv"
-        rows = np.loadtxt(path, delimiter=",")
-        if rows.ndim != 2 or rows.shape[1] != 7 + len(csv_joint_names):
-            raise ValueError(f"{path} has shape {rows.shape}")
-        pos = _resample(rows[:, 0:3].astype(np.float64))
-        quat_xyzw = rows[:, 3:7].astype(np.float64)
-        quat_wxyz = np.concatenate((quat_xyzw[:, 3:4], quat_xyzw[:, 0:3]), axis=-1)
-        quat = _resample(quat_wxyz, quat=True)
-        q = _resample(rows[:, 7:].astype(np.float64))[:, perm]
-        pos = pos.copy()
-        pos[:, 0:2] -= pos[0, 0:2]
-        quat_t = torch.tensor(quat, dtype=torch.float32)
-        lin = _linear_velocity(pos, CONTROL_DT)
-        ang = _angular_velocity(quat_t, CONTROL_DT).numpy()
-        qvel = _linear_velocity(q, CONTROL_DT)
-        n = pos.shape[0]
-        starts.append(cursor)
-        cursor += n
-        ends.append(cursor)
-        root_p.append(pos.astype(np.float32))
-        root_quat.append(quat.astype(np.float32))
-        root_v.append(lin)
-        root_w.append(ang.astype(np.float32))
-        joint_q.append(q.astype(np.float32))
-        joint_qd.append(qvel.astype(np.float32))
-        print(f"resampled {name}: {n} frames", flush=True)
+    return _build(cache_path or CACHE_PATH)
 
-    root_p_t = torch.tensor(np.concatenate(root_p))
-    root_quat_t = torch.tensor(np.concatenate(root_quat))
-    root_v_t = torch.tensor(np.concatenate(root_v))
-    root_w_t = torch.tensor(np.concatenate(root_w))
-    q_t = torch.tensor(np.concatenate(joint_q))
-    qd_t = torch.tensor(np.concatenate(joint_qd))
-    body_p, body_quat, body_v, body_w = [], [], [], []
-    chunk = 8192
-    for start in range(0, root_p_t.shape[0], chunk):
-        end = min(start + chunk, root_p_t.shape[0])
-        bp, bq, bv, bw = kin.forward(
-            root_p_t[start:end],
-            root_quat_t[start:end],
-            root_v_t[start:end],
-            root_w_t[start:end],
-            q_t[start:end],
-            qd_t[start:end],
-        )
-        body_p.append(bp)
-        body_quat.append(bq)
-        body_v.append(bv)
-        body_w.append(bw)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_path,
-        joint_names=np.array(joint_names),
-        clip_names=np.array(clip_names),
-        body_names=np.array(kin.body_names),
-        fps=np.int64(TARGET_FPS),
-        starts=np.asarray(starts, dtype=np.int64),
-        ends=np.asarray(ends, dtype=np.int64),
-        root_p=root_p_t.numpy(),
-        root_quat=root_quat_t.numpy(),
-        root_v=root_v_t.numpy(),
-        root_w=root_w_t.numpy(),
-        q=q_t.numpy(),
-        qd=qd_t.numpy(),
-        body_p=torch.cat(body_p).numpy(),
-        body_quat=torch.cat(body_quat).numpy(),
-        body_v=torch.cat(body_v).numpy(),
-        body_w=torch.cat(body_w).numpy(),
-    )
-    print(f"wrote {cache_path} ({cursor} frames)", flush=True)
-    return cache_path
+
+# Default cache path for scripts that imported it from here.
+def __getattr__(name: str):
+    if name == "CACHE_PATH":
+        from .motions.lafan1 import CACHE_PATH
+
+        return CACHE_PATH
+    if name == "RAW_DIR":
+        from .motions.lafan1 import RAW_DIR
+
+        return RAW_DIR
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

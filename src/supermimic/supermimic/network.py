@@ -13,21 +13,14 @@ import torch.nn as nn
 
 from supermimic.math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
 from supermimic.mdp import (
-    BODY_POS_DIM,
-    GOAL_DIM,
-    INV_DIM,
-    N_CONTACT,
-    NUM_J,
-    PELVIS_FEAT_DIM,
-    PRIV_DIM,
     WM_FRAMES,
-    XI_DIM,
     WorldModelState,
     heading_body_pos,
     invariant_features,
     pelvis_body_pos,
     pelvis_features,
 )
+from supermimic.tasks import TaskSpec
 
 # Set by the trainer. None keeps fp32. bf16 covers the MLP GEMMs only; callers
 # get fp32 back so quaternion integration stays in fp32.
@@ -270,16 +263,16 @@ class InputNorms(nn.Module):
     is the world model's, and ξ is shared by the world model and the critic.
     """
 
-    def __init__(self, obs_dim: int):
+    def __init__(self, obs_dim: int, task: TaskSpec):
         super().__init__()
-        self.state = RunningNorm(INV_DIM)
-        self.dyn = RunningNorm(PELVIS_FEAT_DIM)
+        self.state = RunningNorm(task.inv_dim)
+        self.dyn = RunningNorm(task.pelvis_feat_dim)
         self.obs = RunningNorm(obs_dim)
-        self.goal = RunningNorm(GOAL_DIM)
-        self.action = RunningNorm(NUM_J)
-        self.xi = RunningNorm(XI_DIM)
-        self.body = RunningNorm(BODY_POS_DIM)
-        self.priv = RunningNorm(PRIV_DIM)
+        self.goal = RunningNorm(task.goal_dim)
+        self.action = RunningNorm(task.num_joints)
+        self.xi = RunningNorm(task.xi_dim)
+        self.body = RunningNorm(task.body_pos_dim)
+        self.priv = RunningNorm(task.priv_dim)
 
     def wm(
         self,
@@ -341,18 +334,22 @@ class MLP(nn.Module):
 class WorldModel(nn.Module):
     """Deterministic dynamics. The network predicts a frame-local increment."""
 
-    out_dim = 3 + 3 + 3 + 3 + NUM_J + NUM_J + N_CONTACT
-
-    def __init__(self, norm: str = "none", residual: bool = False, frame: str = "heading"):
+    def __init__(
+        self,
+        task: TaskSpec,
+        norm: str = "none",
+        residual: bool = False,
+        frame: str = "heading",
+    ):
         super().__init__()
         if frame not in WM_FRAMES:
             raise ValueError(f"wm frame must be one of {WM_FRAMES}, got {frame!r}.")
+        self.task = task
         self.frame = frame
-        from supermimic.mdp import XI_DIM
-
-        feat_dim = PELVIS_FEAT_DIM if frame == "pelvis" else INV_DIM
+        self.out_dim = task.wm_out_dim
+        feat_dim = task.pelvis_feat_dim if frame == "pelvis" else task.inv_dim
         self.net = MLP(
-            feat_dim + NUM_J + XI_DIM + BODY_POS_DIM + N_CONTACT,
+            feat_dim + task.num_joints + task.xi_dim + task.body_pos_dim + task.n_contact,
             [2048, 2048, 2048],
             self.out_dim,
             norm,
@@ -392,8 +389,9 @@ class WorldModel(nn.Module):
             state_n = norms.state(feat_in)
             rotate = yaw_quat(quat)
         feat = torch.cat((state_n, norms.action(action), norms.xi(xi_n), norms.body(body), contact), dim=-1)
+        nj = self.task.num_joints
         dp, drot, dv, dw, dq, dqd, contact_logit = self.net(feat).split(
-            (3, 3, 3, 3, NUM_J, NUM_J, N_CONTACT), dim=-1
+            (3, 3, 3, 3, nj, nj, self.task.n_contact), dim=-1
         )
         nxt_p = p + quat_apply(rotate, dp)
         nxt_quat = quat_normalize(quat_mul(quat, rotvec_to_quat(drot)))
@@ -424,7 +422,7 @@ def policy_widths(saved: dict, key: str) -> list[int]:
     return [int(width) for width in saved.get(key, PAPER_POLICY_HIDDEN)]
 
 
-def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict) -> Policy:
+def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict, action_dim: int) -> Policy:
     """Rebuild a policy from a checkpoint config. Missing ``policy_kind`` is the split actor."""
     kind = str(saved.get("policy_kind", "split"))
     norm = str(saved.get("policy_norm", "none"))
@@ -432,7 +430,14 @@ def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict) -> Policy:
     if kind in ("trunk", "film"):
         hidden = [int(width) for width in saved.get("policy_trunk", TRUNK_POLICY_HIDDEN)]
         return Policy(
-            obs_dim, goal_dim, hist, stochastic=stochastic, norm=norm, kind=kind, trunk_hidden=hidden
+            obs_dim,
+            goal_dim,
+            hist,
+            stochastic=stochastic,
+            norm=norm,
+            kind=kind,
+            trunk_hidden=hidden,
+            action_dim=action_dim,
         )
     return Policy(
         obs_dim,
@@ -444,6 +449,7 @@ def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict) -> Policy:
         decoder_hidden=policy_widths(saved, "policy_decoder"),
         norm=norm,
         kind="split",
+        action_dim=action_dim,
     )
 
 
@@ -454,7 +460,7 @@ class FiLMTrunk(nn.Module):
     observation history. ``h ← (1 + γ(goal)) ⊙ h + β(goal)`` after the layer norm.
     """
 
-    def __init__(self, obs_in: int, goal_dim: int, hidden: list[int], norm: str):
+    def __init__(self, obs_in: int, goal_dim: int, hidden: list[int], norm: str, action_dim: int):
         super().__init__()
         self.goal_fc = nn.Linear(goal_dim, FILM_GOAL_HIDDEN)
         self.goal_act = nn.SiLU()
@@ -476,7 +482,7 @@ class FiLMTrunk(nn.Module):
             self.films.append(film)
             din = width
         self.act = nn.SiLU()
-        self.head = nn.Linear(din, NUM_J)
+        self.head = nn.Linear(din, action_dim)
         nn.init.zeros_(self.head.bias)
         with torch.no_grad():
             self.head.weight.mul_(0.01)
@@ -513,6 +519,7 @@ class Policy(nn.Module):
         trunk_hidden: list[int] | tuple[int, ...] = TRUNK_POLICY_HIDDEN,
         norm: str = "none",
         kind: str = "split",
+        action_dim: int = 29,
     ):
         super().__init__()
         if kind not in ("split", "trunk", "film"):
@@ -525,19 +532,19 @@ class Policy(nn.Module):
         self.trunk = None
         self.film = None
         if kind == "trunk":
-            self.trunk = MLP(goal_dim + obs_dim * hist, list(trunk_hidden), NUM_J, norm)
+            self.trunk = MLP(goal_dim + obs_dim * hist, list(trunk_hidden), action_dim, norm)
             nn.init.zeros_(self.trunk.head.bias)
             with torch.no_grad():
                 self.trunk.head.weight.mul_(0.01)
         elif kind == "film":
-            self.film = FiLMTrunk(obs_dim * hist, goal_dim, list(trunk_hidden), norm)
+            self.film = FiLMTrunk(obs_dim * hist, goal_dim, list(trunk_hidden), norm, action_dim)
         else:
             self.encoder = MLP(goal_dim, list(encoder_hidden), z_dim, norm)
-            self.decoder = MLP(z_dim + obs_dim * hist, list(decoder_hidden), NUM_J, norm)
+            self.decoder = MLP(z_dim + obs_dim * hist, list(decoder_hidden), action_dim, norm)
             nn.init.zeros_(self.decoder.head.bias)
             with torch.no_grad():
                 self.decoder.head.weight.mul_(0.01)
-        self.log_std = nn.Parameter(torch.full((NUM_J,), -1.0)) if stochastic else None
+        self.log_std = nn.Parameter(torch.full((action_dim,), -1.0)) if stochastic else None
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, norms: InputNorms, deterministic: bool = True) -> torch.Tensor:
         obs = norms.obs(obs_hist).flatten(-2)

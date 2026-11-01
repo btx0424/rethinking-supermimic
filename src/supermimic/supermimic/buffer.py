@@ -4,24 +4,24 @@ from __future__ import annotations
 
 import torch
 
-from supermimic.mdp import N_BODY, N_CONTACT, NUM_J, STATE_DIM, XI_DIM
+from supermimic.tasks import TaskSpec
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int, num_envs: int, device: str):
+    def __init__(self, capacity: int, num_envs: int, device: str, task: TaskSpec):
         self.capacity = capacity
         self.num_envs = num_envs
         self.device = device
         shape = (capacity, num_envs)
-        self.s = torch.zeros(*shape, STATE_DIM, device=device)
-        self.s1 = torch.zeros(*shape, STATE_DIM, device=device)
-        self.body_pos = torch.zeros(*shape, N_BODY, 3, device=device)
-        self.body_quat = torch.zeros(*shape, N_BODY, 4, device=device)
-        self.a = torch.zeros(*shape, NUM_J, device=device)
-        self.a_prev = torch.zeros(*shape, NUM_J, device=device)
-        self.xi = torch.zeros(*shape, XI_DIM, device=device)
-        self.c = torch.zeros(*shape, N_CONTACT, device=device)
-        self.c1 = torch.zeros(*shape, N_CONTACT, device=device)
+        self.s = torch.zeros(*shape, task.state_dim, device=device)
+        self.s1 = torch.zeros(*shape, task.state_dim, device=device)
+        self.body_pos = torch.zeros(*shape, task.n_body, 3, device=device)
+        self.body_quat = torch.zeros(*shape, task.n_body, 4, device=device)
+        self.a = torch.zeros(*shape, task.num_joints, device=device)
+        self.a_prev = torch.zeros(*shape, task.num_joints, device=device)
+        self.xi = torch.zeros(*shape, task.xi_dim, device=device)
+        self.c = torch.zeros(*shape, task.n_contact, device=device)
+        self.c1 = torch.zeros(*shape, task.n_contact, device=device)
         self.f = torch.zeros(*shape, dtype=torch.long, device=device)
         self.ep = torch.full(shape, -1, dtype=torch.long, device=device)
         self.step = torch.zeros(*shape, dtype=torch.long, device=device)
