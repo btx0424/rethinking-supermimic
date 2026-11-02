@@ -1,4 +1,14 @@
-"""Floating rigid-body object for Weave HOI scenes."""
+"""Floating rigid-body object for Weave HOI scenes.
+
+Object poses in the Weave rollouts are authored against the meshes under
+``Weave/objects/<name>/<name>.obj`` (same assets ``genrl.data.view`` loads).
+Those quaternions are MuJoCo/Viser ``wxyz``. The object_hoi STL/XML set uses a
+different local frame (table height along Y), so it must not be used here.
+
+Default MuJoCo density makes ``smalltable`` ~22 kg; object_hoi trains with a
+0.2 kg object (Isaac ``set_masses(0.2)``). We match that so hand contacts can
+actually displace the free body.
+"""
 
 from __future__ import annotations
 
@@ -8,46 +18,57 @@ import mujoco
 from mjlab.entity import EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
-# Prefer the authored XML+STL under object_hoi; fall back to Weave meshes.
-_OBJECT_HOI_ROOT = Path("/mnt/workspace/btx0424/aa-projects/object_hoi/data/objects")
 _WEAVE_ROOT = Path("/mnt/workspace/btx0424/Weave/objects")
 
-
-def _object_xml(object_name: str) -> Path | None:
-    path = _OBJECT_HOI_ROOT / object_name / f"{object_name}.xml"
-    return path if path.is_file() else None
+# Same mass object_hoi applies at runtime for the HOI table.
+_OBJECT_MASS = 0.2
 
 
-def _object_mesh(object_name: str) -> Path:
-    for root in (_OBJECT_HOI_ROOT, _WEAVE_ROOT):
-        for suffix in (".stl", ".obj"):
-            path = root / object_name / f"{object_name}{suffix}"
-            if path.is_file():
-                return path
-    raise FileNotFoundError(f"No mesh for object {object_name!r} under {_OBJECT_HOI_ROOT} or {_WEAVE_ROOT}.")
+def object_mesh_path(object_name: str) -> Path:
+    """Weave object triangle mesh. Matches ``object_quat_w`` in the rollout NPZ."""
+    path = _WEAVE_ROOT / object_name / f"{object_name}.obj"
+    if path.is_file():
+        return path
+    raise FileNotFoundError(
+        f"No Weave mesh for object {object_name!r} at {path}. "
+        f"Expected the same OBJ genrl loads from {_WEAVE_ROOT}."
+    )
+
+
+# Backward-compatible private alias.
+_object_mesh = object_mesh_path
+
+
+def _apply_object_mass(spec: mujoco.MjSpec, mass: float = _OBJECT_MASS) -> None:
+    """Replace density-derived inertia with a light HOI mass (scaled inertia)."""
+    # Compile once to read the mesh-derived COM / inertia, then overwrite.
+    probe = spec.compile()
+    body_id = mujoco.mj_name2id(probe, mujoco.mjtObj.mjOBJ_BODY, "object")
+    if body_id < 0:
+        raise RuntimeError("Object spec is missing body 'object'.")
+    dens_mass = float(probe.body_mass[body_id])
+    if dens_mass <= 0.0:
+        raise RuntimeError(f"Object density mass is non-positive ({dens_mass}).")
+    scale = mass / dens_mass
+    ipos = probe.body_ipos[body_id]
+    inertia = probe.body_inertia[body_id] * scale
+    for body in spec.bodies:
+        if body.name != "object":
+            continue
+        body.mass = mass
+        body.ipos = ipos
+        body.inertia = inertia
+        for geom in body.geoms:
+            geom.density = 0.0
+        return
+    raise RuntimeError("Object spec is missing body 'object'.")
 
 
 def object_spec(object_name: str, *, disable_gravity: bool = False) -> mujoco.MjSpec:
-    """Free-joint rigid body named ``object`` (entity key), mesh from ``object_name``."""
-    xml_path = _object_xml(object_name)
-    if xml_path is not None:
-        spec = mujoco.MjSpec.from_file(str(xml_path))
-        # Normalize the free body name so the scene entity is always ``object``.
-        for body in spec.bodies:
-            if body.name and body.name != "world":
-                body.name = "object"
-                break
-        for joint in spec.joints:
-            if joint.name:
-                joint.name = "object_freejoint"
-                break
-        for geom in spec.geoms:
-            if geom.name and geom.name.endswith("_collision"):
-                geom.name = "object_collision"
-    else:
-        mesh = _object_mesh(object_name)
-        gravcomp = "1" if disable_gravity else "0"
-        xml = f"""
+    """Free-joint rigid body named ``object`` (entity key), Weave OBJ mesh."""
+    mesh = object_mesh_path(object_name)
+    gravcomp = "1" if disable_gravity else "0"
+    xml = f"""
 <mujoco model="{object_name}">
   <compiler meshdir="{mesh.parent.resolve()}" angle="radian"/>
   <asset>
@@ -64,7 +85,8 @@ def object_spec(object_name: str, *, disable_gravity: bool = False) -> mujoco.Mj
   </worldbody>
 </mujoco>
 """
-        spec = mujoco.MjSpec.from_string(xml)
+    spec = mujoco.MjSpec.from_string(xml)
+    _apply_object_mass(spec)
     if disable_gravity:
         for body in spec.bodies:
             if body.name and body.name != "world":

@@ -23,6 +23,7 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
     G1_ACTUATOR_WAIST,
 )
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.utils.spec_config import CollisionCfg
 from mjlab.utils.string import resolve_expr
 
 from supermimic.motions.weave import ROBOT_XML
@@ -169,10 +170,35 @@ def compile_g1_inspire() -> tuple[mujoco.MjModel, tuple[str, ...]]:
 
 
 def robot_cfg() -> EntityCfg:
+    # Match object_hoi's inspire CollisionCfg: hands/feet get friction contacts
+    # against the free object (contype 1 / conaffinity 1). XML defaults keep
+    # visual meshes non-colliding; only ``*_collision*`` geoms are touched.
     return EntityCfg(
         init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, 0.76), joint_pos={".*": 0.0}),
         spec_fn=inspire_spec,
         articulation=ARTICULATION,
+        collisions=(
+            CollisionCfg(
+                geom_names_expr=(".*_collision.*",),
+                contype=0,
+                conaffinity=1,
+                solref=(0.01, 1),
+                condim={
+                    ".*_foot_collision.*": 6,
+                    ".*_(hand|thumb|index|middle|ring|pinky).*_collision.*": 6,
+                    ".*_collision.*": 1,
+                },
+                priority={
+                    ".*_foot_collision.*": 1,
+                    ".*_(hand|thumb|index|middle|ring|pinky).*_collision.*": 1,
+                    ".*": 0,
+                },
+                friction={
+                    ".*_foot_collision.*": (1.0, 5e-3, 5e-4),
+                    ".*_(hand|thumb|index|middle|ring|pinky).*_collision.*": (1.0, 5e-3, 5e-4),
+                },
+            ),
+        ),
     )
 
 

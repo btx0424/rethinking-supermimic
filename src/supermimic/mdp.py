@@ -102,6 +102,8 @@ OBJECT_REWARD_TERM_NAMES = (
     "object_ori",
     "object_lin_vel",
     "object_ang_vel",
+    # Hand tips in the object frame vs the demo (object_hoi motion_hand_obj_relative_pos).
+    "hand_obj_pos",
 )
 # Shared length-scales (σ). Tracking uses the paper values; regularizers are style-specific uses.
 REWARD_TERM_SCALE = {
@@ -115,6 +117,7 @@ REWARD_TERM_SCALE = {
     "object_ori": 0.4,
     "object_lin_vel": 1.0,
     "object_ang_vel": 3.14,
+    "hand_obj_pos": 0.1,
     "action_rate": 1.0,
     "joint_limit": 0.1,
 }
@@ -130,6 +133,7 @@ _TRACKING_WEIGHTS = {
     "object_ori": 1.0,
     "object_lin_vel": 1.0,
     "object_ang_vel": 1.0,
+    "hand_obj_pos": 4.0,
 }
 REWARD_TERM_WEIGHT = {
     "gaussian": {**_TRACKING_WEIGHTS, "action_rate": 0.1, "joint_limit": 2.0},
@@ -149,8 +153,16 @@ def reward_term_names(task: TaskSpec | None = None) -> tuple[str, ...]:
     if task is not None and task.has_object:
         # Object terms sit with the other tracking kernels, before the penalties.
         base = REWARD_TERM_NAMES[:-2]
-        return base + OBJECT_REWARD_TERM_NAMES + REWARD_TERM_NAMES[-2:]
+        object_terms = OBJECT_REWARD_TERM_NAMES
+        if not task.hand_bodies:
+            object_terms = tuple(name for name in object_terms if name != "hand_obj_pos")
+        return base + object_terms + REWARD_TERM_NAMES[-2:]
     return REWARD_TERM_NAMES
+
+
+def hand_obj_relative_pos(hand_p, obj_p, obj_quat) -> torch.Tensor:
+    """Finger/hand link positions in the object frame, ``(..., n_hand, 3)``."""
+    return quat_apply_inverse(obj_quat.unsqueeze(-2), hand_p - obj_p.unsqueeze(-2))
 
 
 def max_step_reward(style: str = "gaussian", task: TaskSpec | None = None) -> float:
@@ -581,6 +593,7 @@ class MDP:
         terms: bool = False,
         bodies=None,
         object_state=None,
+        hand_pos=None,
     ):
         """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
 
@@ -589,6 +602,7 @@ class MDP:
 
         With ``terms=True``, also return a name→tensor dict that sums to the reward.
         ``object_state`` is ``(obj_p, obj_quat, obj_v, obj_w)`` for HOI tasks.
+        ``hand_pos`` is world-frame finger link positions for ``hand_obj_pos``.
         """
         if bodies is None:
             body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
@@ -620,6 +634,13 @@ class MDP:
             errors["object_ori"] = quat_error_angle(motion.object_quat[frame], obj_quat).square()
             errors["object_lin_vel"] = (motion.object_v[frame] - obj_v).square().sum(-1)
             errors["object_ang_vel"] = (motion.object_w[frame] - obj_w).square().sum(-1)
+            if self.task.hand_bodies:
+                if hand_pos is None:
+                    hand_pos = self.kin.hands(p, quat, v, w, q, qd)
+                ref_hand = motion.hand_p[frame]
+                ref_local = hand_obj_relative_pos(ref_hand, motion.object_p[frame], motion.object_quat[frame])
+                sim_local = hand_obj_relative_pos(hand_pos, obj_p, obj_quat)
+                errors["hand_obj_pos"] = (ref_local - sim_local).square().sum(-1).mean(-1)
         weight = self.term_weight
         s = REWARD_TERM_SCALE
         pen = REWARD_TERM_WEIGHT["gaussian"]

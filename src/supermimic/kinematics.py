@@ -30,6 +30,22 @@ TRACKED_BODIES = (
     "right_wrist_yaw_link",
 )
 
+# Finger links used by object_hoi's hand–object relative position reward.
+HAND_BODIES = (
+    "L_thumb_intermediate",
+    "L_thumb_distal",
+    "L_index_intermediate",
+    "L_middle_intermediate",
+    "L_ring_intermediate",
+    "L_pinky_intermediate",
+    "R_thumb_intermediate",
+    "R_thumb_distal",
+    "R_index_intermediate",
+    "R_middle_intermediate",
+    "R_ring_intermediate",
+    "R_pinky_intermediate",
+)
+
 
 def _hinge_quat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     """Unit-axis hinge: ``axis`` (..., 3), ``angle`` (...)."""
@@ -45,9 +61,15 @@ class TorchKinematics:
     relative to ``qpos0``, which is how MuJoCo defines the joint transform.
     """
 
-    def __init__(self, model: mujoco.MjModel, joint_names: tuple[str, ...]):
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        joint_names: tuple[str, ...],
+        hand_bodies: tuple[str, ...] = (),
+    ):
         self.joint_names = joint_names
         self.body_names = TRACKED_BODIES
+        self.hand_body_names = tuple(hand_bodies)
         self.nbody = int(model.nbody)
         name_to_body = {
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i): i for i in range(model.nbody)
@@ -55,7 +77,11 @@ class TorchKinematics:
         missing = [name for name in TRACKED_BODIES if name not in name_to_body]
         if missing:
             raise KeyError(f"Tracked bodies missing from the G1 model: {missing}")
+        missing_hands = [name for name in self.hand_body_names if name not in name_to_body]
+        if missing_hands:
+            raise KeyError(f"Hand bodies missing from the robot model: {missing_hands}")
         self.tracked_ids = [name_to_body[name] for name in TRACKED_BODIES]
+        self.hand_ids = [name_to_body[name] for name in self.hand_body_names]
         self.anchor_index = TRACKED_BODIES.index("torso_link")
         self.pelvis_index = TRACKED_BODIES.index("pelvis")
         self.anchor_name = "torso"
@@ -147,6 +173,7 @@ class TorchKinematics:
             "q_index": q_index,
             "hinge_layers": hinge_layers,
             "tracked": np.asarray(self.tracked_ids, dtype=np.int64),
+            "hands": np.asarray(self.hand_ids, dtype=np.int64),
             "zero_anchor": zero_anchor,
         }
         # Kept for callers/tests that inspect the old Python chain.
@@ -213,6 +240,7 @@ class TorchKinematics:
         cached = {
             "layers": layers,
             "tracked": torch.as_tensor(c["tracked"], device=device, dtype=torch.long),
+            "hands": torch.as_tensor(c["hands"], device=device, dtype=torch.long),
             "free_id": self._free_id,
             "nbody": self.nbody,
             "zero_anchor": c["zero_anchor"],
@@ -220,7 +248,7 @@ class TorchKinematics:
         self._device_cache[key] = cached
         return cached
 
-    def forward(
+    def _fk_all(
         self,
         p: torch.Tensor,
         quat: torch.Tensor,
@@ -228,11 +256,8 @@ class TorchKinematics:
         w: torch.Tensor,
         q: torch.Tensor,
         qd: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return tracked body position, quaternion, linear and angular velocity.
-
-        All vectors are in the world frame. Shapes are (..., 14, 3) and (..., 14, 4).
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
+        """Full-chain FK. Returns ``(pos, rot, lin, ang, lead_shape)`` over every body."""
         shape = p.shape[:-1]
         p = p.reshape(-1, 3)
         quat = quat_normalize(quat.reshape(-1, 4))
@@ -304,7 +329,23 @@ class TorchKinematics:
             rot[:, body] = xquat
             lin[:, body] = v_b
             ang[:, body] = w_b
+        return pos, rot, lin, ang, shape
 
+    def forward(
+        self,
+        p: torch.Tensor,
+        quat: torch.Tensor,
+        v: torch.Tensor,
+        w: torch.Tensor,
+        q: torch.Tensor,
+        qd: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return tracked body position, quaternion, linear and angular velocity.
+
+        All vectors are in the world frame. Shapes are (..., 14, 3) and (..., 14, 4).
+        """
+        pos, rot, lin, ang, shape = self._fk_all(p, quat, v, w, q, qd)
+        buf = self._buffers(pos.device, pos.dtype)
         tracked = buf["tracked"]
         n_tracked = tracked.shape[0]
         return (
@@ -314,15 +355,33 @@ class TorchKinematics:
             ang[:, tracked].reshape(*shape, n_tracked, 3),
         )
 
+    def hands(
+        self,
+        p: torch.Tensor,
+        quat: torch.Tensor,
+        v: torch.Tensor,
+        w: torch.Tensor,
+        q: torch.Tensor,
+        qd: torch.Tensor,
+    ) -> torch.Tensor:
+        """World-frame hand/finger link positions ``(..., n_hand, 3)`` for HOI rewards."""
+        if not self.hand_ids:
+            raise RuntimeError("No hand bodies configured on this kinematics model.")
+        pos, _rot, _lin, _ang, shape = self._fk_all(p, quat, v, w, q, qd)
+        buf = self._buffers(pos.device, pos.dtype)
+        hands = buf["hands"]
+        return pos[:, hands].reshape(*shape, hands.shape[0], 3)
+
 
 def make_kinematics(
     model: mujoco.MjModel,
     joint_names: tuple[str, ...],
     backend: str = "warp",
     device: str | torch.device = "cuda",
+    hand_bodies: tuple[str, ...] = (),
 ):
     """``warp`` (default) or ``torch``. Both expose ``TorchKinematics``' public attributes."""
-    kin = TorchKinematics(model, joint_names)
+    kin = TorchKinematics(model, joint_names, hand_bodies=hand_bodies)
     if backend == "torch":
         return kin
     if backend == "warp":

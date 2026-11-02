@@ -804,7 +804,9 @@ class Trainer:
         self.task = get_task(cfg.task)
         self.motion = self.task.load_motion(self.device)
         model, names = self.task.compile_model()
-        self.kin = make_kinematics(model, names, cfg.fk, self.device)
+        self.kin = make_kinematics(
+            model, names, cfg.fk, self.device, hand_bodies=self.task.hand_bodies
+        )
         # Torch FK caches device tensors on first forward. Prewarm so the first
         # compiled call does not treat as_tensor copies as graph outputs.
         if cfg.fk == "torch":

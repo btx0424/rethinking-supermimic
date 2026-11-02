@@ -27,7 +27,9 @@ def _build_sim(saved_cfg: dict, num_envs: int, device: str) -> TrackingSim:
     task = get_task(str(saved_cfg.get("task", "lafan1")))
     motion = task.load_motion(device)
     model, names = task.compile_model()
-    kin = make_kinematics(model, names, str(saved_cfg.get("fk", "warp")), device)
+    kin = make_kinematics(
+        model, names, str(saved_cfg.get("fk", "warp")), device, hand_bodies=task.hand_bodies
+    )
     kin.set_anchor(str(saved_cfg.get("anchor", "torso")))
     return TrackingSim(
         num_envs,

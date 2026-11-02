@@ -205,6 +205,9 @@ class MotionLib:
             lib.object_quat = torch.tensor(data["object_quat"])
             lib.object_v = torch.tensor(data["object_v"])
             lib.object_w = torch.tensor(data["object_w"])
+        if "hand_p" in data.files:
+            lib.hand_p = torch.tensor(data["hand_p"])
+            lib.hand_body_names = tuple(data["hand_body_names"].tolist())
         return lib.to(device)
 
     @classmethod

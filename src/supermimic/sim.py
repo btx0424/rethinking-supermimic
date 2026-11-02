@@ -75,10 +75,15 @@ class TrackingSim:
             entities=entities,
         )
         self.scene = Scene(scene_cfg, device)
+        sc = self.task.sim
         sim_cfg = SimulationCfg(
-            nconmax=128,
-            njmax=500,
-            mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20),
+            nconmax=sc.nconmax,
+            njmax=sc.njmax,
+            mujoco=MujocoCfg(
+                timestep=sc.timestep,
+                iterations=sc.iterations,
+                ls_iterations=sc.ls_iterations,
+            ),
         )
         self.sim = Simulation(
             num_envs=num_envs,
@@ -130,6 +135,26 @@ class TrackingSim:
             dtype=torch.long,
             device=device,
         )
+        if self.task.hand_bodies:
+            missing_hands = [name for name in self.task.hand_bodies if name not in self.robot.body_names]
+            if missing_hands:
+                raise KeyError(f"The robot is missing hand bodies: {missing_hands}")
+            self._hand_local = torch.tensor(
+                [self.robot.body_names.index(name) for name in self.task.hand_bodies],
+                dtype=torch.long,
+                device=device,
+            )
+            if getattr(motion, "hand_p", None) is None:
+                raise RuntimeError(
+                    f"Task {self.task.name} expects hand_p on the motion library."
+                )
+            if tuple(getattr(motion, "hand_body_names", ())) != tuple(self.task.hand_bodies):
+                raise RuntimeError(
+                    f"Motion hand bodies {getattr(motion, 'hand_body_names', None)} "
+                    f"do not match task {self.task.hand_bodies}."
+                )
+        else:
+            self._hand_local = None
         self._terrain_ids = self.scene["terrain"].indexing.geom_ids
         self._init_contact_index()
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
@@ -214,6 +239,13 @@ class TrackingSim:
         vel = self.robot.data.body_link_vel_w[:, idx]
         return pos, quat, vel[..., :3], vel[..., 3:6]
 
+    def hand_positions(self):
+        """World-frame finger link positions for ``hand_obj_pos``, origin-removed."""
+        if self._hand_local is None:
+            raise RuntimeError("This task has no hand bodies.")
+        pose = self.robot.data.body_link_pose_w[:, self._hand_local]
+        return pose[..., :3] - self.scene.env_origins[:, None, :]
+
     def state(self):
         data = self.robot.data
         pose = data.root_link_pose_w
@@ -281,6 +313,7 @@ class TrackingSim:
         contact_next = self.ground_contact()
         last = self.motion.clip_end[self.motion.clip_id[f]] - 1
         f_next = torch.minimum(f + 1, last)
+        hand1 = self.hand_positions() if self._hand_local is not None else None
         reward, terms = self.mdp.reward(
             p1,
             quat1,
@@ -294,6 +327,7 @@ class TrackingSim:
             terms=True,
             bodies=bodies1,
             object_state=obj1,
+            hand_pos=hand1,
         )
         hard = self.mdp.termination(p1, quat1, f_next)
         if self.survival_bonus:

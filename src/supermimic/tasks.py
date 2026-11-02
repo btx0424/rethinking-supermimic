@@ -6,9 +6,36 @@ same ``TrackingSim`` and ``MDP``; only this spec changes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from supermimic.kinematics import TRACKED_BODIES
+from supermimic.kinematics import HAND_BODIES, TRACKED_BODIES
+
+
+@dataclass(frozen=True)
+class SimCfg:
+    """Per-task MuJoCo / mjlab solver limits used by ``TrackingSim``.
+
+    Hand–object scenes need larger ``njmax`` / ``nconmax`` than plain G1
+    locomotion; overflow messages come from mujoco_warp when these are tight.
+    """
+
+    nconmax: int = 128
+    njmax: int = 500
+    timestep: float = 0.005
+    iterations: int = 10
+    ls_iterations: int = 20
+
+    def __post_init__(self) -> None:
+        if self.nconmax <= 0:
+            raise ValueError(f"nconmax must be positive, got {self.nconmax}.")
+        if self.njmax <= 0:
+            raise ValueError(f"njmax must be positive, got {self.njmax}.")
+        if self.timestep <= 0.0:
+            raise ValueError(f"timestep must be positive, got {self.timestep}.")
+        if self.iterations <= 0:
+            raise ValueError(f"iterations must be positive, got {self.iterations}.")
+        if self.ls_iterations <= 0:
+            raise ValueError(f"ls_iterations must be positive, got {self.ls_iterations}.")
 
 
 @dataclass(frozen=True)
@@ -22,8 +49,10 @@ class TaskSpec:
     has_object: bool
     foot_geom_expr: str
     object_name: str | None = None
+    hand_bodies: tuple[str, ...] = ()
     goal_frames: int = 10
     hist: int = 10
+    sim: SimCfg = field(default_factory=SimCfg)
 
     def __post_init__(self) -> None:
         if self.num_joints <= 0:
@@ -36,10 +65,16 @@ class TaskSpec:
             raise ValueError(f"{self.name}: has_object requires object_name.")
         if not self.has_object and self.object_name is not None:
             raise ValueError(f"{self.name}: object_name set but has_object is False.")
+        if self.hand_bodies and not self.has_object:
+            raise ValueError(f"{self.name}: hand_bodies require has_object.")
 
     @property
     def n_body(self) -> int:
         return len(self.tracked_bodies)
+
+    @property
+    def n_hand(self) -> int:
+        return len(self.hand_bodies)
 
     @property
     def n_contact(self) -> int:
@@ -222,6 +257,9 @@ class WeaveTask(TaskSpec):
             has_object=True,
             foot_geom_expr=r"^(left|right)_foot_collision_[1-7]$",
             object_name=object_name,
+            hand_bodies=HAND_BODIES,
+            # Finger + object contacts: overflow asked for njmax≈554.
+            sim=SimCfg(nconmax=256, njmax=768),
         )
 
     def compile_model(self):

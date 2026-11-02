@@ -242,6 +242,10 @@ class WeaveMotion(Motion):
             raise RuntimeError(
                 f"{path} has no object fields; delete it and rebuild with WeaveMotion.build_cache."
             )
+        if getattr(lib, "hand_p", None) is None:
+            raise RuntimeError(
+                f"{path} has no hand_p; delete it and rebuild with WeaveMotion.build_cache."
+            )
         return lib
 
     @classmethod
@@ -440,7 +444,7 @@ def build_cache(
     hinge order. The root is the pelvis, and the 14 tracked bodies are sliced
     out of the recorded body trajectory.
     """
-    from supermimic.kinematics import TRACKED_BODIES
+    from supermimic.kinematics import HAND_BODIES, TRACKED_BODIES
     from supermimic.motion import TARGET_FPS, write_npz_cache
     from supermimic.robots.g1_inspire import compile_g1_inspire
 
@@ -468,7 +472,11 @@ def build_cache(
     missing_bodies = [name for name in TRACKED_BODIES if name not in body_index]
     if missing_bodies:
         raise KeyError(f"Dataset is missing tracked bodies: {missing_bodies}")
+    missing_hands = [name for name in HAND_BODIES if name not in body_index]
+    if missing_hands:
+        raise KeyError(f"Dataset is missing hand bodies: {missing_hands}")
     body_perm = np.asarray([body_index[name] for name in TRACKED_BODIES], dtype=np.int64)
+    hand_perm = np.asarray([body_index[name] for name in HAND_BODIES], dtype=np.int64)
     pelvis = body_index[PELVIS_BODY]
 
     joint_q: list[np.ndarray] = []
@@ -481,6 +489,7 @@ def build_cache(
     body_quat: list[np.ndarray] = []
     body_v: list[np.ndarray] = []
     body_w: list[np.ndarray] = []
+    hand_p: list[np.ndarray] = []
     object_p: list[np.ndarray] = []
     object_quat: list[np.ndarray] = []
     object_v: list[np.ndarray] = []
@@ -527,6 +536,7 @@ def build_cache(
         body_quat.append(quat[:, body_perm].astype(np.float32, copy=False))
         body_v.append(lin[:, body_perm].astype(np.float32, copy=False))
         body_w.append(ang[:, body_perm].astype(np.float32, copy=False))
+        hand_p.append(pos[:, hand_perm].astype(np.float32, copy=False))
         object_p.append(obj_p.astype(np.float32, copy=False))
         object_quat.append(obj_quat.astype(np.float32, copy=False))
         object_v.append(obj_v.astype(np.float32, copy=False))
@@ -571,6 +581,8 @@ def build_cache(
         object_quat=cat(object_quat),
         object_v=cat(object_v),
         object_w=cat(object_w),
+        hand_p=cat(hand_p),
+        hand_body_names=np.array(HAND_BODIES),
     )
     print(f"wrote {out_path} ({q_all.shape[0]} frames, {len(clip_names)} clips)", flush=True)
     return out_path

@@ -473,7 +473,9 @@ class Trainer:
         self.task = get_task(cfg.task)
         self.motion = self.task.load_motion(str(self.device))
         model, names = self.task.compile_model()
-        self.kin = make_kinematics(model, names, "torch", str(self.device))
+        self.kin = make_kinematics(
+            model, names, "torch", str(self.device), hand_bodies=self.task.hand_bodies
+        )
         obs_terms = cfg.obs_terms or resolve_obs_terms(())
         self.sim = TrackingSim(
             cfg.num_envs,
