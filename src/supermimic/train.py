@@ -1,4 +1,4 @@
-"""Train SuperMimic or SAC on the LAFAN1 clips."""
+"""Train SuperMimic, NablaMimic, or SAC on the LAFAN1 clips."""
 
 from __future__ import annotations
 
@@ -26,10 +26,8 @@ def _experiment_name(run_dir: Path) -> str:
     return "/".join(run_dir.parts[-2:])
 
 
-def _build_supermimic_cfg(cfg: DictConfig, run_dir: Path):
-    from supermimic.algos.supermimic import TrainConfig
-
-    return TrainConfig(
+def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
+    return dict(
         num_envs=int(cfg.num_envs),
         iterations=int(cfg.iterations),
         buffer_steps=int(cfg.buffer_steps),
@@ -94,6 +92,27 @@ def _build_supermimic_cfg(cfg: DictConfig, run_dir: Path):
         wm_ema=_parse_ema(cfg, "wm_ema", 0.99),
         imagine_wm=str(cfg.get("imagine_wm", "live")),
         task=str(cfg.get("task", "lafan1")),
+    )
+
+
+def _build_supermimic_cfg(cfg: DictConfig, run_dir: Path):
+    from supermimic.algos.supermimic import TrainConfig
+
+    return TrainConfig(**_supermimic_kwargs(cfg, run_dir))
+
+
+def _build_nablamimic_cfg(cfg: DictConfig, run_dir: Path):
+    from supermimic.algos.nablamimic import NablaTrainConfig
+
+    return NablaTrainConfig(
+        **_supermimic_kwargs(cfg, run_dir),
+        act_cot_clip=None if cfg.get("act_cot_clip") is None else float(cfg.act_cot_clip),
+        action_target_steps=int(cfg.get("action_target_steps", 8)),
+        action_target_windows=int(cfg.get("action_target_windows", 1)),
+        action_target_delta=float(cfg.get("action_target_delta", 0.03)),
+        action_target_delta_floor=float(cfg.get("action_target_delta_floor", 0.3)),
+        action_target_batch=int(cfg.get("action_target_batch", 16384)),
+        action_target_lr=float(cfg.get("action_target_lr", cfg.pi_lr)),
     )
 
 
@@ -166,12 +185,16 @@ def main(cfg: DictConfig) -> None:
         from supermimic.algos.supermimic import run
 
         run(_build_supermimic_cfg(cfg, run_dir), run_dir)
+    elif algo == "nablamimic":
+        from supermimic.algos.nablamimic import run
+
+        run(_build_nablamimic_cfg(cfg, run_dir), run_dir)
     elif algo == "sac":
         from supermimic.sac import run
 
         run(_build_sac_cfg(cfg, run_dir), run_dir)
     else:
-        raise ValueError(f"Unknown algo={algo!r}. Expected 'supermimic' or 'sac'.")
+        raise ValueError(f"Unknown algo={algo!r}. Expected 'supermimic', 'nablamimic', or 'sac'.")
 
 
 if __name__ == "__main__":

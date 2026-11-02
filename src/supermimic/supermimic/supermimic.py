@@ -1103,16 +1103,10 @@ class Trainer:
         diagnose_reward = (iteration + 1) % cfg.log_every == 0
         policy_wm = self.policy_wm()
         with hold_out_net(policy_wm), hold_out_net(self.critic):
-            with timed(self.device):
-                start = self.sample_policy_starts()
-                pi_loss, critic_batch, imag_score, survival, imag_terms, term_losses = self.imagine(
-                    start
-                )
-            self.timing["imagine"].append(timed.last)
-
-            with timed(self.device):
-                gn_pi = self.update_policy(pi_loss, term_losses, diagnose_reward=diagnose_reward)
-            self.timing["policy"].append(timed.last)
+            start = self.sample_policy_starts()
+            pi_loss, critic_batch, imag_score, survival, imag_terms, gn_pi = self.improve_policy(
+                start, diagnose_reward=diagnose_reward, iteration=iteration
+            )
 
         with timed(self.device):
             v_loss, gn_v, value_mean = self.update_critic(critic_batch)
@@ -1522,6 +1516,22 @@ class Trainer:
             g["imag_terms"],
             g["term_losses"],
         )
+
+    def improve_policy(
+        self,
+        start: dict[str, torch.Tensor],
+        diagnose_reward: bool = False,
+        iteration: int = 0,
+    ) -> tuple:
+        """Policy improvement: BPTT through the WM (SuperMimic). Records imagine/policy timings."""
+        del iteration  # SuperMimic does not anneal the improvement step size.
+        with timed(self.device):
+            pi_loss, critic_batch, imag_score, survival, imag_terms, term_losses = self.imagine(start)
+        self.timing["imagine"].append(timed.last)
+        with timed(self.device):
+            gn_pi = self.update_policy(pi_loss, term_losses, diagnose_reward=diagnose_reward)
+        self.timing["policy"].append(timed.last)
+        return pi_loss, critic_batch, imag_score, survival, imag_terms, gn_pi
 
     def diagnose_imagination_step_grads(
         self, start: dict[str, torch.Tensor] | None = None
