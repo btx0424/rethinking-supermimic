@@ -11,7 +11,7 @@ import torch
 import warp as wp
 
 from .kinematics import TorchKinematics
-from .math_utils import quat_normalize
+from .math import quat_normalize
 
 wp.config.quiet = True
 wp.init()

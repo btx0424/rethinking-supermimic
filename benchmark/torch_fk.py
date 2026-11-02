@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from supermimic.kinematics import TorchKinematics, compile_g1
+from supermimic.utils.kinematics import TorchKinematics, compile_g1
 
 
 def _make_state(batch: int, n_j: int, device: torch.device, requires_grad: bool, seed: int = 0):
@@ -179,7 +179,7 @@ def main() -> None:
         bench("eager", eager, batch, n_j, device, args.warmup, args.iters)
 
     if not args.no_warp and device.type == "cuda":
-        from supermimic.warp_fk import WarpKinematics
+        from supermimic.utils.warp_fk import WarpKinematics
 
         print("\nloading warp FK…", flush=True)
         warp_kin = WarpKinematics(kin)

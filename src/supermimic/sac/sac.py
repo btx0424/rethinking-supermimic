@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from supermimic import experiment_log
+from supermimic.utils import experiment_log
 from supermimic.mdp import (
     CONTROL_DT,
     GOAL_FRAMES,
@@ -29,7 +29,7 @@ from supermimic.mdp import (
 from supermimic.mdp import WorldModelState
 from supermimic.sac.network import AlphaModule, MultiStepReturn, NormalActor, make_critic
 from supermimic.sac.replay_buffer import ReplayBuffer
-from supermimic.sac.util import (
+from supermimic.utils.nn import (
     IndependentNormal,
     ObsVecNorm,
     autocast,
@@ -209,7 +209,7 @@ class SACAgent:
             self.target_entropy = 0.0
         self.alpha = AlphaModule(cfg.alpha_init).to(device)
 
-        from supermimic.optim import build_optimizer
+        from supermimic.utils.optim import build_optimizer
 
         self.opt_actor = build_optimizer(self.actor, cfg.lr, cfg.optim)
         self.opt_Q = build_optimizer(self.Q, cfg.lr, cfg.optim)
@@ -460,7 +460,7 @@ class Trainer:
     """Environment loop + :class:`SACAgent` (tracking sim, dict transitions)."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from supermimic.kinematics import make_kinematics
+        from supermimic.utils.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
         from supermimic.tasks import get_task
 

@@ -7,12 +7,13 @@ The robot is the G1 shipped with mjlab.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
-from supermimic.kinematics import TorchKinematics, compile_g1, verify_kinematics
+from supermimic.utils.kinematics import TorchKinematics, compile_g1, verify_kinematics
 from supermimic.motion import (
     CONTROL_DT,
     TARGET_FPS,
@@ -23,11 +24,52 @@ from supermimic.motion import (
 )
 
 from .base import Motion
-from .vis_types import VisClipInfo, VisFrame, VisSession
+from supermimic.utils.vis_types import VisClipInfo, VisFrame, VisSession
 
-RAW_DIR = Path("/mnt/workspace/btx0424/aa-projects/aa-bfm/data/lafan1/raw/g1")
-META_PATH = Path("/mnt/workspace/btx0424/aa-projects/aa-bfm/data/lafan1/meta.json")
-CACHE_PATH = Path(__file__).resolve().parents[3] / "data" / "lafan1_g1.npz"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+CACHE_PATH = _REPO_ROOT / "data" / "lafan1_g1.npz"
+
+
+def lafan1_root() -> Path:
+    """LAFAN1 data root: ``$LAFAN1_ROOT`` or ``<repo>/data/lafan1``."""
+    env = os.environ.get("LAFAN1_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    return _REPO_ROOT / "data" / "lafan1"
+
+
+def ensure_lafan1_raw(root: Path | None = None) -> tuple[Path, Path]:
+    """Return ``(raw/g1, meta.json)``, downloading via aa-bfm when missing."""
+    root = lafan1_root() if root is None else Path(root).expanduser().resolve()
+    raw_dir = root / "raw" / "g1"
+    meta_path = root / "meta.json"
+    has_csv = raw_dir.is_dir() and any(raw_dir.glob("*.csv"))
+    if has_csv and meta_path.is_file():
+        return raw_dir, meta_path
+    try:
+        from aa_bfm.data import Dataloader
+    except ImportError as exc:
+        raise RuntimeError(
+            f"LAFAN1 data not found under {root} (need raw/g1/*.csv and meta.json). "
+            "Set LAFAN1_ROOT to that directory, or install aa-bfm to auto-download "
+            f"into {lafan1_root()}."
+        ) from exc
+    print(f"LAFAN1 raw missing at {raw_dir}; downloading via aa_bfm into {root}…", flush=True)
+    Dataloader(root=root).ensure()
+    if not meta_path.is_file() or not any(raw_dir.glob("*.csv")):
+        raise FileNotFoundError(
+            f"aa_bfm download finished but {raw_dir} / {meta_path} are still incomplete."
+        )
+    return raw_dir, meta_path
+
+
+def __getattr__(name: str):
+    """Lazy ``RAW_DIR`` / ``META_PATH`` so callers see the resolved env root."""
+    if name == "RAW_DIR":
+        return lafan1_root() / "raw" / "g1"
+    if name == "META_PATH":
+        return lafan1_root() / "meta.json"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class Lafan1Motion(Motion):
@@ -39,7 +81,7 @@ class Lafan1Motion(Motion):
         return CACHE_PATH
 
     @classmethod
-    def build_cache(cls, cache_path: Path | None = None, raw_dir: Path = RAW_DIR) -> Path:
+    def build_cache(cls, cache_path: Path | None = None, raw_dir: Path | None = None) -> Path:
         return build_cache(cache_path or CACHE_PATH, raw_dir=raw_dir)
 
     @classmethod
@@ -111,9 +153,20 @@ class _Lafan1VisSession:
         )
 
 
-def build_cache(cache_path: Path = CACHE_PATH, raw_dir: Path = RAW_DIR) -> Path:
+def build_cache(cache_path: Path | None = None, raw_dir: Path | None = None) -> Path:
     """Resample the 40 raw 30 Hz CSVs and store torch-FK body trajectories."""
-    meta = json.loads(META_PATH.read_text())
+    cache_path = CACHE_PATH if cache_path is None else Path(cache_path)
+    if raw_dir is None:
+        raw_dir, meta_path = ensure_lafan1_raw()
+    else:
+        raw_dir = Path(raw_dir)
+        meta_path = raw_dir.parent.parent / "meta.json"
+        if not meta_path.is_file():
+            raise FileNotFoundError(
+                f"Expected meta.json at {meta_path} (parent of raw/g1). "
+                "Pass LAFAN1_ROOT or place meta.json next to raw/."
+            )
+    meta = json.loads(meta_path.read_text())
     csv_joint_names = list(meta["joint_names"])
     clip_names = list(meta["clip_names"])
     model, joint_names = compile_g1()

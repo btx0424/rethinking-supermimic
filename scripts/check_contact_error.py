@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from supermimic.algo import TrainConfig, Trainer, world_model_window
-from supermimic.kinematics import TRACKED_BODIES
+from supermimic.utils.kinematics import TRACKED_BODIES
 from supermimic.mdp import PAPER_OBS_TERMS, unflatten_state
 from supermimic.network import PAPER_POLICY_HIDDEN
 

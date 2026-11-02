@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .math_utils import quat_error_angle
+from .utils.math import quat_error_angle
 from .mdp import (
     CONTROL_DT,
     REWARD_TERM_SCALE,

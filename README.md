@@ -1,5 +1,10 @@
 # Rethinking Supermimic
 
+SuperMimic-style humanoid motion tracking: a learned world model (MLP), a policy trained by
+backpropagating through short imagined windows, and a critic that bootstraps the window return.
+mjlab supplies the G1 and the physics step; the world model and the policy update never call the
+simulator.
+
 ## Installation
 
 We use mjlab for its lightweightness. The robot model will be the G1 shipped with mjlab.
@@ -16,27 +21,123 @@ CUDA 13 (driver 580 or newer) is the other fork. It uses the PyPI torch and Warp
 uv sync --no-default-groups --extra cu13
 ```
 
-## Training
+## Datasets
 
-The 40 LAFAN1 clips are read from `aa-projects/aa-bfm/data/lafan1/raw/g1` (30 Hz) and cached at 50 Hz in `data/lafan1_g1.npz` on first use. mjlab supplies the G1 and the physics step; the world model and the policy update do not call the simulator.
+Two motion sources are supported. Both resample to 50 Hz and cache into the repo-local
+`<repo>/data/` directory on first use; both that directory and the run logs are git-ignored.
+
+### LAFAN1 (whole-body tracking)
+
+40 clips of a G1 retarget, 30 Hz CSV. Point `LAFAN1_ROOT` at a directory holding `raw/g1/*.csv`
+and `meta.json`:
+
+```bash
+export LAFAN1_ROOT=/path/to/aa-bfm/data/lafan1
+```
+
+If the variable is unset, the loader looks in `<repo>/data/lafan1`, and if that is empty it
+downloads through `aa_bfm.Dataloader` (HuggingFace `lvhaidong/LAFAN1_Retargeting_Dataset`). Either
+way the resampled library is written to `<repo>/data/lafan1_g1.npz`.
+
+### Weave (object interaction)
+
+Hand–object clips for the inspire-hand G1, 50 Hz, with a free-joint object. The dataset is not
+auto-downloaded, so `WEAVE_ROOT` is required:
+
+```bash
+export WEAVE_ROOT=/path/to/Weave      # contains the rollout folders and objects/<name>/<name>.obj
+```
+
+One cache per object set is written to `<repo>/data/weave_g1_hand_<objects>.npz`. The robot MJCF
+ships in `robot_assets/unitree_g1/`, so no external asset path is needed.
+
+### Visualization
+
+Scrub the reference motions in a browser (Viser, default http://localhost:8080):
+
+```bash
+PYTHONPATH=src python -m supermimic.utils.viz_motion --dataset lafan1
+PYTHONPATH=src python -m supermimic.utils.viz_motion --dataset weave --objects smalltable smallbox
+```
+
+Useful flags: `--port`, `--hz` (viewer refresh; clips always step at 50 Hz), `--split {train,test}`
+and `--max-clips` (Weave only). The same viewer is reachable programmatically as
+`Lafan1Motion.viser_play()` / `WeaveMotion.viser_play()`.
+
+## Train, play, evaluate
+
+### Train
 
 ```bash
 PYTHONPATH=src python -m supermimic.train
+PYTHONPATH=src python -m supermimic.train algo=nablamimic
+PYTHONPATH=src python -m supermimic.train task=weave
+```
+
+Hydra writes each run under `logs/<swanlab.experiment>/<timestamp>/` (`ckpt_*.pt`, `train_log.csv`,
+`config.yaml`). `algo=` selects the trainer (see [Algorithms](#algorithms)); `task=` selects
+`lafan1` or `weave`. Any config key can be overridden on the command line, e.g.
+`wm_ema=null`, `imagine_wm=ema`, `iterations=5000`.
+
+### Play
+
+Interactive rollout of the reference and, with a checkpoint, the learned policy:
+
+```bash
+PYTHONPATH=src python -m supermimic.play                          # reference only
+PYTHONPATH=src python -m supermimic.play --ckpt logs/lafan1/<timestamp>/last.pt
+PYTHONPATH=src python -m supermimic.play --task weave             # reference, no ckpt
+```
+
+`play` opens a Viser page with a ground plane. With `--ckpt`, the solid robot is the policy and a
+translucent blue ghost is the reference; the task is inferred from the checkpoint. Flags: `--port`,
+`--device`, `--hz`.
+
+### Evaluate
+
+```bash
 PYTHONPATH=src python -m supermimic.eval --ckpt logs/lafan1/<timestamp>/ckpt_002000.pt
 ```
 
-Hydra writes each run under `logs/<swanlab.experiment>/<timestamp>/` (ckpts, `train_log.csv`, `config.yaml`).
+Plays each clip from its first frame and reports the normalized return (Appendix F.1 protocol).
+By default it evaluates the EMA weights; `--live` uses the online policy instead. `--device` and
+`--quiet` are also available.
 
-```bash
-PYTHONPATH=src python -m supermimic.play
-PYTHONPATH=src python -m supermimic.play --ckpt logs/lafan1/<timestamp>/last.pt
-```
+## Algorithms
 
-`play` opens a Viser page (default http://localhost:8080) with a ground plane to scrub LAFAN1 clips. With `--ckpt`, the solid robot is the policy and a translucent blue ghost is the reference.
+`algo=supermimic` and `algo=nablamimic` share the whole world-model stack — replay, WM fitting,
+imagined rollouts, the reward/termination model, the critic, and EMA checkpoints. They differ
+only in the **policy improvement operator**: how the imagined window turns into a policy update.
 
-Hydra selects the policy observation and the anchor. The config observation is Table A.1 plus the 6D reference-root orientation, and the anchor is the pelvis. `obs.base_lin_vel=true` adds body-frame linear velocity. `actor=trunk` concatenates the goal with the history. `actor=film` keeps that trunk on proprioception and lets the goal scale and shift each layer.
+| | `supermimic` | `nablamimic` |
+|---|---|---|
+| Idea | SuperMimic's BPTT: differentiate the window return w.r.t. policy parameters and take one Adam step. | ∇Mimic / PODS: the gradient defines *target actions*, and the policy is regressed onto them. |
+| Gradient | `∂J/∂θ` through the WM and the policy. | `∂J/∂a` w.r.t. actions only; the policy runs under `no_grad` and its parameters get no direct gradient. |
+| Update | One optimizer step on the window gradient. | Action targets `y = a + η·g/RMS(g)` with a fixed RMS step `δ` rad, then `M` Adam regression steps on `‖π(o) − y‖²` (joint radians). |
+| Tail control | None by default (`grad_clip_norm` only). | Per-sample clip of `‖∂J/∂a‖` to `act_cot_clip` × batch median. |
+| Reuse of a window | Once. | `action_target_steps` regression steps per window (default 8), from a ring buffer of `action_target_windows`. |
+| Key knobs | `pi_lr`, `grad_clip_norm`, `pi_warmup` | `action_target_steps`, `action_target_delta`, `act_cot_clip`, `action_target_lr` (also sets `pi_lr`), `action_target_batch` |
 
-`swanlab.mode` is `offline` by default, which writes the run under `swanlog/` without uploading. `online` uploads, and `disabled` turns logging off. `local` needs the SwanLab dashboard extra, which is not installed here.
+Practical notes:
+
+- `nablamimic` sets `pi_lr = action_target_lr` (default `6e-4`) and `grad_clip_value = 0.1` in
+  `conf/algo/nablamimic.yaml`; everything else starts from the `supermimic` defaults.
+- The `imagine_wm` switch (`live` | `ema`) applies to both: it picks which world model supplies the
+  policy-training gradients. WM fitting always updates the live model.
+- Both are world-model methods: gradients come from the learned model, not the simulator.
+  `nablamimic` borrows only the improvement operator of ∇Mimic, which pairs it with exact
+  simulator gradients ([NablaEngine](https://github.com/OamIcs/NablaEngine)).
+
+## Configuration notes
+
+Hydra selects the policy observation and the anchor. The config observation is Table A.1 plus the
+6D reference-root orientation, and the anchor is the pelvis. `obs.base_lin_vel=true` adds
+body-frame linear velocity. `actor=trunk` concatenates the goal with the history. `actor=film`
+keeps that trunk on proprioception and lets the goal scale and shift each layer.
+
+`swanlab.mode` is `offline` by default, which writes the run under `swanlog/` without uploading.
+`online` uploads, and `disabled` turns logging off. `local` needs the SwanLab dashboard extra,
+which is not installed here.
 
 ## Ours, the paper, and supermimic_vibed
 

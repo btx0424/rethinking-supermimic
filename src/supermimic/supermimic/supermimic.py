@@ -19,7 +19,7 @@ torch_logging.set_logs(dynamo=logging.INFO, inductor=logging.INFO)
 from torch.utils.tensorboard import SummaryWriter
 
 from supermimic.algos.buffer import ReplayBuffer
-from supermimic.sac.util import soft_copy_
+from supermimic.utils.nn import soft_copy_
 from supermimic.mdp import (
     CONTROL_DT,
     GOAL_FRAMES,
@@ -50,7 +50,7 @@ from supermimic.algos.network import (
 )
 from supermimic.algos.reward_norm import RewardNormalizer
 from supermimic.tasks import TaskSpec, get_task
-from supermimic import experiment_log
+from supermimic.utils import experiment_log
 
 
 @dataclass
@@ -786,7 +786,7 @@ class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
-        from supermimic.kinematics import make_kinematics
+        from supermimic.utils.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
 
         self.cfg = cfg
@@ -954,7 +954,7 @@ class Trainer:
         else:
             raise ValueError(f"critic_kind must be 'scalar' or 'classification', got {cfg.critic_kind!r}.")
         self.norms = InputNorms(obs_dim, self.task).to(self.device)
-        from supermimic.optim import build_optimizer
+        from supermimic.utils.optim import build_optimizer
 
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
         self.opt_pi = build_optimizer(self.policy, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95))

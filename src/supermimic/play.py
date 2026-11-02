@@ -19,7 +19,7 @@ import viser
 from mjviser import ViserMujocoScene
 from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 
-from supermimic.kinematics import make_kinematics
+from supermimic.utils.kinematics import make_kinematics
 from supermimic.mdp import GOAL_FRAMES, HIST, PAPER_OBS_TERMS, WorldModelState
 from supermimic.motion import MotionLib
 from supermimic.supermimic.network import InputNorms, build_policy
@@ -187,7 +187,7 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
 
     if "actor" in saved:
         from supermimic.sac.network import NormalActor
-        from supermimic.sac.util import ObsVecNorm
+        from supermimic.utils.nn import ObsVecNorm
 
         policy_obs_dim = sim.mdp.obs_dim + sim.mdp.task.goal_dim
         actor = NormalActor(

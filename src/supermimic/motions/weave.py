@@ -1,14 +1,13 @@
 """
 Loading, processing, caching, and visualization of Weave motions.
 
-Target asset:
-``aa-projects/object_hoi/src/assets/unitree_g1/g1_29dof_rev_1_0_with_inspire_hand_DFQ.xml``
-
-Raw rollouts live under ``/mnt/workspace/btx0424/Weave`` (see ``genrl.data.weave``).
+Robot MJCF: ``robot_assets/unitree_g1/g1_29dof_rev_1_0_with_inspire_hand_DFQ.xml``.
+Raw rollouts: set ``WEAVE_ROOT`` to the Weave dataset directory (see ``genrl.data.weave``).
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,12 +16,33 @@ import mujoco
 import numpy as np
 
 from .base import Motion
-from .vis_types import VisClipInfo, VisFrame, VisSession
+from supermimic.utils.vis_types import VisClipInfo, VisFrame, VisSession
 
-DEFAULT_ROOT = Path("/mnt/workspace/btx0424/Weave")
-_DATA_DIR = Path(__file__).resolve().parents[3] / "data"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DATA_DIR = _REPO_ROOT / "data"
 # Robot-only cache kept for backward compatibility; object HOI uses a tagged path.
 CACHE_PATH = _DATA_DIR / "weave_g1_hand.npz"
+ROBOT_XML = (
+    _REPO_ROOT / "robot_assets" / "unitree_g1" / "g1_29dof_rev_1_0_with_inspire_hand_DFQ.xml"
+)
+
+
+def weave_root() -> Path:
+    """Weave dataset root from ``$WEAVE_ROOT`` (required; dataset is not auto-downloaded)."""
+    env = os.environ.get("WEAVE_ROOT")
+    if not env or not env.strip():
+        raise RuntimeError(
+            "WEAVE_ROOT is not set. Export it to the Weave dataset directory "
+            "(contains per-object rollout folders and objects/ meshes)."
+        )
+    path = Path(env).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"WEAVE_ROOT={path} is not a directory.")
+    return path
+
+
+def object_mesh_root() -> Path:
+    return weave_root() / "objects"
 
 
 def cache_path_for(objects: tuple[str, ...]) -> Path:
@@ -30,12 +50,6 @@ def cache_path_for(objects: tuple[str, ...]) -> Path:
     if not objects:
         raise ValueError("objects must be non-empty.")
     return _DATA_DIR / f"weave_g1_hand_{'_'.join(objects)}.npz"
-
-ROBOT_XML = Path(
-    "/mnt/workspace/btx0424/aa-projects/object_hoi/src/assets/unitree_g1/"
-    "g1_29dof_rev_1_0_with_inspire_hand_DFQ.xml"
-)
-OBJECT_MESH_ROOT = DEFAULT_ROOT / "objects"
 
 # Weave rollout NPZ column order (dataset card).
 DATASET_JOINT_NAMES: tuple[str, ...] = (
@@ -180,8 +194,9 @@ def _compile_robot_model() -> mujoco.MjModel:
     return mujoco.MjModel.from_xml_path(str(ROBOT_XML))
 
 
-def _object_mesh(object_name: str, mesh_root: Path = OBJECT_MESH_ROOT) -> Path:
-    path = mesh_root / object_name / f"{object_name}.obj"
+def _object_mesh(object_name: str, mesh_root: Path | None = None) -> Path:
+    root = object_mesh_root() if mesh_root is None else Path(mesh_root)
+    path = root / object_name / f"{object_name}.obj"
     if not path.is_file():
         raise FileNotFoundError(path)
     return path
@@ -216,7 +231,7 @@ class WeaveMotion(Motion):
     def build_cache(
         cls,
         cache_path: Path | None = None,
-        root: Path = DEFAULT_ROOT,
+        root: Path | None = None,
         objects: tuple[str, ...] = ("smalltable",),
         split: str = "train",
         **_,
@@ -277,13 +292,16 @@ class WeaveMotion(Motion):
     @classmethod
     def open_vis_session(
         cls,
-        root: Path = DEFAULT_ROOT,
+        root: Path | None = None,
         objects: Sequence[str] = ("smalltable", "smallbox"),
         split: str = "train",
         max_clips: int | None = 200,
         **_,
     ) -> VisSession:
-        return _WeaveVisSession.load(root=root, objects=tuple(objects), split=split, max_clips=max_clips)
+        resolved = weave_root() if root is None else Path(root)
+        return _WeaveVisSession.load(
+            root=resolved, objects=tuple(objects), split=split, max_clips=max_clips
+        )
 
 
 @dataclass
@@ -434,7 +452,7 @@ _AVAILABLE_OBJECTS = (
 
 def build_cache(
     cache_path: Path | None = None,
-    root: Path = DEFAULT_ROOT,
+    root: Path | None = None,
     objects: tuple[str, ...] = ("smalltable",),
     split: str = "train",
 ) -> Path:
@@ -444,10 +462,11 @@ def build_cache(
     hinge order. The root is the pelvis, and the 14 tracked bodies are sliced
     out of the recorded body trajectory.
     """
-    from supermimic.kinematics import HAND_BODIES, TRACKED_BODIES
+    from supermimic.utils.kinematics import HAND_BODIES, TRACKED_BODIES
     from supermimic.motion import TARGET_FPS, write_npz_cache
     from supermimic.robots.g1_inspire import compile_g1_inspire
 
+    root = weave_root() if root is None else Path(root)
     if split not in ("train", "test"):
         raise ValueError(f"split must be 'train' or 'test', got {split!r}.")
     unknown = [name for name in objects if name not in _AVAILABLE_OBJECTS]

@@ -1,4 +1,4 @@
-"""Small SAC helpers (no tensordict / torchrl)."""
+"""Small NN helpers shared by SAC and the SuperMimic trainers (no tensordict / torchrl)."""
 
 from __future__ import annotations
 

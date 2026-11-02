@@ -11,7 +11,7 @@ import mujoco
 import numpy as np
 import torch
 
-from .math_utils import quat_apply, quat_apply_inverse, quat_mul, quat_normalize
+from .math import quat_apply, quat_apply_inverse, quat_mul, quat_normalize
 
 TRACKED_BODIES = (
     "pelvis",

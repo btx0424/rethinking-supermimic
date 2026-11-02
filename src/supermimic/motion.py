@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .math_utils import quat_apply_inverse, quat_mul, quat_normalize, quat_to_rotvec, yaw_quat
+from .utils.math import quat_apply_inverse, quat_mul, quat_normalize, quat_to_rotvec, yaw_quat
 
 CONTROL_DT = 0.02
 SOURCE_FPS = 30
@@ -237,7 +237,7 @@ class MotionLib:
     def _prepare_goal(self) -> None:
         root_v_local = quat_apply_inverse(self.root_quat, self.root_v)
         root_w_local = quat_apply_inverse(self.root_quat, self.root_w)
-        from .math_utils import mat_to_6d, quat_to_mat
+        from .utils.math import mat_to_6d, quat_to_mat
 
         self.root_rot6 = mat_to_6d(quat_to_mat(self.root_quat))
         self.root_v_local = root_v_local
@@ -264,7 +264,7 @@ class MotionLib:
         future = self.future_frames(f, k)
         yaw = yaw_quat(self.root_quat[f])
         dp = quat_apply_inverse(yaw.unsqueeze(1), self.root_p[future] - self.root_p[f].unsqueeze(1))
-        from .math_utils import mat_to_6d, quat_inv, quat_to_mat
+        from .utils.math import mat_to_6d, quat_inv, quat_to_mat
 
         relative = quat_mul(quat_inv(yaw).unsqueeze(1).expand_as(self.root_quat[future]), self.root_quat[future])
         rot6 = mat_to_6d(quat_to_mat(relative))
@@ -281,7 +281,7 @@ class MotionLib:
         )
         object_p = getattr(self, "object_p", None)
         if object_p is not None:
-            from .math_utils import mat_to_6d, quat_inv, quat_to_mat
+            from .utils.math import mat_to_6d, quat_inv, quat_to_mat
 
             obj_dp = quat_apply_inverse(yaw.unsqueeze(1), object_p[future] - self.root_p[f].unsqueeze(1))
             obj_rel = quat_mul(

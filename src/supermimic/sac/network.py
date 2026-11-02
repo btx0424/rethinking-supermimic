@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from supermimic.sac.util import IndependentNormal
+from supermimic.utils.nn import IndependentNormal
 
 
 class MultiStepReturn(nn.Module):

@@ -102,7 +102,7 @@ def _steady_samples(fn, warmup: int, iters: int, device: torch.device) -> list[f
 def _setup_wm(batch: int, k: int, device: torch.device, amp: str, optim: str, wm_lr: float):
     from supermimic import network
     from supermimic.algo import MSELoss, contact_bce
-    from supermimic.kinematics import TorchKinematics, compile_g1
+    from supermimic.utils.kinematics import TorchKinematics, compile_g1
     from supermimic.mdp import (
         N_BODY,
         N_CONTACT,
@@ -113,7 +113,7 @@ def _setup_wm(batch: int, k: int, device: torch.device, amp: str, optim: str, wm
     )
     from supermimic.motion import MotionLib
     from supermimic.network import InputNorms, WorldModel
-    from supermimic.optim import build_optimizer
+    from supermimic.utils.optim import build_optimizer
 
     torch.manual_seed(0)
     if amp not in ("none", "bf16"):

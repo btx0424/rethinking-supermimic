@@ -18,7 +18,7 @@ import mujoco
 from mjlab.entity import EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
-_WEAVE_ROOT = Path("/mnt/workspace/btx0424/Weave/objects")
+from supermimic.motions.weave import object_mesh_root
 
 # Same mass object_hoi applies at runtime for the HOI table.
 _OBJECT_MASS = 0.2
@@ -26,12 +26,13 @@ _OBJECT_MASS = 0.2
 
 def object_mesh_path(object_name: str) -> Path:
     """Weave object triangle mesh. Matches ``object_quat_w`` in the rollout NPZ."""
-    path = _WEAVE_ROOT / object_name / f"{object_name}.obj"
+    mesh_root = object_mesh_root()
+    path = mesh_root / object_name / f"{object_name}.obj"
     if path.is_file():
         return path
     raise FileNotFoundError(
         f"No Weave mesh for object {object_name!r} at {path}. "
-        f"Expected the same OBJ genrl loads from {_WEAVE_ROOT}."
+        f"Expected the same OBJ genrl loads from {mesh_root} (set WEAVE_ROOT)."
     )
 
 

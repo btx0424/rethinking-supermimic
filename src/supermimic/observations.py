@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .math_utils import (
+from .utils.math import (
     mat_to_6d,
     quat_apply_inverse,
     quat_inv,

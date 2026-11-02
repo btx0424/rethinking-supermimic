@@ -10,8 +10,8 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
-from .kinematics import TorchKinematics
-from .math_utils import quat_from_euler_xyz, quat_mul
+from .utils.kinematics import TorchKinematics
+from .utils.math import quat_from_euler_xyz, quat_mul
 from .mdp import (
     MDP,
     PAPER_OBS_TERMS,

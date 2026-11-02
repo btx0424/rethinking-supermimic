@@ -34,8 +34,8 @@ from supermimic.mdp import (
     unflatten_object,
     unflatten_state,
 )
-from supermimic.optim import build_optimizer
-from supermimic.sac.util import soft_copy_
+from supermimic.utils.optim import build_optimizer
+from supermimic.utils.nn import soft_copy_
 from supermimic.supermimic.supermimic import (
     TrainConfig,
     Trainer,

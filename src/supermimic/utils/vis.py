@@ -11,7 +11,7 @@ import viser
 from mjviser import ViserMujocoScene
 
 if TYPE_CHECKING:
-    from .base import Motion
+    from supermimic.motions.base import Motion
     from .vis_types import VisFrame, VisSession
 
 _GROUND_Z = -0.02

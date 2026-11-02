@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
     from supermimic.motion import MotionLib
 
-    from .vis_types import VisFrame, VisSession
+    from supermimic.utils.vis_types import VisFrame, VisSession
 
 
 class Motion(ABC):
@@ -100,6 +100,6 @@ class Motion(ABC):
 
     @classmethod
     def viser_play(cls, port: int = 8080, hz: float = 30.0, **session_kwargs: Any) -> None:
-        from .vis import play_viser
+        from supermimic.utils.vis import play_viser
 
         play_viser(cls, port=port, hz=hz, session_kwargs=session_kwargs)

@@ -6,9 +6,9 @@ from typing import NamedTuple
 
 import torch
 
-from .kinematics import TRACKED_BODIES, TorchKinematics
+from .utils.kinematics import TRACKED_BODIES, TorchKinematics
 from .tasks import Lafan1Task, TaskSpec
-from .math_utils import (
+from .utils.math import (
     mat_to_6d,
     quat_apply,
     quat_apply_inverse,

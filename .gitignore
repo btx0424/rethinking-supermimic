@@ -19,3 +19,6 @@ benchmark/.train_compile_cache.json
 
 # hydra
 outputs/
+
+# Mujoco logs
+MUJOCO_LOG.TXT

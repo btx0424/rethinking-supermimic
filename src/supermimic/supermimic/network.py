@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 
-from supermimic.math_utils import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
+from supermimic.utils.math import quat_apply, quat_mul, quat_normalize, rotvec_to_quat, yaw_quat
 from supermimic.mdp import (
     WM_FRAMES,
     WorldModelState,

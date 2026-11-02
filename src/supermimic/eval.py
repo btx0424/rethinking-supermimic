@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from supermimic.kinematics import make_kinematics
+from supermimic.utils.kinematics import make_kinematics
 from supermimic.mdp import (
     GOAL_FRAMES,
     HIST,
@@ -142,7 +142,7 @@ def evaluate_supermimic(
 
 def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progress: bool) -> None:
     from supermimic.sac.network import NormalActor
-    from supermimic.sac.util import ObsVecNorm
+    from supermimic.utils.nn import ObsVecNorm
 
     task = get_task(str(saved_cfg.get("task", "lafan1")))
     motion = task.load_motion(device)

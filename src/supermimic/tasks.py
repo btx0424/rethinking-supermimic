@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from supermimic.kinematics import HAND_BODIES, TRACKED_BODIES
+from supermimic.utils.kinematics import HAND_BODIES, TRACKED_BODIES
 
 
 @dataclass(frozen=True)
@@ -222,7 +222,7 @@ class Lafan1Task(TaskSpec):
         )
 
     def compile_model(self):
-        from supermimic.kinematics import compile_g1
+        from supermimic.utils.kinematics import compile_g1
 
         return compile_g1()
 
