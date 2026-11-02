@@ -15,6 +15,7 @@ from .math_utils import quat_from_euler_xyz, quat_mul
 from .mdp import (
     MDP,
     PAPER_OBS_TERMS,
+    WorldModelState,
     flatten_object,
     flatten_state,
     max_step_reward,
@@ -314,21 +315,23 @@ class TrackingSim:
         last = self.motion.clip_end[self.motion.clip_id[f]] - 1
         f_next = torch.minimum(f + 1, last)
         hand1 = self.hand_positions() if self._hand_local is not None else None
-        reward, terms = self.mdp.reward(
+        body_p, body_quat, body_v, body_w = bodies1
+        obj_fields = obj1 if obj1 is not None else (None, None, None, None)
+        reward_state = WorldModelState(
             p1,
             quat1,
             v1,
             w1,
             q1,
             qd1,
-            f_next,
-            action,
-            a_prev,
-            terms=True,
-            bodies=bodies1,
-            object_state=obj1,
-            hand_pos=hand1,
+            body_p,
+            body_quat,
+            *obj_fields,
+            body_v,
+            body_w,
+            hand1,
         )
+        reward, terms = self.mdp.reward(reward_state, f_next, action, a_prev, terms=True)
         hard = self.mdp.termination(p1, quat1, f_next)
         if self.survival_bonus:
             reward = reward + self.survival_bonus * (~hard).float()

@@ -125,9 +125,14 @@ class TrainConfig:
     contact_coef: float = 0.01
     log_every: int = 50
     ckpt_every: int = 500
-    # Polyak EMA of policy weights for eval/checkpoints (instantTrack ``--pi_ema``).
-    # Rollout and BPTT still use the online policy; ``None`` disables EMA.
-    pi_ema: float | None = 0.995
+    # Polyak EMA decay β for eval/checkpoints (``tau = 1 - β``; default β=0.99 → τ=0.01).
+    # Rollout / BPTT use the online nets; ``None`` disables. Checkpoint keys: ``pi`` /
+    # ``wm`` store EMA when enabled, with live weights under ``pi_live`` / ``wm_live``.
+    pi_ema: float | None = 0.99
+    wm_ema: float | None = 0.99
+    # Which world model imagination uses for policy BPTT gradients: ``live`` or ``ema``.
+    # ``ema`` requires ``wm_ema`` to be set. WM fitting always updates the live model.
+    imagine_wm: str = "live"
     seed: int = 0
     # Continue from this checkpoint. Missing modules (older runs) are left at init.
     resume: str | None = None
@@ -385,13 +390,14 @@ class RewardL1Loss(nn.Module):
                 raise ValueError("Object reward-L1 needs obj_preds and batch['obj1'].")
             obj_pred = unflatten_object(obj_preds.reshape(steps * batch_size, -1))
             obj_true = unflatten_object(batch["obj1"].transpose(0, 1).reshape(steps * batch_size, -1))
-        reward_pred = self.mdp.reward(
-            *unflatten_state(pred), frame, action, a_prev, object_state=obj_pred
-        )
+        def _reward_state(flat: torch.Tensor, obj):
+            root = unflatten_state(flat)
+            obj_fields = obj if obj is not None else (None, None, None, None)
+            return WorldModelState(*root, None, None, *obj_fields)
+
+        reward_pred = self.mdp.reward(_reward_state(pred, obj_pred), frame, action, a_prev)
         with torch.no_grad():
-            reward_true = self.mdp.reward(
-                *unflatten_state(true), frame, action, a_prev, object_state=obj_true
-            )
+            reward_true = self.mdp.reward(_reward_state(true, obj_true), frame, action, a_prev)
         return (reward_pred - reward_true).abs().mean()
 
 
@@ -699,13 +705,14 @@ def imagine_horizon(
         goals.append(goal)
     flat = _flatten_time(states[1:])
     object_state = _flatten_object_time(states[1:]) if mdp.task.has_object else None
+    obj_fields = object_state if object_state is not None else (None, None, None, None)
+    reward_state = WorldModelState(*flat, None, None, *obj_fields)
     reward, term_parts = mdp.reward(
-        *flat,
+        reward_state,
         _stack(frames[1:]),
         _stack(actions),
         _stack(prev_actions),
         terms=True,
-        object_state=object_state,
     )
     done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
     reward = reward.view(horizon, batch)
@@ -901,6 +908,17 @@ class Trainer:
             self.policy_ema.eval()
         else:
             self.policy_ema = None
+        self.wm_ema_tau = 1.0 - cfg.wm_ema if cfg.wm_ema is not None else None
+        if self.wm_ema_tau is not None:
+            self.wm_ema = copy.deepcopy(self.wm)
+            self.wm_ema.requires_grad_(False)
+            self.wm_ema.eval()
+        else:
+            self.wm_ema = None
+        if cfg.imagine_wm not in ("live", "ema"):
+            raise ValueError(f"imagine_wm must be 'live' or 'ema', got {cfg.imagine_wm!r}.")
+        if cfg.imagine_wm == "ema" and self.wm_ema is None:
+            raise ValueError("imagine_wm='ema' requires wm_ema to be enabled (not null).")
         self.term_names = reward_term_names(self.task)
         in_dim = (
             self.task.inv_dim
@@ -1083,7 +1101,8 @@ class Trainer:
         # Freeze WM/V params through imagine + policy backward (not torch.no_grad:
         # π must still differentiate through dynamics and ∂V/∂s).
         diagnose_reward = (iteration + 1) % cfg.log_every == 0
-        with hold_out_net(self.wm), hold_out_net(self.critic):
+        policy_wm = self.policy_wm()
+        with hold_out_net(policy_wm), hold_out_net(self.critic):
             with timed(self.device):
                 start = self.sample_policy_starts()
                 pi_loss, critic_batch, imag_score, survival, imag_terms, term_losses = self.imagine(
@@ -1260,6 +1279,8 @@ class Trainer:
                 loss.backward()
                 norms.append(_clip_grads(self.wm.parameters(), cfg.grad_clip_norm))
                 self.opt_wm.step()
+                if self.wm_ema_tau is not None and self.wm_ema is not None:
+                    soft_copy_(self.wm, self.wm_ema, self.wm_ema_tau)
             mse_losses.append(mse.detach())
             reward_losses.append(reward_l1.detach())
             contact_losses.append(contact_loss.detach())
@@ -1398,6 +1419,13 @@ class Trainer:
             raise RuntimeError("Could not sample enough imagination starts inside the clips.")
         return out
 
+    def policy_wm(self) -> WorldModel:
+        """World model used for policy imagination BPTT (``cfg.imagine_wm``)."""
+        if self.cfg.imagine_wm == "ema":
+            assert self.wm_ema is not None
+            return self.wm_ema
+        return self.wm
+
     def _imagine_graph(self, start: dict[str, torch.Tensor]) -> dict:
         """Differentiable imagination rollout and return pieces (shared by train / diagnostics)."""
         cfg = self.cfg
@@ -1427,7 +1455,7 @@ class Trainer:
             survival,
         ) = imagine_horizon(
             self.policy,
-            self.wm,
+            self.policy_wm(),
             self.critic,
             self.norms,
             self.sim.mdp,
@@ -1518,7 +1546,7 @@ class Trainer:
         extra = [self.policy.log_std] if self.policy.log_std is not None else []
         params = encoder + decoder + extra
         n_enc = len(encoder)
-        with hold_out_net(self.wm), hold_out_net(self.critic):
+        with hold_out_net(self.policy_wm()), hold_out_net(self.critic):
             g = self._imagine_graph(start)
             step_return = g["step_return"]
             step_reward = g["step_reward"]
@@ -1852,9 +1880,16 @@ class Trainer:
         if self.cfg.wm_tune not in ("frozen", "tunable"):
             raise ValueError(f"wm_tune must be 'frozen' or 'tunable', got {self.cfg.wm_tune!r}")
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        if "wm" not in ckpt:
-            raise KeyError(f"{path} has no world model ('wm').")
-        self.wm.load_state_dict(ckpt["wm"])
+        if "wm" not in ckpt and "wm_live" not in ckpt:
+            raise KeyError(f"{path} has no world model ('wm' / 'wm_live').")
+        # Prefer live weights for continued training; ``wm`` alone is legacy live or EMA.
+        live = ckpt.get("wm_live", ckpt.get("wm"))
+        self.wm.load_state_dict(live)
+        if self.wm_ema is not None:
+            if "wm_live" in ckpt and "wm" in ckpt:
+                self.wm_ema.load_state_dict(ckpt["wm"])
+            else:
+                self.wm_ema.load_state_dict(self.wm.state_dict())
         norms = ckpt.get("norms")
         if norms is not None:
             own = self.norms.state_dict()
@@ -1879,7 +1914,6 @@ class Trainer:
         """Load whatever this checkpoint contains. Absent modules stay freshly initialized."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         modules = {
-            "wm": self.wm,
             "critic": self.critic,
             "disc": self.adv_loss,
             "norms": self.norms,
@@ -1922,6 +1956,37 @@ class Trainer:
                 self.policy_ema.load_state_dict(self.policy.state_dict(), strict=False)
         else:
             absent.append("pi")
+        if "wm" in ckpt or "wm_live" in ckpt:
+            live = ckpt.get("wm_live", ckpt.get("wm"))
+            if live is not None:
+                try:
+                    missing, unexpected = self.wm.load_state_dict(live, strict=False)
+                    loaded.append("wm_live" if "wm_live" in ckpt else "wm")
+                    if missing or unexpected:
+                        print(
+                            f"resume wm_live: missing={list(missing)} unexpected={list(unexpected)}",
+                            flush=True,
+                        )
+                except (ValueError, RuntimeError) as exc:
+                    absent.append("wm_live")
+                    print(f"resume skip wm_live: {exc}", flush=True)
+            if self.wm_ema is not None and "wm" in ckpt and "wm_live" in ckpt:
+                try:
+                    missing, unexpected = self.wm_ema.load_state_dict(ckpt["wm"], strict=False)
+                    loaded.append("wm_ema")
+                    if missing or unexpected:
+                        print(
+                            f"resume wm_ema: missing={list(missing)} unexpected={list(unexpected)}",
+                            flush=True,
+                        )
+                except (ValueError, RuntimeError) as exc:
+                    absent.append("wm_ema")
+                    print(f"resume skip wm_ema: {exc}", flush=True)
+            elif self.wm_ema is not None and live is not None:
+                # Legacy checkpoint: ``wm`` was the live model.
+                self.wm_ema.load_state_dict(self.wm.state_dict(), strict=False)
+        else:
+            absent.append("wm")
         for key, module in modules.items():
             if key not in ckpt:
                 absent.append(key)
@@ -1968,8 +2033,14 @@ class Trainer:
         else:
             pi_state = self.policy.state_dict()
             pi_live_state = None
+        if self.wm_ema is not None:
+            wm_state = self.wm_ema.state_dict()
+            wm_live_state = self.wm.state_dict()
+        else:
+            wm_state = self.wm.state_dict()
+            wm_live_state = None
         ckpt = {
-            "wm": self.wm.state_dict(),
+            "wm": wm_state,
             "pi": pi_state,
             "critic": self.critic.state_dict(),
             "disc": self.adv_loss.state_dict(),
@@ -1983,6 +2054,8 @@ class Trainer:
         }
         if pi_live_state is not None:
             ckpt["pi_live"] = pi_live_state
+        if wm_live_state is not None:
+            ckpt["wm_live"] = wm_live_state
         if self.reward_norm is not None:
             ckpt["reward_norm"] = self.reward_norm.state_dict()
         path = self.log_dir / f"ckpt_{iteration:06d}.pt"

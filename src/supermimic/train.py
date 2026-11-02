@@ -90,13 +90,15 @@ def _build_supermimic_cfg(cfg: DictConfig, run_dir: Path):
         wm_tune=str(cfg.wm_tune),
         optim=str(cfg.optim),
         policy_bootstrap=bool(cfg.policy_bootstrap),
-        pi_ema=_parse_pi_ema(cfg),
+        pi_ema=_parse_ema(cfg, "pi_ema", 0.99),
+        wm_ema=_parse_ema(cfg, "wm_ema", 0.99),
+        imagine_wm=str(cfg.get("imagine_wm", "live")),
         task=str(cfg.get("task", "lafan1")),
     )
 
 
-def _parse_pi_ema(cfg: DictConfig) -> float | None:
-    raw = cfg.get("pi_ema", 0.995)
+def _parse_ema(cfg: DictConfig, key: str, default: float) -> float | None:
+    raw = cfg.get(key, default)
     return None if raw is None else float(raw)
 
 
@@ -148,7 +150,7 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
         swanlab_project=str(cfg.swanlab.project),
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment=_experiment_name(run_dir),
-        pi_ema=_parse_pi_ema(cfg),
+        pi_ema=_parse_ema(cfg, "pi_ema", 0.995),
         task=str(cfg.get("task", "lafan1")),
     )
 

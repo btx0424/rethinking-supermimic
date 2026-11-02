@@ -142,6 +142,52 @@ REWARD_TERM_WEIGHT = {
 }
 
 
+class ObservationTerm:
+    """One policy observation feature. Composed by ``MDP.obs``."""
+
+    name: str
+    dim: int
+    noise: float = 0.0
+
+    def __init__(self, mdp: "MDP"):
+        self.mdp = mdp
+
+    def __call__(
+        self,
+        state: "WorldModelState",
+        a_prev: torch.Tensor,
+        xi: torch.Tensor,
+        frame: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return ``(..., dim)``."""
+        raise NotImplementedError
+
+
+class RewardTerm:
+    """One reward contribution. Composed by ``MDP.reward``."""
+
+    name: str
+    weight: float
+    scale: float | None = None
+    penalty: bool = False
+
+    def __init__(self, mdp: "MDP", weight: float, scale: float | None = None):
+        self.mdp = mdp
+        self.weight = float(weight)
+        if scale is not None:
+            self.scale = float(scale)
+
+    def __call__(
+        self,
+        state: "WorldModelState",
+        action: torch.Tensor,
+        a_prev: torch.Tensor,
+        frame: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``(...)`` per-env contribution (already × weight × kernel/penalty × dt)."""
+        raise NotImplementedError
+
+
 def resolve_reward_style(style: str) -> str:
     if style not in REWARD_STYLES:
         raise ValueError(f"Unknown reward style {style!r}. Known: {REWARD_STYLES}.")
@@ -304,6 +350,12 @@ class WorldModelState(NamedTuple):
     """World-frame object linear velocity, (..., 3)."""
     obj_w: torch.Tensor | None = None
     """World-frame object angular velocity, (..., 3)."""
+    body_lin_vel: torch.Tensor | None = None
+    """World-frame tracked-body linear velocity, (..., n_body, 3). Reward only."""
+    body_ang_vel: torch.Tensor | None = None
+    """World-frame tracked-body angular velocity, (..., n_body, 3). Reward only."""
+    hand_pos: torch.Tensor | None = None
+    """World-frame finger link positions, (..., n_hand, 3). HOI reward only."""
 
     def root(self) -> tuple[torch.Tensor, ...]:
         """The six root-and-joint tensors the buffer stores."""
@@ -481,12 +533,19 @@ class MDP:
         self.term_weight = REWARD_TERM_WEIGHT[self.reward_style]
         self.term_names = reward_term_names(self.task)
         self.max_step_reward = max_step_reward(self.reward_style, self.task)
-        layout = {name: self.task.obs_term(name) for name in self.obs_terms}
-        self.obs_dim = sum(dim for dim, _noise in layout.values())
-        self.noise = torch.cat(
-            [torch.full((dim,), noise, device=default_q.device) for dim, noise in layout.values()]
-        )
         self.gravity = default_q.new_tensor(GRAVITY)
+        from .observations import build_obs_terms
+        from .rewards import build_reward_terms
+
+        self._obs_terms = build_obs_terms(self, self.obs_terms)
+        self._reward_terms = build_reward_terms(self, self.term_names)
+        self.obs_dim = sum(term.dim for term in self._obs_terms)
+        self.noise = torch.cat(
+            [
+                torch.full((term.dim,), term.noise, device=default_q.device)
+                for term in self._obs_terms
+            ]
+        )
 
     def needs_body_pose(self) -> bool:
         """Whether observation terms read tracked-body poses from the state."""
@@ -505,67 +564,16 @@ class MDP:
         Body-dependent terms read ``state.body_pos`` / ``state.body_quat``. Callers
         must fill those (simulator or ``WorldModel.step``); this method does not run FK.
         """
-        p, quat, v, w, q, qd = state.root()
-        measured = q + xi[..., 1 : 1 + self.task.num_joints]
-        parts = {
-            "joint_pos": measured - self.default_q,
-            "joint_vel": qd,
-            "base_ang_vel": quat_apply_inverse(quat, w),
-            "base_lin_vel": quat_apply_inverse(quat, v),
-            "projected_gravity": quat_apply_inverse(quat, self.gravity.expand_as(w)),
-            "last_action": a_prev,
-        }
-        body_p, body_quat = state.body_pos, state.body_quat
-        if self.needs_body_pose() and (body_p is None or body_quat is None):
-            raise ValueError("Observation terms need state.body_pos and state.body_quat; fill them before obs.")
+        if self.needs_body_pose() and (state.body_pos is None or state.body_quat is None):
+            raise ValueError(
+                "Observation terms need state.body_pos and state.body_quat; fill them before obs."
+            )
         if self.needs_object() and (
             state.obj_p is None or state.obj_quat is None or state.obj_v is None or state.obj_w is None
         ):
             raise ValueError("Object observation terms need state.obj_*; fill them before obs.")
-        if "object_pos" in self.obs_terms or "object_ori" in self.obs_terms:
-            assert state.obj_p is not None and state.obj_quat is not None
-            yaw = yaw_quat(quat)
-            if "object_pos" in self.obs_terms:
-                parts["object_pos"] = quat_apply_inverse(yaw, state.obj_p - p)
-            if "object_ori" in self.obs_terms:
-                relative = quat_mul(quat_inv(yaw), state.obj_quat)
-                parts["object_ori"] = mat_to_6d(quat_to_mat(relative))
-        if "anchor_ori" in self.obs_terms:
-            if frame is None:
-                raise ValueError("The anchor_ori observation needs the reference frame.")
-            # Pelvis is the free-joint state. Any other anchor comes from body_quat.
-            if self.anchor == self.kin.pelvis_index:
-                robot_quat = quat
-            else:
-                robot_quat = body_quat[..., self.anchor, :]
-            ref_quat = self.motion.body_quat[frame][..., self.anchor, :]
-            relative = quat_mul(quat_inv(robot_quat), ref_quat)
-            parts["anchor_ori"] = mat_to_6d(quat_to_mat(relative))
-        if "anchor_pos" in self.obs_terms:
-            if frame is None:
-                raise ValueError("The anchor_pos observation needs the reference frame.")
-            if self.anchor == self.kin.pelvis_index:
-                robot_p = p
-            else:
-                robot_p = body_p[..., self.anchor, :]
-            ref_p = self.motion.body_p[frame][..., self.anchor, :]
-            # Reference minus robot, in the robot heading frame. xy is the drift.
-            parts["anchor_pos"] = quat_apply_inverse(yaw_quat(quat), ref_p - robot_p)
-        if "body_pos" in self.obs_terms or "body_ori" in self.obs_terms:
-            if frame is None:
-                raise ValueError("The body_pos and body_ori observations need the reference frame.")
-            # Same 14 bodies and the same anchor alignment as the body tracking reward.
-            ref_pos, ref_ori = _anchor_relative(
-                body_p, body_quat, self.motion.body_p[frame], self.motion.body_quat[frame], self.anchor
-            )
-            if "body_pos" in self.obs_terms:
-                yaw = yaw_quat(quat)
-                error = quat_apply_inverse(yaw.unsqueeze(-2), ref_pos - body_p)
-                parts["body_pos"] = error.flatten(-2)
-            if "body_ori" in self.obs_terms:
-                relative = quat_mul(quat_inv(body_quat), ref_ori)
-                parts["body_ori"] = mat_to_6d(quat_to_mat(relative)).flatten(-2)
-        return torch.cat([parts[name] for name in self.obs_terms], dim=-1)
+        parts = [term(state, a_prev, xi, frame) for term in self._obs_terms]
+        return torch.cat(parts, dim=-1)
 
     def add_noise(self, obs: torch.Tensor) -> torch.Tensor:
         return obs + (2.0 * torch.rand_like(obs) - 1.0) * self.noise
@@ -579,76 +587,46 @@ class MDP:
             body_p = self.bodies(p, quat, v, w, q, qd)[0]
         return heading_body_pos(p, quat, body_p)
 
+    def _complete_reward_state(self, state: WorldModelState) -> WorldModelState:
+        """Fill body pose/twist via FK when the caller only packed root/joints."""
+        if self.task.has_object and (
+            state.obj_p is None or state.obj_quat is None or state.obj_v is None or state.obj_w is None
+        ):
+            raise ValueError("Object reward needs state.obj_* packed on WorldModelState.")
+        need_bodies = (
+            state.body_pos is None
+            or state.body_quat is None
+            or state.body_lin_vel is None
+            or state.body_ang_vel is None
+        )
+        if not need_bodies:
+            return state
+        body_p, body_quat, body_v, body_w = self.bodies(*state.root())
+        return state._replace(
+            body_pos=body_p if state.body_pos is None else state.body_pos,
+            body_quat=body_quat if state.body_quat is None else state.body_quat,
+            body_lin_vel=body_v if state.body_lin_vel is None else state.body_lin_vel,
+            body_ang_vel=body_w if state.body_ang_vel is None else state.body_ang_vel,
+        )
+
     def reward(
         self,
-        p,
-        quat,
-        v,
-        w,
-        q,
-        qd,
+        state: WorldModelState,
         frame,
         action,
         a_prev,
         terms: bool = False,
-        bodies=None,
-        object_state=None,
-        hand_pos=None,
     ):
         """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
 
-        Action-rate and joint-limit are always the paper penalties
-        ``-w · ||Δa||² · dt`` and ``-w · relu_violation · dt``.
+        ``state`` is packed like ``obs`` (root, joints, bodies, optional object/hands).
+        Missing body pose/twist are filled with FK. Action-rate and joint-limit stay
+        the paper penalties ``-w · feature · dt``.
 
         With ``terms=True``, also return a name→tensor dict that sums to the reward.
-        ``object_state`` is ``(obj_p, obj_quat, obj_v, obj_w)`` for HOI tasks.
-        ``hand_pos`` is world-frame finger link positions for ``hand_obj_pos``.
         """
-        if bodies is None:
-            body_p, body_quat, body_v, body_w = self.bodies(p, quat, v, w, q, qd)
-        else:
-            body_p, body_quat, body_v, body_w = bodies
-        ref_p = self.motion.body_p[frame]
-        ref_quat = self.motion.body_quat[frame]
-        ref_pos, ref_ori = _anchor_relative(body_p, body_quat, ref_p, ref_quat, self.anchor)
-        if self.reward_style == "cauchy":
-            kernel = cauchy_kernel
-        elif self.reward_style == "gaussian_linear":
-            kernel = gaussian_linear_kernel
-        else:
-            kernel = gaussian_kernel
-        errors = {
-            "body_pos": (ref_pos - body_p).square().sum(-1).mean(-1),
-            "body_ori": quat_error_angle(ref_ori, body_quat).square().mean(-1),
-            "body_lin_vel": (self.motion.body_v[frame] - body_v).square().sum(-1).mean(-1),
-            "body_ang_vel": (self.motion.body_w[frame] - body_w).square().sum(-1).mean(-1),
-            "root_pos": (self.motion.root_p[frame] - p).square().sum(-1),
-            "root_ori": quat_error_angle(self.motion.root_quat[frame], quat).square(),
-        }
-        if self.task.has_object:
-            if object_state is None:
-                raise ValueError("Object reward needs object_state=(obj_p, obj_quat, obj_v, obj_w).")
-            obj_p, obj_quat, obj_v, obj_w = object_state
-            motion = self.motion
-            errors["object_pos"] = (motion.object_p[frame] - obj_p).square().sum(-1)
-            errors["object_ori"] = quat_error_angle(motion.object_quat[frame], obj_quat).square()
-            errors["object_lin_vel"] = (motion.object_v[frame] - obj_v).square().sum(-1)
-            errors["object_ang_vel"] = (motion.object_w[frame] - obj_w).square().sum(-1)
-            if self.task.hand_bodies:
-                if hand_pos is None:
-                    hand_pos = self.kin.hands(p, quat, v, w, q, qd)
-                ref_hand = motion.hand_p[frame]
-                ref_local = hand_obj_relative_pos(ref_hand, motion.object_p[frame], motion.object_quat[frame])
-                sim_local = hand_obj_relative_pos(hand_pos, obj_p, obj_quat)
-                errors["hand_obj_pos"] = (ref_local - sim_local).square().sum(-1).mean(-1)
-        weight = self.term_weight
-        s = REWARD_TERM_SCALE
-        pen = REWARD_TERM_WEIGHT["gaussian"]
-        parts = {
-            name: weight[name] * kernel(errors[name], s[name]) * CONTROL_DT for name in errors
-        }
-        parts["action_rate"] = -pen["action_rate"] * (action - a_prev).square().sum(-1) * CONTROL_DT
-        parts["joint_limit"] = -pen["joint_limit"] * hard_joint_violation(q, self.soft_lo, self.soft_hi) * CONTROL_DT
+        state = self._complete_reward_state(state)
+        parts = {term.name: term(state, action, a_prev, frame) for term in self._reward_terms}
         names = self.term_names
         reward = parts[names[0]]
         for name in names[1:]:
