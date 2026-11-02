@@ -36,6 +36,8 @@ adv_coef: 0.0
 reward_coef: 1.0
 contact_coef: 0.01
 ckpt_every: 500
+# Store optimizer moments in checkpoints (~80 MiB). Off keeps weights only.
+save_optim: false
 pi_ema: 0.99
 wm_ema: 0.99
 imagine_wm: live

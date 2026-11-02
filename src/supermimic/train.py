@@ -82,6 +82,7 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         device=str(cfg.device),
         log_every=int(cfg.log_every),
         ckpt_every=int(cfg.ckpt_every),
+        save_optim=bool(cfg.get("save_optim", False)),
         seed=int(cfg.seed),
         resume=None if cfg.resume is None else str(cfg.resume),
         wm_ckpt=None if cfg.wm_ckpt is None else str(cfg.wm_ckpt),

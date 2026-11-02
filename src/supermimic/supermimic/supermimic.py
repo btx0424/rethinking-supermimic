@@ -125,6 +125,9 @@ class TrainConfig:
     contact_coef: float = 0.01
     log_every: int = 50
     ckpt_every: int = 500
+    # Include optimizer state (Muon/AdamW moments) in checkpoints. Off keeps them small
+    # (~190 → ~110 MiB); resuming a run without them restarts the optimizer moments.
+    save_optim: bool = False
     # Polyak EMA decay β for eval/checkpoints (``tau = 1 - β``; default β=0.99 → τ=0.01).
     # Rollout / BPTT use the online nets; ``None`` disables. Checkpoint keys: ``pi`` /
     # ``wm`` store EMA when enabled, with live weights under ``pi_live`` / ``wm_live``.
@@ -2010,9 +2013,13 @@ class Trainer:
             loaded.append(key)
             if missing or unexpected:
                 print(f"resume {key}: missing={list(missing)} unexpected={list(unexpected)}", flush=True)
+        if not any(key in ckpt for key in optimizers):
+            print(
+                "checkpoint has no optimizer state (save_optim=False): optimizer moments restart",
+                flush=True,
+            )
         for key, opt in optimizers.items():
             if key not in ckpt:
-                absent.append(key)
                 continue
             try:
                 opt.load_state_dict(ckpt[key])
@@ -2055,13 +2062,14 @@ class Trainer:
             "critic": self.critic.state_dict(),
             "disc": self.adv_loss.state_dict(),
             "norms": self.norms.state_dict(),
-            "opt_wm": self.opt_wm.state_dict(),
-            "opt_pi": self.opt_pi.state_dict(),
-            "opt_v": self.opt_v.state_dict(),
-            "opt_disc": self.opt_disc.state_dict(),
             "iteration": iteration,
             "cfg": self.cfg.__dict__,
         }
+        if self.cfg.save_optim:
+            ckpt["opt_wm"] = self.opt_wm.state_dict()
+            ckpt["opt_pi"] = self.opt_pi.state_dict()
+            ckpt["opt_v"] = self.opt_v.state_dict()
+            ckpt["opt_disc"] = self.opt_disc.state_dict()
         if pi_live_state is not None:
             ckpt["pi_live"] = pi_live_state
         if wm_live_state is not None:

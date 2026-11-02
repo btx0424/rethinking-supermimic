@@ -34,6 +34,8 @@ adv_coef: 0.0
 reward_coef: 1.0
 contact_coef: 0.01
 ckpt_every: 500
+# Store optimizer moments in checkpoints (~80 MiB). Off keeps weights only.
+save_optim: false
 # Polyak EMA decay β (tau = 1-β) for eval checkpoints (null = off).
 pi_ema: 0.99
 wm_ema: 0.99
