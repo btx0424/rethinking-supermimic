@@ -1,4 +1,9 @@
-"""Fixed-size replay buffer. New transitions replace the oldest."""
+"""Fixed-size replay buffer. New transitions replace the oldest.
+
+Sampling never synchronises with the host: contiguous windows and valid rollout
+starts are indexed once per update by :meth:`ReplayBuffer.prepare`, and the draws
+themselves are plain gathers from those precomputed candidate lists.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +39,8 @@ class ReplayBuffer:
             self.obj1 = None
         self.ptr = 0
         self.filled = 0
+        self._window_candidates: torch.Tensor | None = None
+        self._start_candidates: torch.Tensor | None = None
 
     def add(self, batch: dict[str, torch.Tensor]) -> None:
         i = self.ptr
@@ -55,68 +62,101 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.filled = min(self.filled + 1, self.capacity)
 
-    def _time_env(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.filled < self.capacity:
-            time = torch.randint(0, self.filled, (n,), device=self.device)
-        else:
-            time = torch.randint(0, self.capacity, (n,), device=self.device)
-        env = torch.randint(0, self.num_envs, (n,), device=self.device)
-        return time, env
+    # ------------------------------------------------------------------ candidates
+
+    def _live(self) -> torch.Tensor:
+        """``(capacity, num_envs)`` mask of rows written so far."""
+        if self.filled >= self.capacity:
+            return torch.ones((self.capacity, self.num_envs), dtype=torch.bool, device=self.device)
+        rows = torch.arange(self.capacity, device=self.device)[:, None]
+        return (rows < self.filled).expand(self.capacity, self.num_envs)
+
+    @torch.no_grad()
+    def prepare(
+        self,
+        window: int,
+        start_horizon: int = 0,
+        clip_last: torch.Tensor | None = None,
+    ) -> None:
+        """Index the rows that can start a ``window``-step transition window or an imagined rollout.
+
+        Called once per training iteration; both candidate lists are gathered from
+        afterwards without touching the host. ``clip_last`` (``(capacity, num_envs)``)
+        is the last usable reference frame of the row's clip; starts must leave
+        ``start_horizon`` frames of reference beyond them.
+        """
+        if self.filled < 1:
+            raise RuntimeError("The replay buffer is empty.")
+        live = self._live()
+        step, ep = self.step, self.ep
+
+        # A window start stays inside one episode with consecutive steps.
+        ok = live.clone()
+        for j in range(1, window + 1):
+            same = (
+                torch.roll(live, -j, 0)
+                & (torch.roll(ep, -j, 0) == ep)
+                & (torch.roll(step, -j, 0) == step + j)
+            )
+            ok &= same
+        self._window_candidates = ok.reshape(-1).nonzero().squeeze(-1)
+
+        starts = live
+        if start_horizon > 0 and clip_last is not None:
+            starts = starts & (self.f + start_horizon <= clip_last)
+        self._start_candidates = starts.reshape(-1).nonzero().squeeze(-1)
+
+    def _pick(self, candidates: torch.Tensor | None, n: int, what: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(time, env)`` of ``n`` random entries of a precomputed candidate list.
+
+        Draws with replacement, so the list only has to be non-empty (uniform
+        sampling with replacement, as before). An empty list means the buffer is too
+        short for the requested window or horizon.
+        """
+        if candidates is None:
+            raise RuntimeError("Call ReplayBuffer.prepare before sampling.")
+        if candidates.numel() == 0:
+            raise RuntimeError(
+                f"No valid {what} candidates. The buffer is too short for this "
+                "window/horizon (or no row is a legal start); collect more steps or "
+                "lower wm_window/horizon."
+            )
+        idx = candidates[torch.randint(0, candidates.numel(), (n,), device=self.device)]
+        return idx // self.num_envs, idx % self.num_envs
+
+    # ------------------------------------------------------------------ sampling
 
     def sample_windows(self, batch: int, k: int) -> dict[str, torch.Tensor]:
         if self.filled < k:
             raise RuntimeError(f"Need at least {k} buffered steps, have {self.filled}.")
-        got_t, got_e = [], []
-        guard = 0
-        while sum(t.shape[0] for t in got_t) < batch and guard < 40:
-            guard += 1
-            need = batch - sum(t.shape[0] for t in got_t)
-            # Draw only starts that leave k in-range steps. Gathering first and
-            # rejecting afterwards indexes past the buffer while it is still filling.
-            if self.filled < self.capacity:
-                time = torch.randint(0, self.filled - k + 1, (need * 4,), device=self.device)
-                idx = time[:, None] + torch.arange(k, device=self.device)
-            else:
-                time = torch.randint(0, self.capacity, (need * 4,), device=self.device)
-                idx = (time[:, None] + torch.arange(k, device=self.device)) % self.capacity
-            env = torch.randint(0, self.num_envs, (time.shape[0],), device=self.device)
-            steps = self.step[idx, env[:, None]]
-            eps = self.ep[idx, env[:, None]]
-            continuous = (steps[:, 1:] == steps[:, :1] + torch.arange(1, k, device=self.device)).all(-1)
-            same = (eps == eps[:, :1]).all(-1)
-            take = (continuous & same).nonzero(as_tuple=False).flatten()[:need]
-            got_t.append(time[take])
-            got_e.append(env[take])
-        time = torch.cat(got_t)
-        env = torch.cat(got_e)
-        if time.shape[0] < batch:
-            raise RuntimeError("Could not sample enough contiguous world-model windows.")
+        time, env = self._pick(self._window_candidates, batch, "window")
         if self.filled < self.capacity:
             idx = time[:, None] + torch.arange(k, device=self.device)
         else:
             idx = (time[:, None] + torch.arange(k, device=self.device)) % self.capacity
+        env = env[:, None]
         out = {
-            "s": self.s[idx, env[:, None]],
-            "s1": self.s1[idx, env[:, None]],
-            "body_pos": self.body_pos[idx, env[:, None]],
-            "body_quat": self.body_quat[idx, env[:, None]],
-            "a": self.a[idx, env[:, None]],
-            "a_prev": self.a_prev[idx, env[:, None]],
-            "xi": self.xi[idx, env[:, None]],
-            "c": self.c[idx, env[:, None]],
-            "c1": self.c1[idx, env[:, None]],
-            "f": self.f[idx, env[:, None]],
+            "s": self.s[idx, env],
+            "s1": self.s1[idx, env],
+            "body_pos": self.body_pos[idx, env],
+            "body_quat": self.body_quat[idx, env],
+            "a": self.a[idx, env],
+            "a_prev": self.a_prev[idx, env],
+            "xi": self.xi[idx, env],
+            "c": self.c[idx, env],
+            "c1": self.c1[idx, env],
+            "f": self.f[idx, env],
         }
         if self.obj is not None:
-            out["obj"] = self.obj[idx, env[:, None]]
-            out["obj1"] = self.obj1[idx, env[:, None]]
+            out["obj"] = self.obj[idx, env]
+            out["obj1"] = self.obj1[idx, env]
         return out
 
     def sample_starts(self, batch: int, hist: int) -> dict[str, torch.Tensor]:
         """Current transitions plus an observation history, oldest frame first."""
         if self.filled < 1:
             raise RuntimeError("The replay buffer is empty.")
-        time, env = self._time_env(batch)
+        time, env = self._pick(self._start_candidates, batch, "rollout start")
         offsets = torch.arange(hist - 1, -1, -1, device=self.device)
         if self.filled < self.capacity:
             raw = time[:, None] - offsets
@@ -129,6 +169,8 @@ class ReplayBuffer:
         expected = self.step[time, env][:, None] - offsets
         eps = self.ep[raw, env[:, None]]
         valid = valid & (steps == expected) & (eps == self.ep[time, env][:, None])
+        # Rows before the episode start repeat the episode's first row (mjlab fills
+        # the history buffer with the first observation after a reset).
         for col in range(hist - 2, -1, -1):
             bad = ~valid[:, col]
             raw[bad, col] = raw[bad, col + 1]

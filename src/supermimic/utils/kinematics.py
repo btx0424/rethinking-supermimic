@@ -46,6 +46,21 @@ HAND_BODIES = (
     "R_pinky_intermediate",
 )
 
+# The same five fingertips per hand on the XHand robot (Weave G1-Xhand-OMOMO).
+# One link per finger, the last one before the sensor/tip link.
+XHAND_BODIES = (
+    "left_hand_thumb_rota_link2",
+    "left_hand_index_rota_link2",
+    "left_hand_mid_link2",
+    "left_hand_ring_link2",
+    "left_hand_pinky_link2",
+    "right_hand_thumb_rota_link2",
+    "right_hand_index_rota_link2",
+    "right_hand_mid_link2",
+    "right_hand_ring_link2",
+    "right_hand_pinky_link2",
+)
+
 
 def _hinge_quat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     """Unit-axis hinge: ``axis`` (..., 3), ``angle`` (...)."""
@@ -371,6 +386,40 @@ class TorchKinematics:
         buf = self._buffers(pos.device, pos.dtype)
         hands = buf["hands"]
         return pos[:, hands].reshape(*shape, hands.shape[0], 3)
+
+    def forward_with_hands(
+        self,
+        p: torch.Tensor,
+        quat: torch.Tensor,
+        v: torch.Tensor,
+        w: torch.Tensor,
+        q: torch.Tensor,
+        qd: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """One FK pass for both: tracked bodies plus hand link positions.
+
+        Cache builders need both from the same trajectory; calling :meth:`forward`
+        and :meth:`hands` separately would walk the chain twice.
+        """
+        if not self.hand_ids:
+            raise RuntimeError("No hand bodies configured on this kinematics model.")
+        pos, rot, lin, ang, shape = self._fk_all(p, quat, v, w, q, qd)
+        buf = self._buffers(pos.device, pos.dtype)
+        tracked = buf["tracked"]
+        hands = buf["hands"]
+        return (
+            pos[:, tracked].reshape(*shape, tracked.shape[0], 3),
+            rot[:, tracked].reshape(*shape, tracked.shape[0], 4),
+            lin[:, tracked].reshape(*shape, tracked.shape[0], 3),
+            ang[:, tracked].reshape(*shape, tracked.shape[0], 3),
+            pos[:, hands].reshape(*shape, hands.shape[0], 3),
+        )
 
 
 def make_kinematics(

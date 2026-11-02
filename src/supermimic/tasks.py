@@ -53,6 +53,8 @@ class TaskSpec:
     goal_frames: int = 10
     hist: int = 10
     sim: SimCfg = field(default_factory=SimCfg)
+    # Object tasks: which clip split the motion cache was built from.
+    split: str = "train"
 
     def __post_init__(self) -> None:
         if self.num_joints <= 0:
@@ -176,6 +178,10 @@ class TaskSpec:
         """mjlab ``EntityCfg`` for the free-joint object. Only for object tasks."""
         raise NotImplementedError(f"{self.name} has no object asset.")
 
+    def object_mesh_path(self):
+        """Triangle mesh of the scene object, for playback overlays."""
+        raise NotImplementedError(f"{self.name} has no object asset.")
+
     def compile_model(self):
         """MuJoCo model and hinge-joint names in qpos order."""
         raise NotImplementedError
@@ -246,9 +252,13 @@ class WeaveTask(TaskSpec):
     Finger hinges are independent position actuators, matching the recorded
     joint angles. The scene object mesh matches ``object_name``; the motion
     cache is built from that object's rollout file.
+
+    ``split`` is recorded for parity with :class:`WeaveXHandTask` but does not
+    select a cache: this release ships one rollout file per object, and the
+    cached library keeps its ``motion_lengths`` across both.
     """
 
-    def __init__(self, object_name: str = "smalltable") -> None:
+    def __init__(self, object_name: str = "smalltable", split: str = "train") -> None:
         super().__init__(
             name="weave",
             num_joints=53,
@@ -260,6 +270,7 @@ class WeaveTask(TaskSpec):
             hand_bodies=HAND_BODIES,
             # Finger + object contacts: overflow asked for njmax≈554.
             sim=SimCfg(nconmax=256, njmax=768),
+            split=split,
         )
 
     def compile_model(self):
@@ -281,6 +292,12 @@ class WeaveTask(TaskSpec):
         assert self.object_name is not None
         return object_cfg(self.object_name)
 
+    def object_mesh_path(self):
+        from supermimic.robots.object import object_mesh_path
+
+        assert self.object_name is not None
+        return object_mesh_path(self.object_name)
+
     def action_scale(self, joint_names: tuple[str, ...]) -> list[float]:
         from supermimic.robots.g1_inspire import action_scale
 
@@ -293,15 +310,103 @@ class WeaveTask(TaskSpec):
         return WeaveMotion.load(device=device, objects=(self.object_name,))
 
 
+class WeaveXHandTask(TaskSpec):
+    """XHand G1 plus a primitive-collided free object tracking a G1-Xhand-OMOMO clip.
+
+    Same 53-DoF layout as :class:`WeaveTask` but a different robot asset (XHand
+    instead of Inspire hands) and a different motion release, whose object
+    colliders are fitted primitives (``assets/primitives``) rather than the
+    visual mesh. Hand reward bodies are the XHand fingertips.
+    """
+
+    def __init__(self, object_name: str = "smalltable", split: str = "train") -> None:
+        from supermimic.utils.kinematics import XHAND_BODIES
+
+        super().__init__(
+            name="weave_xhand",
+            num_joints=53,
+            tracked_bodies=TRACKED_BODIES,
+            contact_bodies=TRACKED_BODIES,
+            has_object=True,
+            foot_geom_expr=r"^(left|right)_foot_collision_[1-9]$",
+            object_name=object_name,
+            hand_bodies=XHAND_BODIES,
+            # Same finger + object contact budget as WeaveTask; the arm cylinders
+            # and pelvis mesh do not self-collide, so this stays comfortable.
+            sim=SimCfg(nconmax=256, njmax=768),
+            split=split,
+        )
+        if split not in ("train", "test"):
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}.")
+
+    def compile_model(self):
+        from supermimic.robots.g1_xhand import compile_g1_xhand
+
+        model, names = compile_g1_xhand()
+        if len(names) != self.num_joints:
+            raise RuntimeError(f"XHand model has {len(names)} hinges, expected {self.num_joints}.")
+        return model, names
+
+    def robot_cfg(self):
+        from supermimic.robots.g1_xhand import robot_cfg
+
+        return robot_cfg()
+
+    def object_cfg(self):
+        from supermimic.robots.object_xhand import object_cfg
+
+        assert self.object_name is not None
+        return object_cfg(self.object_name)
+
+    def object_mesh_path(self):
+        from supermimic.motions.weave_xhand import object_mesh_path
+
+        assert self.object_name is not None
+        return object_mesh_path(self.object_name)
+
+    def action_scale(self, joint_names: tuple[str, ...]) -> list[float]:
+        from supermimic.robots.g1_xhand import action_scale
+
+        return action_scale(joint_names)
+
+    def load_motion(self, device: str):
+        from supermimic.motions.weave_xhand import WeaveXHandMotion
+
+        assert self.object_name is not None
+        return WeaveXHandMotion.load(
+            device=device, objects=(self.object_name,), split=self.split
+        )
+
+
 _TASKS: dict[str, type[TaskSpec]] = {
     "lafan1": Lafan1Task,
     "weave": WeaveTask,
+    "weave_xhand": WeaveXHandTask,
 }
 
 
 def get_task(name: str) -> TaskSpec:
     try:
-        return _TASKS[name]()
+        factory = _TASKS[name]
     except KeyError as exc:
         known = ", ".join(sorted(_TASKS))
         raise KeyError(f"Unknown task {name!r}. Available: {known}.") from exc
+    return factory()
+
+
+def make_task(name: str, *, object_name: str | None = None, split: str | None = None) -> TaskSpec:
+    """Task with per-run overrides.
+
+    ``object_name`` and ``split`` apply to the object tasks. ``split`` reaches
+    ``weave_xhand`` only: its cache path is split-tagged, while the older
+    ``weave`` cache holds both splits under one file.
+    """
+    if name not in _TASKS:
+        known = ", ".join(sorted(_TASKS))
+        raise KeyError(f"Unknown task {name!r}. Available: {known}.")
+    kwargs = {}
+    if name in ("weave", "weave_xhand") and object_name is not None:
+        kwargs["object_name"] = object_name
+    if name == "weave_xhand" and split is not None:
+        kwargs["split"] = split
+    return _TASKS[name](**kwargs)

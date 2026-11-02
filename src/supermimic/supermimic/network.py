@@ -228,7 +228,13 @@ class Block(nn.Module):
         return y
 
 class RunningNorm(nn.Module):
-    """Running mean and variance. Updates do not receive gradients."""
+    """Running mean and variance. Updates do not receive gradients.
+
+    The freeze test runs on the device (``torch.where``) when ``no_sync`` is set, so
+    ``update`` never reads ``count`` on the host inside a training iteration.
+    """
+
+    no_sync: bool = False
 
     def __init__(self, dim: int, max_count: float = 2e8, eps: float = 1e-2):
         super().__init__()
@@ -241,16 +247,27 @@ class RunningNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.detach().reshape(-1, x.shape[-1]).float()
-        if self.count >= self.max_count or x.numel() == 0:
+        if x.numel() == 0:
+            return
+        if not self.no_sync and self.count >= self.max_count:
             return
         n = x.shape[0]
         batch_mean = x.mean(0)
         batch_var = x.var(0, unbiased=False)
         total = self.count + n
         delta = batch_mean - self.mean
-        self.mean += delta * n / total
-        self.var = (self.var * self.count + batch_var * n + delta.square() * self.count * n / total) / total
-        self.count = total
+        mean = self.mean + delta * n / total
+        var = (self.var * self.count + batch_var * n + delta.square() * self.count * n / total) / total
+        if self.no_sync:
+            # Frozen past max_count, decided on the device.
+            live = self.count < self.max_count
+            self.mean.copy_(torch.where(live, mean, self.mean))
+            self.var.copy_(torch.where(live, var, self.var))
+            self.count.copy_(torch.where(live, total, self.count))
+        else:
+            self.mean.copy_(mean)
+            self.var.copy_(var)
+            self.count.copy_(total)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
@@ -460,6 +477,10 @@ TRUNK_POLICY_HIDDEN = (512, 512, 512)
 # Goal embedding for per-layer scale and shift. The proprioceptive trunk stays at TRUNK_POLICY_HIDDEN.
 FILM_GOAL_HIDDEN = 256
 
+# Width of the non-joint part of one goal frame: root displacement 3, 6D rotation 6,
+# root linear and angular velocity 3 + 3. The joint blocks follow it.
+GOAL_ROOT_DIM = 15
+
 
 def policy_widths(saved: dict, key: str) -> list[int]:
     """Read encoder or decoder widths from a checkpoint config, with the paper default."""
@@ -471,6 +492,7 @@ def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict, action_dim
     kind = str(saved.get("policy_kind", "split"))
     norm = str(saved.get("policy_norm", "none"))
     stochastic = bool(saved.get("stochastic_actor", False))
+    ref_residual = float(saved.get("ref_residual", 0.0))
     if kind in ("trunk", "film"):
         hidden = [int(width) for width in saved.get("policy_trunk", TRUNK_POLICY_HIDDEN)]
         return Policy(
@@ -482,6 +504,7 @@ def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict, action_dim
             kind=kind,
             trunk_hidden=hidden,
             action_dim=action_dim,
+            ref_residual=ref_residual,
         )
     return Policy(
         obs_dim,
@@ -494,6 +517,7 @@ def build_policy(obs_dim: int, goal_dim: int, hist: int, saved: dict, action_dim
         norm=norm,
         kind="split",
         action_dim=action_dim,
+        ref_residual=ref_residual,
     )
 
 
@@ -564,6 +588,7 @@ class Policy(nn.Module):
         norm: str = "none",
         kind: str = "split",
         action_dim: int = 29,
+        ref_residual: float = 0.0,
     ):
         super().__init__()
         if kind not in ("split", "trunk", "film"):
@@ -571,6 +596,14 @@ class Policy(nn.Module):
         self.hist = hist
         self.stochastic = stochastic
         self.kind = kind
+        # Residual actions: the head predicts a correction on top of the next
+        # reference joint pose read from the goal, so an untrained policy already
+        # commands the reference. ``0`` reproduces the paper's absolute action.
+        self.ref_residual = float(ref_residual)
+        if self.ref_residual > 0:
+            # Filled by ``set_reference_action``: default pose and action scale.
+            self.register_buffer("q_default", torch.zeros(action_dim))
+            self.register_buffer("alpha", torch.ones(action_dim))
         self.encoder = None
         self.decoder = None
         self.trunk = None
@@ -601,8 +634,34 @@ class Policy(nn.Module):
             z = torch.tanh(self.encoder(goal_n))
             mean = self.decoder(torch.cat((z, obs), dim=-1))
         if self.log_std is not None and not deterministic:
-            return mean + self.log_std.exp() * torch.randn_like(mean)
+            mean = mean + self.log_std.exp() * torch.randn_like(mean)
+        if self.ref_residual > 0:
+            mean = mean + self.ref_residual * self._reference_action(goal, mean)
         return mean
+
+    def _reference_action(self, goal: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        """``(q_ref(f+1) - q_default) / alpha`` from the first goal frame.
+
+        ``goal`` is ``(B, K * goal_per_frame)`` and the frames are contiguous, so the
+        first frame's joint block is at ``[GOAL_ROOT_DIM : GOAL_ROOT_DIM + A]``.
+        """
+        del like
+        action_dim = self.q_default.shape[0]
+        q_next = goal[..., GOAL_ROOT_DIM:GOAL_ROOT_DIM + action_dim]
+        if q_next.shape[-1] != action_dim:
+            raise RuntimeError(
+                f"Residual actions need {action_dim} joint columns in the goal, got "
+                f"{q_next.shape[-1]}."
+            )
+        return (q_next - self.q_default) / self.alpha
+
+    @torch.no_grad()
+    def set_reference_action(self, q_default: torch.Tensor, alpha: torch.Tensor) -> None:
+        """Buffers used by residual actions; saved with the state dict."""
+        if self.ref_residual <= 0:
+            return
+        self.q_default.copy_(q_default.to(self.q_default))
+        self.alpha.copy_(alpha.to(self.alpha))
 
     def entropy(self) -> torch.Tensor:
         """Entropy of the state-independent diagonal Gaussian (sum over action dims)."""

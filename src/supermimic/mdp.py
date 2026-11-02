@@ -539,6 +539,8 @@ class MDP:
 
         self._obs_terms = build_obs_terms(self, self.obs_terms)
         self._reward_terms = build_reward_terms(self, self.term_names)
+        # Set by ``compile_heads``; ``imagine_horizon`` reads it to pick the fused path.
+        self.reward_terms_compiled = False
         self.obs_dim = sum(term.dim for term in self._obs_terms)
         self.noise = torch.cat(
             [
@@ -634,6 +636,37 @@ class MDP:
         if terms:
             return reward, parts
         return reward
+
+    def reward_flat(
+        self,
+        state: WorldModelState,
+        frame: torch.Tensor,
+        action: torch.Tensor,
+        a_prev: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """``reward(state, frame, action, a_prev, terms=True)`` with the flat signature.
+
+        Compiling this (see :meth:`compile_heads`) fuses the analytic MDP, including
+        the FK that fills missing body poses, into one graph. A ``WorldModelState`` is
+        not a tensor, so it is unpacked here rather than by ``torch.compile`` itself.
+        """
+        state = self._complete_reward_state(state)
+        parts = {term.name: term(state, action, a_prev, frame) for term in self._reward_terms}
+        reward = parts[self.term_names[0]]
+        for name in self.term_names[1:]:
+            reward = reward + parts[name]
+        return reward, parts
+
+    def compile_heads(self, enabled: bool = True) -> None:
+        """``torch.compile`` the analytic reward head (``compile_mdp``).
+
+        Sets ``reward_terms_compiled`` so `imagine_horizon` takes the fused path.
+        ``compile=False`` leaves everything eager.
+        """
+        self.reward_terms_compiled = bool(enabled)
+        if not enabled:
+            return
+        self.reward_flat = torch.compile(self.reward_flat, mode="default", dynamic=False)
 
     def termination(self, p, quat, frame) -> torch.Tensor:
         height, tilt = self._errors(p, quat, frame)

@@ -128,6 +128,10 @@ class TrainConfig:
     use_amp: bool = True
 
     task: str = "lafan1"
+    # Weave / weave_xhand: which object's motions and collider to train on.
+    object_name: str | None = None
+    # Weave / weave_xhand clip split. Train is the default; test is for evaluation.
+    split: str = "train"
     anchor: str = "pelvis"
     obs_terms: tuple[str, ...] = ()
     reward_style: str = "gaussian"
@@ -462,7 +466,7 @@ class Trainer:
     def __init__(self, cfg: TrainConfig, log_dir: Path | str):
         from supermimic.utils.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
-        from supermimic.tasks import get_task
+        from supermimic.tasks import make_task
 
         self.cfg = cfg
         self.log_dir = Path(log_dir)
@@ -470,7 +474,7 @@ class Trainer:
         self.device = torch.device(cfg.device)
         torch.manual_seed(cfg.seed)
 
-        self.task = get_task(cfg.task)
+        self.task = make_task(cfg.task, object_name=cfg.object_name, split=cfg.split)
         self.motion = self.task.load_motion(str(self.device))
         model, names = self.task.compile_model()
         self.kin = make_kinematics(

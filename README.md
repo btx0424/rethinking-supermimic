@@ -58,11 +58,32 @@ Scrub the reference motions in a browser (Viser, default http://localhost:8080):
 ```bash
 PYTHONPATH=src python -m supermimic.utils.viz_motion --dataset lafan1
 PYTHONPATH=src python -m supermimic.utils.viz_motion --dataset weave --objects smalltable smallbox
+PYTHONPATH=src python -m supermimic.utils.viz_motion --dataset weave_xhand --objects smalltable
 ```
 
 Useful flags: `--port`, `--hz` (viewer refresh; clips always step at 50 Hz), `--split {train,test}`
-and `--max-clips` (Weave only). The same viewer is reachable programmatically as
-`Lafan1Motion.viser_play()` / `WeaveMotion.viser_play()`.
+and `--max-clips` (object datasets only). The same viewer is reachable programmatically as
+`Lafan1Motion.viser_play()` / `WeaveMotion.viser_play()` / `WeaveXHandMotion.viser_play()`.
+
+### Weave XHand (newer release)
+
+The XHand release is a separate dataset with a different robot and primitive-fitted object
+colliders. Its robot is committed as a ready-to-load MuJoCo model,
+`robot_assets/unitree_g1/g1_29dof_rev_1_0_xhand.xml`, with XHand-specific meshes (hands and
+wrist adapter) in `robot_assets/unitree_g1/meshes/g1_xhand/` — the G1 body meshes it needs were
+already in the parent `meshes/` directory byte-identically, so nothing is duplicated. The vendored
+URDF sits next to the XML as the source of truth; `python -m supermimic.robots.g1_xhand`
+regenerates the XML from it. Only the motions and object assets are external:
+
+```bash
+export WEAVE_XHAND_ROOT=/path/to/G1-Xhand-OMOMO   # contains assets/ and motions/
+```
+
+It is 8 objects × ~250–370 clips at 30 Hz, resampled to 50 Hz and cached per object and split as
+`data/weave_xhand_<objects>_<split>.npz`. The release has no official train/test split, so every
+fifth clip (20%) is held out for evaluation (`split=test`). Objects use the release's primitives
+(boxes / cylinders / capsules) for collision instead of the visual mesh, with density 200 kg/m³
+(25 for `largebox`) — 0.16–6.6 kg per object.
 
 ## Train, play, evaluate
 
@@ -72,12 +93,14 @@ and `--max-clips` (Weave only). The same viewer is reachable programmatically as
 PYTHONPATH=src python -m supermimic.train
 PYTHONPATH=src python -m supermimic.train algo=nablamimic
 PYTHONPATH=src python -m supermimic.train task=weave
+PYTHONPATH=src python -m supermimic.train task=weave_xhand object_name=smallbox
 ```
 
 Hydra writes each run under `logs/<swanlab.experiment>/<timestamp>/` (`ckpt_*.pt`, `train_log.csv`,
 `config.yaml`). `algo=` selects the trainer (see [Algorithms](#algorithms)); `task=` selects
-`lafan1` or `weave`. Any config key can be overridden on the command line, e.g.
-`wm_ema=null`, `imagine_wm=ema`, `iterations=5000`.
+`lafan1`, `weave`, or `weave_xhand`, and `object_name=` picks the object task's clip set. Any config
+key can be overridden on the command line, e.g. `wm_ema=null`, `imagine_wm=ema`,
+`iterations=5000`, `save_optim=true`.
 
 ### Play
 

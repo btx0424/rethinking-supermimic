@@ -19,12 +19,26 @@ from supermimic.mdp import (
 )
 from supermimic.motion import CONTROL_DT, MotionLib
 from supermimic.sim import TrackingSim
-from supermimic.tasks import get_task
+from supermimic.tasks import TaskSpec, make_task
 from supermimic.supermimic.network import InputNorms, build_policy
 
 
+def _task_from_cfg(saved_cfg: dict) -> TaskSpec:
+    """Task from a checkpoint config, keeping its object choice.
+
+    ``weave_xhand`` is evaluated on its held-out test split; ``weave`` keeps the
+    split it trained on, because its cache is not split-tagged.
+    """
+    name = str(saved_cfg.get("task", "lafan1"))
+    return make_task(
+        name,
+        object_name=saved_cfg.get("object_name"),
+        split="test" if name == "weave_xhand" else None,
+    )
+
+
 def _build_sim(saved_cfg: dict, num_envs: int, device: str) -> TrackingSim:
-    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    task = _task_from_cfg(saved_cfg)
     motion = task.load_motion(device)
     model, names = task.compile_model()
     kin = make_kinematics(
@@ -104,7 +118,7 @@ def evaluate_supermimic(
     live: bool,
     progress: bool,
 ) -> None:
-    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    task = _task_from_cfg(saved_cfg)
     motion = task.load_motion(device)
     n = motion.num_clips
     sim = _build_sim(saved_cfg, n, device)
@@ -144,7 +158,7 @@ def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progr
     from supermimic.sac.network import NormalActor
     from supermimic.utils.nn import ObsVecNorm
 
-    task = get_task(str(saved_cfg.get("task", "lafan1")))
+    task = _task_from_cfg(saved_cfg)
     motion = task.load_motion(device)
     n = motion.num_clips
     sim = _build_sim(saved_cfg, n, device)

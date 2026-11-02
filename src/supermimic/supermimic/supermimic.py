@@ -49,7 +49,7 @@ from supermimic.algos.network import (
     critic_forward,
 )
 from supermimic.algos.reward_norm import RewardNormalizer
-from supermimic.tasks import TaskSpec, get_task
+from supermimic.tasks import TaskSpec, make_task
 from supermimic.utils import experiment_log
 
 
@@ -93,6 +93,10 @@ class TrainConfig:
     policy_kind: str = "split"
     policy_trunk: tuple[int, ...] = (512, 512, 512)
     task: str = "lafan1"
+    # Weave / weave_xhand: which object's motions and collider to train on.
+    object_name: str | None = None
+    # Weave / weave_xhand clip split. Train is the default; test is for evaluation.
+    split: str = "train"
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -148,6 +152,17 @@ class TrainConfig:
     # adam | muon. Muon covers hidden 2D weights of the world model and the policy.
     # The first Linear, the output head, biases, and the critic stay Adam.
     optim: str = "muon"
+    # Residual actions (0 = the paper's absolute action). The policy head predicts a
+    # correction on top of the next reference joint pose read from the goal, so an
+    # untrained policy already commands the reference.
+    ref_residual: float = 0.0
+    # Keep gradient norms and the finite-check on the device so no CPU<->GPU sync
+    # happens inside an iteration. Gradient norms reach the logs as tensors.
+    no_host_sync: bool = True
+    # Compile the analytic MDP heads (reward, termination, observation, goal) plus
+    # the per-step imagination reward; they are otherwise eager, thousands of small
+    # kernels per iteration.
+    compile_mdp: bool = True
     # ``scalar`` regresses with MSE. ``classification`` is HL-Gauss cross-entropy;
     # GAE and the policy bootstrap use the expected atom value.
     critic_kind: str = "scalar"
@@ -240,8 +255,10 @@ def _mean(xs: list) -> float:
     """Host mean. CUDA tensors are reduced on-device and synced once here (log time)."""
     if not xs:
         return 0.0
-    if isinstance(xs[0], torch.Tensor):
-        return float(torch.stack([x.detach().reshape(()) for x in xs]).mean())
+    if any(isinstance(x, torch.Tensor) for x in xs):
+        device = next(x.device for x in xs if isinstance(x, torch.Tensor))
+        stacked = torch.stack([torch.as_tensor(x, device=device, dtype=torch.float32).detach().reshape(()) for x in xs])
+        return float(stacked.mean())
     return sum(xs) / len(xs)
 
 
@@ -257,13 +274,6 @@ def _term_score(
     if name in ("action_rate", "joint_limit"):
         return value / CONTROL_DT
     return value / (REWARD_TERM_WEIGHT[style][name] * CONTROL_DT)
-
-
-def _grad_norm(params) -> float:
-    grads = [p.grad.detach() for p in params if p.grad is not None]
-    if not grads:
-        return 0.0
-    return float(nn.utils.get_total_norm(grads))
 
 
 def _grads_norm(grads: list[torch.Tensor | None]) -> float:
@@ -288,15 +298,39 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b) / denom)
 
 
-def _clip_grads(params, max_norm: float | None, max_value: float | None = None) -> float:
-    """Return total grad norm (pre-clip). Clip only when limits are set and positive."""
+def _clip_grads(
+    params,
+    max_norm: float | None,
+    max_value: float | None = None,
+    no_sync: bool = False,
+) -> float | torch.Tensor:
+    """Total grad norm (pre-clip). Clip only when limits are set and positive.
+
+    ``no_sync`` keeps the norm on the device as a 0-dim tensor and, when a
+    non-finite norm is found, zeroes the gradients in place instead of letting the
+    caller branch on the host. Callers that only log the value can pass it to
+    ``_mean``, which syncs once at log time.
+    """
     params = list(params)
-    norm = _grad_norm(params)
+    if not params:
+        return 0.0
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    norm = nn.utils.get_total_norm(grads)
     if max_norm is not None and max_norm > 0:
         nn.utils.clip_grad_norm_(params, max_norm)
     if max_value is not None and max_value > 0:
         nn.utils.clip_grad_value_(params, max_value)
-    return norm
+    if not no_sync:
+        return float(norm)
+    finite = torch.isfinite(norm)
+    # Non-finite gradient: scale every gradient tensor by the boolean, on-device,
+    # so the guard never has to read the value on the host.
+    mask = finite.to(dtype=grads[0].dtype)
+    for g in grads:
+        g.mul_(mask)
+    return norm.detach()
 
 
 class MSELoss(nn.Module):
@@ -710,14 +744,14 @@ def imagine_horizon(
     object_state = _flatten_object_time(states[1:]) if mdp.task.has_object else None
     obj_fields = object_state if object_state is not None else (None, None, None, None)
     reward_state = WorldModelState(*flat, None, None, *obj_fields)
-    reward, term_parts = mdp.reward(
-        reward_state,
-        _stack(frames[1:]),
-        _stack(actions),
-        _stack(prev_actions),
-        terms=True,
-    )
-    done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
+    frames_flat = _stack(frames[1:])
+    actions_flat = _stack(actions)
+    prev_flat = _stack(prev_actions)
+    if getattr(mdp, "reward_terms_compiled", False):
+        reward, term_parts = mdp.reward_flat(reward_state, frames_flat, actions_flat, prev_flat)
+    else:
+        reward, term_parts = mdp.reward(reward_state, frames_flat, actions_flat, prev_flat, terms=True)
+    done = mdp.soft_termination(flat[0], flat[1], frames_flat)
     reward = reward.view(horizon, batch)
     done = done.view(horizon, batch)
     term_raw = torch.stack([term_parts[name] for name in term_names]).view(len(term_names), horizon, batch)
@@ -806,12 +840,12 @@ class Trainer:
         torch.backends.cuda.matmul.allow_tf32 = cfg.amp == "none"
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high" if cfg.amp == "none" else "highest")
-        if cfg.compile:
+        if cfg.compile or cfg.compile_mdp:
             import torch._functorch.config as functorch_config
 
             functorch_config.donated_buffer = False
 
-        self.task = get_task(cfg.task)
+        self.task = make_task(cfg.task, object_name=cfg.object_name, split=cfg.split)
         self.motion = self.task.load_motion(self.device)
         model, names = self.task.compile_model()
         self.kin = make_kinematics(
@@ -834,6 +868,9 @@ class Trainer:
             reward_style=cfg.reward_style,
             task=self.task,
         )
+        if cfg.compile_mdp:
+            # The reward runs over H*B predicted states every iteration, eagerly.
+            self.sim.mdp.compile_heads(True)
         probe = self.motion.goal(self.motion.clip_start[:1].to(self.device), self.task.goal_frames)
         if probe.shape[-1] != self.task.goal_dim:
             raise RuntimeError(
@@ -903,7 +940,12 @@ class Trainer:
             norm=cfg.policy_norm,
             kind=cfg.policy_kind,
             action_dim=self.task.num_joints,
+            ref_residual=cfg.ref_residual,
         ).to(self.device)
+        if cfg.ref_residual > 0:
+            # Scale by the robot's per-joint action scale so the head's output is in
+            # the same units as the absolute action it replaces.
+            self.policy.set_reference_action(self.sim.default_q, self.sim.action_scale)
         self.pi_ema_tau = 1.0 - cfg.pi_ema if cfg.pi_ema is not None else None
         if self.pi_ema_tau is not None:
             self.policy_ema = copy.deepcopy(self.policy)
@@ -957,6 +999,8 @@ class Trainer:
         else:
             raise ValueError(f"critic_kind must be 'scalar' or 'classification', got {cfg.critic_kind!r}.")
         self.norms = InputNorms(obs_dim, self.task).to(self.device)
+        # Device-side freeze checks in the normalizers (``no_host_sync``).
+        network.RunningNorm.no_sync = cfg.no_host_sync
         from supermimic.utils.optim import build_optimizer
 
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
@@ -1097,13 +1141,21 @@ class Trainer:
                 self.timing[key].append(0.0)
             return
 
+        # One index build per iteration; sampling below is pure gathers.
+        log_now = (iteration + 1) % cfg.log_every == 0
+        motion = self.sim.mdp.motion
+        clip_last = (motion.clip_end[motion.clip_id] - 1)[self.buffer.f]
+        self.buffer.prepare(
+            cfg.wm_window, start_horizon=cfg.horizon, clip_last=clip_last
+        )
+
         with timed(self.device):
-            wm_loss, err8, gn_wm, disc_stats = self.update_world_model()
+            wm_loss, err8, gn_wm, disc_stats = self.update_world_model(log_now=log_now)
         self.timing["wm"].append(timed.last)
 
         # Freeze WM/V params through imagine + policy backward (not torch.no_grad:
         # π must still differentiate through dynamics and ∂V/∂s).
-        diagnose_reward = (iteration + 1) % cfg.log_every == 0
+        diagnose_reward = log_now
         policy_wm = self.policy_wm()
         with hold_out_net(policy_wm), hold_out_net(self.critic):
             start = self.sample_policy_starts()
@@ -1204,7 +1256,8 @@ class Trainer:
                     _term_score(name, value.mean().detach(), style)
                 )
             done = out["done"]
-            # One intentional sync for the Python branch.
+            # Episode statistics are per-episode, so the branch needs one host read.
+            # ``no_host_sync`` cannot remove it without dropping those logs.
             if bool(done.any().item()):
                 length = out["ep_len"][done].float().clamp(min=1)
                 self.stats["ep"].append(
@@ -1214,14 +1267,17 @@ class Trainer:
                     self.stats["ep_terms"][name].append(
                         _term_score(name, (value[done] / length).mean().detach(), style)
                     )
-                # Already synced above; host floats are fine for rare episode counts.
-                self.stats["term"].append(float(out["d"][done].float().sum()))
-                self.stats["done_n"].append(float(done.sum()))
+                self.stats["term"].append(out["d"][done].float().sum())
+                self.stats["done_n"].append(done.float().sum())
 
     def update_world_model(
-        self,
+        self, log_now: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, torch.Tensor]]:
-        """Fit the WM on MSE plus optional adversarial and reward-L1 terms, then step D."""
+        """Fit the WM on MSE plus optional adversarial and reward-L1 terms, then step D.
+
+        ``log_now`` gates the terms that only feed the logs (contact precision/recall,
+        the discriminator probe) so they cost nothing on other iterations.
+        """
         cfg = self.cfg
         loss = err8 = None
         norms: list[float] = []
@@ -1247,7 +1303,10 @@ class Trainer:
                 mse, err8 = self.mse_loss(errors)
                 contact_target = batch["c1"].transpose(0, 1)
                 contact_loss = contact_bce(contact_logits, contact_target)
-                contact_prec, contact_recall = contact_precision_recall(contact_logits, contact_target)
+                if log_now:
+                    contact_prec, contact_recall = contact_precision_recall(
+                        contact_logits.detach(), contact_target
+                    )
             if use_reward:
                 reward_l1 = self.reward_l1(preds, batch, obj_preds)
             else:
@@ -1274,38 +1333,50 @@ class Trainer:
                 norms.append(0.0)
             else:
                 loss.backward()
-                norms.append(_clip_grads(self.wm.parameters(), cfg.grad_clip_norm))
+                norms.append(
+                    _clip_grads(self.wm.parameters(), cfg.grad_clip_norm, no_sync=cfg.no_host_sync)
+                )
                 self.opt_wm.step()
                 if self.wm_ema_tau is not None and self.wm_ema is not None:
                     soft_copy_(self.wm, self.wm_ema, self.wm_ema_tau)
             mse_losses.append(mse.detach())
             reward_losses.append(reward_l1.detach())
             contact_losses.append(contact_loss.detach())
-            contact_precs.append(contact_prec)
-            contact_recalls.append(contact_recall)
+            if log_now:
+                contact_precs.append(contact_prec)
+                contact_recalls.append(contact_recall)
 
             # Features for D are detached. With coef 0 this is also the logged generator loss.
-            d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
-            adv_losses.append(adv.detach() if use_adv else adv_det)
-            disc_losses.append(d_loss)
-            disc_reals.append(d_real)
-            disc_fakes.append(d_fake)
-            disc_accs.append(d_acc)
+            if use_adv or log_now:
+                d_loss, d_real, d_fake, d_acc, adv_det = self.update_discriminator(saved)
+                adv_losses.append((adv if use_adv else adv_det).detach())
+                if log_now:
+                    disc_losses.append(d_loss)
+                    disc_reals.append(d_real)
+                    disc_fakes.append(d_fake)
+                    disc_accs.append(d_acc)
+            else:
+                adv_losses.append(adv.detach())
         assert loss is not None and err8 is not None
         mse_mean = torch.stack(mse_losses).mean()
         adv_mean = torch.stack(adv_losses).mean()
         reward_mean = torch.stack(reward_losses).mean()
+
+        def _opt_mean(xs: list[torch.Tensor]) -> torch.Tensor:
+            # Terms gated by ``log_now`` may be absent on this iteration.
+            return torch.stack(xs).mean() if xs else mse_mean.new_zeros(())
+
         disc_stats = {
-            "loss": torch.stack(disc_losses).mean(),
-            "real": torch.stack(disc_reals).mean(),
-            "fake": torch.stack(disc_fakes).mean(),
-            "acc": torch.stack(disc_accs).mean(),
+            "loss": _opt_mean(disc_losses),
+            "real": _opt_mean(disc_reals),
+            "fake": _opt_mean(disc_fakes),
+            "acc": _opt_mean(disc_accs),
             "mse": mse_mean,
             "adv": adv_mean,
             "reward": reward_mean,
             "contact": torch.stack(contact_losses).mean(),
-            "contact_prec": torch.stack(contact_precs).mean(),
-            "contact_recall": torch.stack(contact_recalls).mean(),
+            "contact_prec": _opt_mean(contact_precs),
+            "contact_recall": _opt_mean(contact_recalls),
         }
         total = mse_mean + cfg.adv_coef * adv_mean + cfg.reward_coef * reward_mean + cfg.contact_coef * disc_stats["contact"]
         return total, err8, _mean(norms), disc_stats
@@ -1400,21 +1471,12 @@ class Trainer:
         return self.mse_loss(errors)
 
     def sample_policy_starts(self) -> dict[str, torch.Tensor]:
-        cfg = self.cfg
-        motion = self.sim.mdp.motion
-        pieces = []
-        guard = 0
-        while sum(p["s"].shape[0] for p in pieces) < cfg.pi_batch and guard < 40:
-            guard += 1
-            start = self.buffer.sample_starts(cfg.pi_batch * 2, HIST)
-            last = motion.clip_end[motion.clip_id[start["f"]]] - 1
-            keep = (start["f"] + cfg.horizon <= last).nonzero(as_tuple=False).flatten()
-            keep = keep[: cfg.pi_batch - sum(p["s"].shape[0] for p in pieces)]
-            pieces.append({key: value[keep] for key, value in start.items()})
-        out = {key: torch.cat([p[key] for p in pieces]) for key in pieces[0]}
-        if out["s"].shape[0] < cfg.pi_batch:
-            raise RuntimeError("Could not sample enough imagination starts inside the clips.")
-        return out
+        """Rollout starts, filtered by :meth:`ReplayBuffer.prepare` to leave ``horizon`` frames.
+
+        No host synchronisation and no retry loop: the candidate list already holds
+        every start whose reference clip continues for the whole imagination window.
+        """
+        return self.buffer.sample_starts(self.cfg.pi_batch, HIST)
 
     def policy_wm(self) -> WorldModel:
         """World model used for policy imagination BPTT (``cfg.imagine_wm``)."""
@@ -1614,7 +1676,7 @@ class Trainer:
         pi_loss: torch.Tensor,
         term_losses: dict[str, torch.Tensor] | None = None,
         diagnose_reward: bool = False,
-    ) -> float:
+    ) -> torch.Tensor | float:
         """Policy step. On log iterations, also measure ||∇_θ L_k|| per reward term."""
         cfg = self.cfg
         params = [p for p in self.policy.parameters() if p.requires_grad]
@@ -1634,11 +1696,13 @@ class Trainer:
                 self.agg["reward_grad_boot"].append(0.0)
         self.opt_pi.zero_grad(set_to_none=True)
         pi_loss.backward()
-        grad_norm = _clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_value)
-        if math.isfinite(grad_norm):
-            self.opt_pi.step()
-            if self.pi_ema_tau is not None and self.policy_ema is not None:
-                soft_copy_(self.policy, self.policy_ema, self.pi_ema_tau)
+        grad_norm = _clip_grads(
+            params, cfg.grad_clip_norm, cfg.grad_clip_value, no_sync=cfg.no_host_sync
+        )
+        # A non-finite gradient was zeroed on the device above, so the step is safe.
+        self.opt_pi.step()
+        if self.pi_ema_tau is not None and self.policy_ema is not None:
+            soft_copy_(self.policy, self.policy_ema, self.pi_ema_tau)
         return grad_norm
 
     def update_critic(self, batch: dict) -> tuple[torch.Tensor, float, torch.Tensor]:

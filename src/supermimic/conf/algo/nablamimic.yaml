@@ -23,6 +23,9 @@ lr_decay_iters: 250000
 wm_norm: rms
 wm_residual: false
 wm_frame: pelvis
+ref_residual: 0.0
+no_host_sync: true
+compile_mdp: true
 stochastic_actor: false
 grad_clip_norm: 1.0
 # NablaMimic also clips element-wise at 0.1 on the regression Adam.

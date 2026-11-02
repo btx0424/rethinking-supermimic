@@ -23,7 +23,7 @@ from supermimic.utils.kinematics import make_kinematics
 from supermimic.mdp import GOAL_FRAMES, HIST, PAPER_OBS_TERMS, WorldModelState
 from supermimic.motion import MotionLib
 from supermimic.supermimic.network import InputNorms, build_policy
-from supermimic.tasks import TaskSpec, get_task
+from supermimic.tasks import TaskSpec, make_task
 
 # Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
 _REF_RGB = (40, 120, 255)
@@ -89,9 +89,15 @@ def _resolve_task(ckpt: Path | None, task_name: str | None) -> tuple[TaskSpec, d
     if ckpt is not None:
         saved = torch.load(ckpt, map_location="cpu", weights_only=False)
         saved_cfg = dict(saved.get("cfg", {}))
-        name = str(saved_cfg.get("task", task_name or "lafan1"))
-        return get_task(name), saved_cfg
-    return get_task(task_name or "lafan1"), saved_cfg
+        return (
+            make_task(
+                str(saved_cfg.get("task", task_name or "lafan1")),
+                object_name=saved_cfg.get("object_name"),
+                split=saved_cfg.get("split"),
+            ),
+            saved_cfg,
+        )
+    return make_task(str(task_name or "lafan1")), saved_cfg
 
 
 @dataclass
@@ -284,18 +290,15 @@ class ObjectMesh:
     def __init__(
         self,
         server: viser.ViserServer,
-        object_name: str,
+        mesh_path: Path,
         *,
         name: str,
         rgb: tuple[int, int, int],
         opacity: float | None = None,
     ):
-        from supermimic.robots.object import object_mesh_path
-
         import trimesh
 
-        path = object_mesh_path(object_name)
-        mesh = trimesh.load(path, force="mesh")
+        mesh = trimesh.load(mesh_path, force="mesh")
         if not isinstance(mesh, trimesh.Trimesh):
             mesh = mesh.dump(concatenate=True)
         self.handle = server.scene.add_mesh_simple(
@@ -346,9 +349,10 @@ def play(
     obj_policy: ObjectMesh | None = None
     if has_object:
         assert task.object_name is not None
+        mesh_path = task.object_mesh_path()
         obj_ref = ObjectMesh(
             server,
-            task.object_name,
+            mesh_path,
             name="/reference_object",
             rgb=_OBJ_REF_RGB,
             opacity=_REF_ALPHA if overlay else None,
@@ -356,7 +360,7 @@ def play(
         if overlay:
             obj_policy = ObjectMesh(
                 server,
-                task.object_name,
+                mesh_path,
                 name="/policy_object",
                 rgb=_OBJ_POLICY_RGB,
                 opacity=None,

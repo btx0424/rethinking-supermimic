@@ -22,6 +22,13 @@ lr_decay_iters: 250000
 wm_norm: rms
 wm_residual: false
 wm_frame: pelvis
+# Residual actions: 0 = paper absolute action; 1.0 = head predicts a correction on
+# top of the next reference joint pose (an untrained policy already tracks).
+ref_residual: 0.0
+# Keep gradient norms / finite checks on the GPU (no host sync inside an iteration).
+no_host_sync: true
+# torch.compile the analytic MDP heads (reward / FK) used in imagination.
+compile_mdp: true
 stochastic_actor: false
 grad_clip_norm: 1.0
 grad_clip_value: null

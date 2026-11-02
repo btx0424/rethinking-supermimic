@@ -28,7 +28,11 @@ obs:
   object_ori: false
 
 # lafan1: mjlab G1, 29 hinges. weave: inspire-hand G1 plus a free-joint object.
+# weave_xhand: XHand G1 plus a primitive-collided free object.
 task: lafan1
+# Object task only: which object to track, and which clip split to train on.
+object_name: null
+split: train
 anchor: pelvis
 reward_style: gaussian
 

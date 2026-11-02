@@ -390,7 +390,9 @@ class NablaTrainer(Trainer):
             gn_pi,
         )
 
-    def _action_target_update(self, g: dict, iteration: int) -> tuple[torch.Tensor, float]:
+    def _action_target_update(
+        self, g: dict, iteration: int
+    ) -> tuple[torch.Tensor, float | torch.Tensor]:
         """Form PODS targets from ∂J/∂a and regress π for ``action_target_steps``."""
         cfg = self.cfg
         actions: list[torch.Tensor] = g["actions"]
@@ -437,7 +439,7 @@ class NablaTrainer(Trainer):
         mb = min(cfg.action_target_batch, nfill * h * b)
         w_err = action_scale
         last_loss = obs_ins.new_zeros(())
-        gn = 0.0
+        last_gn: float | torch.Tensor = 0.0
         params = [p for p in self.policy.parameters() if p.requires_grad]
         for _ in range(cfg.action_target_steps):
             si = torch.randint(nfill, (mb,), device=obs_ins.device)
@@ -453,11 +455,14 @@ class NablaTrainer(Trainer):
             loss = (wb * err.square().mean(dim=-1)).sum() / denom
             self.opt_pi.zero_grad(set_to_none=True)
             loss.backward()
-            gn = _clip_grads(params, cfg.grad_clip_norm, cfg.grad_clip_value)
-            if math.isfinite(gn):
-                self.opt_pi.step()
+            gn = _clip_grads(
+                params, cfg.grad_clip_norm, cfg.grad_clip_value, no_sync=cfg.no_host_sync
+            )
+            # A non-finite gradient was zeroed on the device, so the step is safe.
+            self.opt_pi.step()
             last_loss = loss.detach()
-        return last_loss, gn
+            last_gn = gn
+        return last_loss, last_gn
 
 
 def run(cfg: NablaTrainConfig, log_dir) -> None:

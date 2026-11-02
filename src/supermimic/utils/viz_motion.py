@@ -1,4 +1,4 @@
-"""Viser playback for LAFAN1 or Weave reference motions."""
+"""Viser playback for LAFAN1, Weave, and Weave-XHand reference motions."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        choices=("lafan1", "weave"),
+        choices=("lafan1", "weave", "weave_xhand"),
         default="lafan1",
         help="Which Motion loader to visualize.",
     )
@@ -21,25 +21,26 @@ def main() -> None:
         "--objects",
         nargs="+",
         default=["smalltable", "smallbox"],
-        help="Weave object subset (ignored for lafan1).",
+        help="Object subset (ignored for lafan1).",
     )
     parser.add_argument("--split", choices=("train", "test"), default="train")
     parser.add_argument(
         "--max-clips",
         type=int,
         default=200,
-        help="Cap clips loaded for Weave (lafan1 uses the full cache).",
+        help="Cap clips loaded for the object datasets (lafan1 uses the full cache).",
     )
     args = parser.parse_args()
 
     motion = get_motion(args.dataset)
     session_kwargs: dict = {}
-    if args.dataset == "weave":
+    if args.dataset != "lafan1":
         session_kwargs = {
             "objects": tuple(args.objects),
-            "split": args.split,
-            "max_clips": args.max_clips,
         }
+        if args.dataset == "weave_xhand":
+            session_kwargs["max_clips"] = args.max_clips
+            session_kwargs["split"] = args.split
     motion.viser_play(port=args.port, hz=args.hz, **session_kwargs)
 
 

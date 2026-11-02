@@ -7,10 +7,12 @@ from typing import Type
 from .base import Motion
 from .lafan1 import Lafan1Motion
 from .weave import WeaveMotion
+from .weave_xhand import WeaveXHandMotion
 
 MOTION_REGISTRY: dict[str, Type[Motion]] = {
     Lafan1Motion.name: Lafan1Motion,
     WeaveMotion.name: WeaveMotion,
+    WeaveXHandMotion.name: WeaveXHandMotion,
 }
 
 
@@ -26,6 +28,7 @@ __all__ = [
     "Motion",
     "Lafan1Motion",
     "WeaveMotion",
+    "WeaveXHandMotion",
     "MOTION_REGISTRY",
     "get_motion",
 ]

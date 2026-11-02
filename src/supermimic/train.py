@@ -9,11 +9,14 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from supermimic.mdp import resolve_obs_terms
-from supermimic.tasks import get_task
+from supermimic.tasks import make_task
 
 
 def _obs_terms(cfg: DictConfig) -> tuple[str, ...]:
-    task = get_task(str(cfg.get("task", "lafan1")))
+    task = make_task(
+        str(cfg.get("task", "lafan1")),
+        object_name=cfg.get("object_name"),
+    )
     chosen = [name for name, enabled in cfg.obs.items() if enabled]
     if task.has_object:
         for name in ("object_pos", "object_ori"):
@@ -63,6 +66,9 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         policy_decoder=tuple(int(width) for width in cfg.actor.get("decoder", [2048, 1024, 512, 256])),
         policy_trunk=tuple(int(width) for width in cfg.actor.get("hidden", [512, 512, 512])),
         policy_norm=str(cfg.actor.norm),
+        ref_residual=float(cfg.get("ref_residual", 0.0)),
+        no_host_sync=bool(cfg.get("no_host_sync", True)),
+        compile_mdp=bool(cfg.get("compile_mdp", True)),
         anchor=str(cfg.anchor),
         obs_terms=_obs_terms(cfg),
         reward_style=str(cfg.reward_style),
@@ -93,6 +99,8 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         wm_ema=_parse_ema(cfg, "wm_ema", 0.99),
         imagine_wm=str(cfg.get("imagine_wm", "live")),
         task=str(cfg.get("task", "lafan1")),
+        object_name=None if cfg.get("object_name") is None else str(cfg.object_name),
+        split=str(cfg.get("split", "train")),
     )
 
 
@@ -172,6 +180,8 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
         swanlab_experiment=_experiment_name(run_dir),
         pi_ema=_parse_ema(cfg, "pi_ema", 0.995),
         task=str(cfg.get("task", "lafan1")),
+        object_name=None if cfg.get("object_name") is None else str(cfg.object_name),
+        split=str(cfg.get("split", "train")),
     )
 
 
