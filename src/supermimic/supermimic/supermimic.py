@@ -97,6 +97,9 @@ class TrainConfig:
     object_name: str | None = None
     # Weave / weave_xhand clip split. Train is the default; test is for evaluation.
     split: str = "train"
+    # weave_xhand only: hand colliders as fitted box/cylinder primitives instead of
+    # the collider meshes (see ``supermimic.robots.xhand_primitives``).
+    simple_hands: bool = False
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -845,7 +848,12 @@ class Trainer:
 
             functorch_config.donated_buffer = False
 
-        self.task = make_task(cfg.task, object_name=cfg.object_name, split=cfg.split)
+        self.task = make_task(
+            cfg.task,
+            object_name=cfg.object_name,
+            split=cfg.split,
+            simple_hands=cfg.simple_hands,
+        )
         self.motion = self.task.load_motion(self.device)
         model, names = self.task.compile_model()
         self.kin = make_kinematics(

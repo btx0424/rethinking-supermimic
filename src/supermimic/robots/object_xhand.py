@@ -8,10 +8,9 @@ geometry convex and cheap, which is what the release's Isaac task does.
 
 The visual mesh is still attached, with ``contype=0`` so it never collides.
 
-Mass follows ``g1_hoi_learning``'s ``COMMON_MASS_PROPS``: density 200 kg/m³ on the
-primitive volume, except ``largebox`` at 25 (≈1 kg in that task's note). That
-yields 0.16–6.6 kg here — heavy enough to be moved by the fingers, unlike the
-22 kg a mesh-density table would give.
+Mass is fixed at :data:`OBJECT_MASS` (0.2 kg) for every object, matching the older
+``weave`` task and ``object_hoi``'s Isaac ``set_masses(0.2)``. Primitive volume only
+sets the inertia distribution: the density-derived mass is scaled to the target.
 """
 
 from __future__ import annotations
@@ -23,9 +22,9 @@ import numpy as np
 from mjlab.entity import EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
-# Per-object density, matching g1_hoi_learning.objects.object_cfg.
-OBJECT_DENSITY: dict[str, float] = {"largebox": 25.0}
-DEFAULT_DENSITY = 200.0
+# Same light HOI mass as ``weave`` / object_hoi, so the objects move under finger
+# contact instead of the 22 kg a mesh-density table would give.
+OBJECT_MASS = 0.2
 OBJECT_NAME = "object"
 FREE_JOINT = "object_freejoint"
 
@@ -56,7 +55,6 @@ def _primitive_xml(part: dict, index: int) -> str:
         f'      <geom name="{OBJECT_NAME}_collision_{index}" type="{geom_type}" '
         f'size="{size_s}" pos="{pos}" quat="{quat_s}" density="0" group="0"/>\n'
     )
-
 
 def _quat_from_mat(m: np.ndarray) -> np.ndarray:
     """``wxyz`` quaternion from a rotation matrix (Shepperd's method)."""
@@ -96,10 +94,10 @@ def object_spec(object_name: str, *, disable_gravity: bool = False) -> mujoco.Mj
 
     parts = load_primitives(object_name)
     mesh = object_mesh_path(object_name).resolve()
-    density = OBJECT_DENSITY.get(object_name, DEFAULT_DENSITY)
     gravcomp = 1 if disable_gravity else 0
     collisions = "".join(_primitive_xml(part, i) for i, part in enumerate(parts))
-    # Primitive geoms carry the mass (``density``), the visual mesh none.
+    # Primitive geoms carry the density only until ``apply_object_mass`` replaces it
+    # with the fixed 0.2 kg; the visual mesh never contributes mass.
     xml = f"""
 <mujoco model="{object_name}">
   <compiler meshdir="{mesh.parent}" angle="radian"/>
@@ -116,10 +114,14 @@ def object_spec(object_name: str, *, disable_gravity: bool = False) -> mujoco.Mj
 </mujoco>
 """
     spec = mujoco.MjSpec.from_string(xml)
-    # ``density`` on the primitive geoms only; scale to the target density.
+    # Fixed 0.2 kg on every object: the primitive volume only shapes the inertia,
+    # so the priming density is arbitrary (it cancels in the inertia scaling).
+    from supermimic.robots.object import OBJECT_MASS, apply_object_mass
+
     for geom in spec.geoms:
         if geom.name and geom.name.startswith(f"{OBJECT_NAME}_collision"):
-            geom.density = density
+            geom.density = 1000.0
+    apply_object_mass(spec, OBJECT_MASS, body_name=OBJECT_NAME)
     return spec
 
 

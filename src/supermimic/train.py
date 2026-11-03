@@ -12,6 +12,19 @@ from supermimic.mdp import resolve_obs_terms
 from supermimic.tasks import make_task
 
 
+def _task_run_name(task: str, object_name: str | None, split: str | None) -> str:
+    """Run label of a task spec, used for the log directory and the logger."""
+    return make_task(
+        str(task),
+        object_name=None if object_name is None else str(object_name),
+        split=None if split is None else str(split),
+    ).run_name
+
+
+# Registered at import time, before ``@hydra.main`` resolves the config.
+OmegaConf.register_new_resolver("task_run_name", _task_run_name, replace=True)
+
+
 def _obs_terms(cfg: DictConfig) -> tuple[str, ...]:
     task = make_task(
         str(cfg.get("task", "lafan1")),
@@ -101,6 +114,7 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         task=str(cfg.get("task", "lafan1")),
         object_name=None if cfg.get("object_name") is None else str(cfg.object_name),
         split=str(cfg.get("split", "train")),
+        simple_hands=bool(cfg.get("simple_hands", False)),
     )
 
 
@@ -188,7 +202,9 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
 @hydra.main(config_path="conf", config_name="train", version_base=None)
 def main(cfg: DictConfig) -> None:
     run_dir = Path(HydraConfig.get().runtime.output_dir)
-    OmegaConf.save(cfg, run_dir / "config.yaml")
+    # Resolve interpolations (e.g. the task-derived ``swanlab.experiment``) so the
+    # saved config reloads standalone instead of needing our resolvers.
+    OmegaConf.save(OmegaConf.to_container(cfg, resolve=True), run_dir / "config.yaml")
     print(f"log_dir={run_dir} algo={cfg.algo}", flush=True)
 
     algo = str(cfg.algo)

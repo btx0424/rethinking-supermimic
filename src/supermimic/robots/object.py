@@ -20,8 +20,10 @@ from mjlab.utils.spec_config import CollisionCfg
 
 from supermimic.motions.weave import object_mesh_root
 
-# Same mass object_hoi applies at runtime for the HOI table.
-_OBJECT_MASS = 0.2
+# Same light HOI mass as ``object_hoi``'s Isaac ``set_masses(0.2)``; shared by the
+# primitive-collided ``weave_xhand`` objects too.
+OBJECT_MASS = 0.2
+_OBJECT_MASS = OBJECT_MASS
 
 
 def object_mesh_path(object_name: str) -> Path:
@@ -40,13 +42,25 @@ def object_mesh_path(object_name: str) -> Path:
 _object_mesh = object_mesh_path
 
 
-def _apply_object_mass(spec: mujoco.MjSpec, mass: float = _OBJECT_MASS) -> None:
-    """Replace density-derived inertia with a light HOI mass (scaled inertia)."""
-    # Compile once to read the mesh-derived COM / inertia, then overwrite.
+OBJECT_MASS = 0.2
+
+
+def apply_object_mass(
+    spec: mujoco.MjSpec,
+    mass: float = OBJECT_MASS,
+    body_name: str = "object",
+) -> None:
+    """Replace density-derived inertia with a fixed mass, scaling the inertia.
+
+    The compiled model's mass, COM and inertia tensor are read first, then the body
+    is given ``mass`` with its inertia scaled by ``mass / density_mass``. Geom
+    densities are zeroed so they never contribute mass again.
+    """
+    # Compile once to read the density-derived COM / inertia, then overwrite.
     probe = spec.compile()
-    body_id = mujoco.mj_name2id(probe, mujoco.mjtObj.mjOBJ_BODY, "object")
+    body_id = mujoco.mj_name2id(probe, mujoco.mjtObj.mjOBJ_BODY, body_name)
     if body_id < 0:
-        raise RuntimeError("Object spec is missing body 'object'.")
+        raise RuntimeError(f"Object spec is missing body {body_name!r}.")
     dens_mass = float(probe.body_mass[body_id])
     if dens_mass <= 0.0:
         raise RuntimeError(f"Object density mass is non-positive ({dens_mass}).")
@@ -54,7 +68,7 @@ def _apply_object_mass(spec: mujoco.MjSpec, mass: float = _OBJECT_MASS) -> None:
     ipos = probe.body_ipos[body_id]
     inertia = probe.body_inertia[body_id] * scale
     for body in spec.bodies:
-        if body.name != "object":
+        if body.name != body_name:
             continue
         body.mass = mass
         body.ipos = ipos
@@ -62,7 +76,11 @@ def _apply_object_mass(spec: mujoco.MjSpec, mass: float = _OBJECT_MASS) -> None:
         for geom in body.geoms:
             geom.density = 0.0
         return
-    raise RuntimeError("Object spec is missing body 'object'.")
+    raise RuntimeError(f"Object spec is missing body {body_name!r}.")
+
+
+# Backward-compatible private alias.
+_apply_object_mass = apply_object_mass
 
 
 def object_spec(object_name: str, *, disable_gravity: bool = False) -> mujoco.MjSpec:

@@ -135,7 +135,12 @@ def evaluate_supermimic(
     def step_fn(sim: TrackingSim, motion: MotionLib, alive: torch.Tensor) -> dict:
         p, quat, v, w, q, qd = sim.state()
         bodies = sim.tracked_bodies()
-        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
+        if sim.task.has_object:
+            state = WorldModelState(
+                p, quat, v, w, q, qd, bodies[0], bodies[1], *sim.object_state()
+            )
+        else:
+            state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
         obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
         fresh = sim.ep_step == 0
         obs_hist[:] = torch.where(

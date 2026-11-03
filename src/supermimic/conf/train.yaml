@@ -33,6 +33,9 @@ task: lafan1
 # Object task only: which object to track, and which clip split to train on.
 object_name: null
 split: train
+# weave_xhand only: replace the hand mesh colliders with fitted box/cylinder
+# primitives (g1_hoi_learning's simplified URDF).
+simple_hands: true
 anchor: pelvis
 reward_style: gaussian
 
@@ -58,4 +61,5 @@ seed: 0
 swanlab:
   project: rethinking-supermimic
   mode: online
-  experiment: lafan1
+  # Derived from the task spec: `<task>`, or `<task>_<object>[_<split>]` for object tasks.
+  experiment: ${task_run_name:${task},${object_name},${split}}

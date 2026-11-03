@@ -75,6 +75,20 @@ class TaskSpec:
         return len(self.tracked_bodies)
 
     @property
+    def run_name(self) -> str:
+        """Run label used for the log directory and the logger's experiment name.
+
+        ``<task>`` for robot-only tasks, ``<task>_<object>`` for object tasks, with
+        ``_<split>`` appended when the split is not ``train``.
+        """
+        if self.object_name is None:
+            return self.name
+        label = f"{self.name}_{self.object_name}"
+        if self.split != "train":
+            label += f"_{self.split}"
+        return label
+
+    @property
     def n_hand(self) -> int:
         return len(self.hand_bodies)
 
@@ -317,9 +331,18 @@ class WeaveXHandTask(TaskSpec):
     instead of Inspire hands) and a different motion release, whose object
     colliders are fitted primitives (``assets/primitives``) rather than the
     visual mesh. Hand reward bodies are the XHand fingertips.
+
+    ``simple_hands`` swaps the hand *mesh* colliders for the box/cylinder
+    primitives of ``g1_hoi_learning``'s simplified URDF (see
+    ``supermimic.robots.xhand_primitives``); the feet are capsules either way.
     """
 
-    def __init__(self, object_name: str = "smalltable", split: str = "train") -> None:
+    def __init__(
+        self,
+        object_name: str = "smalltable",
+        split: str = "train",
+        simple_hands: bool = False,
+    ) -> None:
         from supermimic.utils.kinematics import XHAND_BODIES
 
         super().__init__(
@@ -331,18 +354,20 @@ class WeaveXHandTask(TaskSpec):
             foot_geom_expr=r"^(left|right)_foot_collision_[1-9]$",
             object_name=object_name,
             hand_bodies=XHAND_BODIES,
-            # Same finger + object contact budget as WeaveTask; the arm cylinders
-            # and pelvis mesh do not self-collide, so this stays comfortable.
-            sim=SimCfg(nconmax=256, njmax=768),
+            # 7 foot capsules per foot (from the Inspire model) plus the hand geoms
+            # push the active constraints past the old 768; 1200 leaves headroom for
+            # object contact and the solver's warm-start rows.
+            sim=SimCfg(nconmax=256, njmax=1200),
             split=split,
         )
+        self.simple_hands = bool(simple_hands)
         if split not in ("train", "test"):
             raise ValueError(f"split must be 'train' or 'test', got {split!r}.")
 
     def compile_model(self):
         from supermimic.robots.g1_xhand import compile_g1_xhand
 
-        model, names = compile_g1_xhand()
+        model, names = compile_g1_xhand(simple=self.simple_hands)
         if len(names) != self.num_joints:
             raise RuntimeError(f"XHand model has {len(names)} hinges, expected {self.num_joints}.")
         return model, names
@@ -350,7 +375,7 @@ class WeaveXHandTask(TaskSpec):
     def robot_cfg(self):
         from supermimic.robots.g1_xhand import robot_cfg
 
-        return robot_cfg()
+        return robot_cfg(simple=self.simple_hands)
 
     def object_cfg(self):
         from supermimic.robots.object_xhand import object_cfg
@@ -394,12 +419,19 @@ def get_task(name: str) -> TaskSpec:
     return factory()
 
 
-def make_task(name: str, *, object_name: str | None = None, split: str | None = None) -> TaskSpec:
+def make_task(
+    name: str,
+    *,
+    object_name: str | None = None,
+    split: str | None = None,
+    simple_hands: bool | None = None,
+) -> TaskSpec:
     """Task with per-run overrides.
 
     ``object_name`` and ``split`` apply to the object tasks. ``split`` reaches
     ``weave_xhand`` only: its cache path is split-tagged, while the older
-    ``weave`` cache holds both splits under one file.
+    ``weave`` cache holds both splits under one file. ``simple_hands`` likewise
+    reaches ``weave_xhand`` only.
     """
     if name not in _TASKS:
         known = ", ".join(sorted(_TASKS))
@@ -409,4 +441,6 @@ def make_task(name: str, *, object_name: str | None = None, split: str | None = 
         kwargs["object_name"] = object_name
     if name == "weave_xhand" and split is not None:
         kwargs["split"] = split
+    if name == "weave_xhand" and simple_hands is not None:
+        kwargs["simple_hands"] = simple_hands
     return _TASKS[name](**kwargs)
