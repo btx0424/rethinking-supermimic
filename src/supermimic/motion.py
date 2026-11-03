@@ -234,6 +234,20 @@ class MotionLib:
         self._prepare_goal()
         return self
 
+    def robot_only(self) -> MotionLib:
+        """Drop the object (and hand) reference fields, keeping the robot clip.
+
+        Used when an object task runs with ``has_object=False``: the cache still
+        carries the object, but the goal, reward and critic layouts must match a
+        robot-only task.
+        """
+        for name in ("object_p", "object_quat", "object_v", "object_w",
+                     "object_v_local", "object_w_local", "hand_p", "hand_body_names"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self._prepare_goal()
+        return self
+
     def _prepare_goal(self) -> None:
         root_v_local = quat_apply_inverse(self.root_quat, self.root_v)
         root_w_local = quat_apply_inverse(self.root_quat, self.root_w)
@@ -258,6 +272,9 @@ class MotionLib:
         """Frames f+1..f+k in the current reference yaw frame. Shape (B, K * width).
 
         Joint velocity is scaled by 0.1 so it does not swamp the root displacement.
+        The object block is appended only when the library carries object fields;
+        :func:`supermimic.tasks.TaskSpec.load_motion` strips them for a robot-only
+        run of an object task.
         """
         if not self._goal_ready:
             self._prepare_goal()

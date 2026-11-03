@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig
 
 from supermimic.algos.network import (
     InputNorms,
@@ -258,10 +259,10 @@ class NablaTrainer(Trainer):
 
     cfg: NablaTrainConfig
 
-    def __init__(self, cfg: NablaTrainConfig, log_dir: Path | str):
+    def __init__(self, cfg: NablaTrainConfig, task_cfg: DictConfig, log_dir: Path | str):
         # Schedule / logging read cfg.pi_lr; keep it aligned with the regression LR.
         cfg.pi_lr = cfg.action_target_lr
-        super().__init__(cfg, log_dir)
+        super().__init__(cfg, task_cfg, log_dir)
         self.opt_pi = build_optimizer(
             self.policy, cfg.action_target_lr, cfg.optim, adam_betas=(0.9, 0.95)
         )
@@ -465,5 +466,5 @@ class NablaTrainer(Trainer):
         return last_loss, last_gn
 
 
-def run(cfg: NablaTrainConfig, log_dir) -> None:
-    NablaTrainer(cfg, log_dir).fit()
+def run(cfg: NablaTrainConfig, task_cfg: DictConfig, log_dir) -> None:
+    NablaTrainer(cfg, task_cfg, log_dir).fit()

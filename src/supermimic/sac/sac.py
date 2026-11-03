@@ -13,6 +13,7 @@ from pathlib import Path
 import einops
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -463,18 +464,19 @@ class SACAgent:
 class Trainer:
     """Environment loop + :class:`SACAgent` (tracking sim, dict transitions)."""
 
-    def __init__(self, cfg: TrainConfig, log_dir: Path | str):
+    def __init__(self, cfg: TrainConfig, task_cfg: DictConfig, log_dir: Path | str):
         from supermimic.utils.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
-        from supermimic.tasks import make_task
+        from supermimic.tasks import make_task_from_config
 
         self.cfg = cfg
+        self.task_cfg = task_cfg
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(cfg.device)
         torch.manual_seed(cfg.seed)
 
-        self.task = make_task(cfg.task, object_name=cfg.object_name, split=cfg.split)
+        self.task = make_task_from_config(task_cfg)
         self.motion = self.task.load_motion(str(self.device))
         model, names = self.task.compile_model()
         self.kin = make_kinematics(
@@ -735,6 +737,10 @@ class Trainer:
             "iteration": iteration,
             "global_step": self.agent.global_step,
             "cfg": self.cfg.__dict__,
+            # The task node as configured, so eval/play rebuild the exact task.
+            "task_cfg": OmegaConf.to_container(self.task_cfg, resolve=True)
+            if isinstance(self.task_cfg, DictConfig)
+            else dict(self.task_cfg),
         }
         if actor_live_state is not None:
             ckpt["actor_live"] = actor_live_state
@@ -800,5 +806,5 @@ class Trainer:
                 self._log_f.close()
 
 
-def run(cfg: TrainConfig, log_dir: Path | str) -> None:
-    Trainer(cfg, log_dir).fit()
+def run(cfg: TrainConfig, task_cfg: DictConfig, log_dir: Path | str) -> None:
+    Trainer(cfg, task_cfg, log_dir).fit()

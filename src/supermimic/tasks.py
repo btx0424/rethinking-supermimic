@@ -6,6 +6,7 @@ same ``TrackingSim`` and ``MDP``; only this spec changes.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 from supermimic.utils.kinematics import HAND_BODIES, TRACKED_BODIES
@@ -49,12 +50,18 @@ class TaskSpec:
     has_object: bool
     foot_geom_expr: str
     object_name: str | None = None
+    # The object asset to load motions for, kept even when ``has_object`` is off.
+    # ``None`` means "same as ``object_name``".
+    cache_object_name: str | None = None
     hand_bodies: tuple[str, ...] = ()
     goal_frames: int = 10
     hist: int = 10
     sim: SimCfg = field(default_factory=SimCfg)
     # Object tasks: which clip split the motion cache was built from.
     split: str = "train"
+    # Every other key of the task config node. Tasks may read their own flags from
+    # here; the shared fields above are the ones the MDP and the networks need.
+    options: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.num_joints <= 0:
@@ -71,6 +78,41 @@ class TaskSpec:
             raise ValueError(f"{self.name}: hand_bodies require has_object.")
 
     @property
+    def motions_object_name(self) -> str | None:
+        """Object whose clip library to load, whether or not it is in the scene."""
+        return self.cache_object_name or self.object_name
+
+    # ---------------------------------------------------------------- variants
+
+    def with_options(self, has_object: bool | None = None) -> "TaskSpec":
+        """Copy of this task with per-run options applied.
+
+        ``has_object=False`` drops the scene object and every object term, so the
+        same motion data can be tracked as robot-only ("sanity check" mode).
+
+        Subclasses take their own ``__init__`` arguments, so ``dataclasses.replace``
+        cannot rebuild them; the copy is made field-by-field instead.
+        """
+        if has_object is None or bool(has_object) == self.has_object:
+            return self
+        if has_object:
+            # Robot-only task asked to track an object: it has no object asset.
+            raise ValueError(f"{self.name} has no object to track.")
+        if not self.has_object:
+            return self
+        clone = copy.copy(self)
+        object.__setattr__(clone, "has_object", False)
+        # Keep the clip library: the cache is per object even when the object
+        # itself is left out of the scene.
+        object.__setattr__(clone, "cache_object_name", self.motions_object_name)
+        object.__setattr__(clone, "object_name", None)
+        object.__setattr__(clone, "hand_bodies", ())
+        # Object rewards/observations are the widest terms; fall back to the
+        # robot-only solver budget.
+        object.__setattr__(clone, "sim", SimCfg())
+        return clone
+
+    @property
     def n_body(self) -> int:
         return len(self.tracked_bodies)
 
@@ -79,10 +121,12 @@ class TaskSpec:
         """Run label used for the log directory and the logger's experiment name.
 
         ``<task>`` for robot-only tasks, ``<task>_<object>`` for object tasks, with
-        ``_<split>`` appended when the split is not ``train``.
+        ``_<split>`` appended when the split is not ``train``. An object task run
+        with ``has_object=False`` is labelled ``<task>_noobj`` so it never shares a
+        directory with the object run.
         """
         if self.object_name is None:
-            return self.name
+            return f"{self.name}_noobj" if self.name != "lafan1" else self.name
         label = f"{self.name}_{self.object_name}"
         if self.split != "train":
             label += f"_{self.split}"
@@ -272,7 +316,12 @@ class WeaveTask(TaskSpec):
     cached library keeps its ``motion_lengths`` across both.
     """
 
-    def __init__(self, object_name: str = "smalltable", split: str = "train") -> None:
+    def __init__(
+        self,
+        object_name: str = "smalltable",
+        split: str = "train",
+        options: dict | None = None,
+    ) -> None:
         super().__init__(
             name="weave",
             num_joints=53,
@@ -285,6 +334,7 @@ class WeaveTask(TaskSpec):
             # Finger + object contacts: overflow asked for njmax≈554.
             sim=SimCfg(nconmax=256, njmax=768),
             split=split,
+            options=dict(options or {}),
         )
 
     def compile_model(self):
@@ -320,8 +370,10 @@ class WeaveTask(TaskSpec):
     def load_motion(self, device: str):
         from supermimic.motions.weave import WeaveMotion
 
-        assert self.object_name is not None
-        return WeaveMotion.load(device=device, objects=(self.object_name,))
+        name = self.motions_object_name
+        assert name is not None
+        lib = WeaveMotion.load(device=device, objects=(name,))
+        return lib if self.has_object else lib.robot_only()
 
 
 class WeaveXHandTask(TaskSpec):
@@ -342,6 +394,7 @@ class WeaveXHandTask(TaskSpec):
         object_name: str = "smalltable",
         split: str = "train",
         simple_hands: bool = False,
+        options: dict | None = None,
     ) -> None:
         from supermimic.utils.kinematics import XHAND_BODIES
 
@@ -359,6 +412,7 @@ class WeaveXHandTask(TaskSpec):
             # object contact and the solver's warm-start rows.
             sim=SimCfg(nconmax=256, njmax=1200),
             split=split,
+            options=dict(options or {}),
         )
         self.simple_hands = bool(simple_hands)
         if split not in ("train", "test"):
@@ -397,10 +451,10 @@ class WeaveXHandTask(TaskSpec):
     def load_motion(self, device: str):
         from supermimic.motions.weave_xhand import WeaveXHandMotion
 
-        assert self.object_name is not None
-        return WeaveXHandMotion.load(
-            device=device, objects=(self.object_name,), split=self.split
-        )
+        name = self.motions_object_name
+        assert name is not None
+        lib = WeaveXHandMotion.load(device=device, objects=(name,), split=self.split)
+        return lib if self.has_object else lib.robot_only()
 
 
 _TASKS: dict[str, type[TaskSpec]] = {
@@ -408,6 +462,45 @@ _TASKS: dict[str, type[TaskSpec]] = {
     "weave": WeaveTask,
     "weave_xhand": WeaveXHandTask,
 }
+
+# Keys of the ``task`` config node that map to explicit constructor arguments.
+_TASK_FIELDS = ("name", "object_name", "split", "simple_hands", "has_object")
+
+
+def _task_options(task_cfg) -> dict:
+    """Every key of the task config node, minus the ones handled explicitly."""
+    if task_cfg is None:
+        return {}
+    if hasattr(task_cfg, "items"):
+        items = task_cfg.items()
+    else:
+        items = dict(task_cfg).items()
+    return {key: value for key, value in items if key not in _TASK_FIELDS}
+
+
+def make_task_from_config(task_cfg) -> TaskSpec:
+    """Build the task from a ``task`` config node (one per task config group).
+
+    The node carries the shared keys (``name``, ``object_name``, ``split``,
+    ``simple_hands``, ``has_object``) plus any task-specific flags, which are
+    forwarded verbatim as :attr:`TaskSpec.options` so a task can define its own
+    without touching the trainer config.
+    """
+    if task_cfg is None:
+        raise ValueError("A task config node is required (defaults: `task: lafan1`).")
+
+    def opt(key: str, cast):
+        value = task_cfg.get(key) if hasattr(task_cfg, "get") else None
+        return None if value is None else cast(value)
+
+    return make_task(
+        str(task_cfg.name),
+        object_name=opt("object_name", str),
+        split=opt("split", str),
+        simple_hands=opt("simple_hands", bool),
+        has_object=opt("has_object", bool),
+        options=_task_options(task_cfg),
+    )
 
 
 def get_task(name: str) -> TaskSpec:
@@ -425,6 +518,8 @@ def make_task(
     object_name: str | None = None,
     split: str | None = None,
     simple_hands: bool | None = None,
+    has_object: bool | None = None,
+    options: dict | None = None,
 ) -> TaskSpec:
     """Task with per-run overrides.
 
@@ -432,15 +527,25 @@ def make_task(
     ``weave_xhand`` only: its cache path is split-tagged, while the older
     ``weave`` cache holds both splits under one file. ``simple_hands`` likewise
     reaches ``weave_xhand`` only.
+
+    ``has_object=False`` switches an object task to robot-only tracking: the scene
+    object and every object observation/reward/termination term are dropped, while
+    the motion cache (which does carry the object) is reused.
+
+    ``options`` is the rest of the task config node; tasks may read their own flags
+    from :attr:`TaskSpec.options`.
     """
     if name not in _TASKS:
         known = ", ".join(sorted(_TASKS))
         raise KeyError(f"Unknown task {name!r}. Available: {known}.")
-    kwargs = {}
+    kwargs: dict = {"options": dict(options or {})}
     if name in ("weave", "weave_xhand") and object_name is not None:
         kwargs["object_name"] = object_name
     if name == "weave_xhand" and split is not None:
         kwargs["split"] = split
     if name == "weave_xhand" and simple_hands is not None:
         kwargs["simple_hands"] = simple_hands
-    return _TASKS[name](**kwargs)
+    if name not in ("weave", "weave_xhand"):
+        # Robot-only tasks have no options to forward.
+        kwargs.pop("options")
+    return _TASKS[name](**kwargs).with_options(has_object=has_object)

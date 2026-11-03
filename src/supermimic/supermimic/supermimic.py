@@ -17,6 +17,7 @@ import logging
 torch_logging.set_logs(dynamo=logging.INFO, inductor=logging.INFO)
 
 from torch.utils.tensorboard import SummaryWriter
+from omegaconf import DictConfig, OmegaConf
 
 from supermimic.algos.buffer import ReplayBuffer
 from supermimic.utils.nn import soft_copy_
@@ -49,7 +50,7 @@ from supermimic.algos.network import (
     critic_forward,
 )
 from supermimic.algos.reward_norm import RewardNormalizer
-from supermimic.tasks import TaskSpec, make_task
+from supermimic.tasks import TaskSpec, make_task_from_config
 from supermimic.utils import experiment_log
 
 
@@ -92,14 +93,8 @@ class TrainConfig:
     # ``split`` is the tanh encoder-decoder. ``trunk`` is one MLP on goal and history.
     policy_kind: str = "split"
     policy_trunk: tuple[int, ...] = (512, 512, 512)
-    task: str = "lafan1"
-    # Weave / weave_xhand: which object's motions and collider to train on.
-    object_name: str | None = None
-    # Weave / weave_xhand clip split. Train is the default; test is for evaluation.
-    split: str = "train"
-    # weave_xhand only: hand colliders as fitted box/cylinder primitives instead of
-    # the collider meshes (see ``supermimic.robots.xhand_primitives``).
-    simple_hands: bool = False
+    # The task (robot, clips, object, colliders and its own flags) is a separate
+    # config node, passed to the trainer as-is; see ``make_task_from_config``.
     anchor: str = "torso"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
@@ -825,11 +820,14 @@ def imagine_horizon(
 class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
-    def __init__(self, cfg: TrainConfig, log_dir: Path | str):
+    def __init__(self, cfg: TrainConfig, task_cfg: DictConfig, log_dir: Path | str):
         from supermimic.utils.kinematics import make_kinematics
         from supermimic.sim import TrackingSim
 
         self.cfg = cfg
+        # The task config node is opaque to the trainer: only the shared keys are
+        # interpreted here, everything else is forwarded to the task spec.
+        self.task_cfg = task_cfg if task_cfg is not None else OmegaConf.create({"name": "lafan1"})
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.device = cfg.device
@@ -848,12 +846,7 @@ class Trainer:
 
             functorch_config.donated_buffer = False
 
-        self.task = make_task(
-            cfg.task,
-            object_name=cfg.object_name,
-            split=cfg.split,
-            simple_hands=cfg.simple_hands,
-        )
+        self.task = make_task_from_config(task_cfg)
         self.motion = self.task.load_motion(self.device)
         model, names = self.task.compile_model()
         self.kin = make_kinematics(
@@ -2136,6 +2129,10 @@ class Trainer:
             "norms": self.norms.state_dict(),
             "iteration": iteration,
             "cfg": self.cfg.__dict__,
+            # The task node as configured, so eval/play rebuild the exact task.
+            "task_cfg": OmegaConf.to_container(self.task_cfg, resolve=True)
+            if isinstance(self.task_cfg, DictConfig)
+            else dict(self.task_cfg),
         }
         if self.cfg.save_optim:
             ckpt["opt_wm"] = self.opt_wm.state_dict()
@@ -2153,5 +2150,5 @@ class Trainer:
         torch.save(ckpt, self.log_dir / "last.pt")
 
 
-def run(cfg: TrainConfig, log_dir) -> None:
-    Trainer(cfg, log_dir).fit()
+def run(cfg: TrainConfig, task_cfg: DictConfig, log_dir) -> None:
+    Trainer(cfg, task_cfg, log_dir).fit()

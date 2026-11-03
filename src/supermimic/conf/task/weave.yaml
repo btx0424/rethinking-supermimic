@@ -1,0 +1,10 @@
+# Weave: inspire-hand G1 tracking one Weave clip with a free-joint object.
+name: weave
+# Set false to track the robot motion only: the object is left out of the scene and
+# its observations/rewards are dropped. The clip library is still reused.
+has_object: true
+# Which object's motions and collider to train on.
+object_name: smalltable
+# The Weave release ships one rollout per object; the cache is not split-tagged.
+split: train
+simple_hands: false

@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from supermimic.utils.kinematics import make_kinematics
@@ -19,22 +20,43 @@ from supermimic.mdp import (
 )
 from supermimic.motion import CONTROL_DT, MotionLib
 from supermimic.sim import TrackingSim
-from supermimic.tasks import TaskSpec, make_task
+from supermimic.tasks import TaskSpec, make_task_from_config
 from supermimic.supermimic.network import InputNorms, build_policy
 
 
-def _task_from_cfg(saved_cfg: dict) -> TaskSpec:
-    """Task from a checkpoint config, keeping its object choice.
+def _flatten_saved(saved: dict) -> dict:
+    """Checkpoint payload with its ``cfg`` dict flattened in, plus ``task_cfg``.
 
-    ``weave_xhand`` is evaluated on its held-out test split; ``weave`` keeps the
-    split it trained on, because its cache is not split-tagged.
+    Older code passed only the ``cfg`` dict around; the task node lives beside it,
+    so the two are merged into one mapping here.
     """
-    name = str(saved_cfg.get("task", "lafan1"))
-    return make_task(
-        name,
-        object_name=saved_cfg.get("object_name"),
-        split="test" if name == "weave_xhand" else None,
-    )
+    flat = dict(saved.get("cfg", {}))
+    flat["task_cfg"] = saved.get("task_cfg")
+    return flat
+
+
+def _task_from_cfg(saved_cfg: dict) -> TaskSpec:
+    """Task from a checkpoint payload (or its flattened ``cfg`` dict).
+
+    The checkpoint stores the whole ``task`` config node under ``task_cfg``, so any
+    task-specific option round-trips. Older checkpoints only have the flattened
+    keys, which are rebuilt into an equivalent node. ``weave_xhand`` is evaluated on
+    its held-out test split; ``weave`` keeps the split it trained on, because its
+    cache is not split-tagged.
+    """
+    node = saved_cfg.get("task_cfg")
+    if node is None:
+        node = {
+            "name": saved_cfg.get("task", "lafan1"),
+            "object_name": saved_cfg.get("object_name"),
+            "split": saved_cfg.get("split", "train"),
+            "simple_hands": saved_cfg.get("simple_hands", False),
+            "has_object": saved_cfg.get("has_object"),
+        }
+    node = dict(node)
+    if node.get("name") == "weave_xhand":
+        node["split"] = "test"
+    return make_task_from_config(OmegaConf.create(node))
 
 
 def _build_sim(saved_cfg: dict, num_envs: int, device: str) -> TrackingSim:
@@ -245,7 +267,8 @@ def _print_results(
 def evaluate(ckpt: Path, device: str, *, live: bool = False, progress: bool = True) -> None:
     torch.manual_seed(0)
     saved = torch.load(ckpt, map_location=device, weights_only=False)
-    saved_cfg = saved.get("cfg", {})
+    # One flat mapping: the trainer ``cfg`` plus the ``task_cfg`` node beside it.
+    saved_cfg = _flatten_saved(saved)
     if "pi" in saved or "pi_live" in saved:
         evaluate_supermimic(saved, saved_cfg, device, live=live, progress=progress)
     elif "actor" in saved or "actor_live" in saved:

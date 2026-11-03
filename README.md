@@ -93,13 +93,26 @@ fifth clip (20%) is held out for evaluation (`split=test`). Objects use the rele
 PYTHONPATH=src python -m supermimic.train
 PYTHONPATH=src python -m supermimic.train algo=nablamimic
 PYTHONPATH=src python -m supermimic.train task=weave
-PYTHONPATH=src python -m supermimic.train task=weave_xhand object_name=smallbox
+PYTHONPATH=src python -m supermimic.train task=weave_xhand task.object_name=smallbox
+# Robot-only sanity check: same clips, no object in the scene or the rewards.
+PYTHONPATH=src python -m supermimic.train task=weave_xhand task.has_object=false
 ```
 
 Hydra writes each run under `logs/<swanlab.experiment>/<timestamp>/` (`ckpt_*.pt`, `train_log.csv`,
-`config.yaml`). `algo=` selects the trainer (see [Algorithms](#algorithms)); `task=` selects
-`lafan1`, `weave`, or `weave_xhand`, and `object_name=` picks the object task's clip set. Any config
-key can be overridden on the command line, e.g. `wm_ema=null`, `imagine_wm=ema`,
+`config.yaml`). `algo=` selects the trainer (see [Algorithms](#algorithms)).
+
+`task=` selects the task config group (`lafan1`, `weave`, `weave_xhand`), and everything about it is
+nested under the same node:
+
+| key | meaning |
+|---|---|
+| `task.name` | which task spec to build |
+| `task.object_name` | object task only: which object's clips and collider |
+| `task.split` | `weave_xhand` only: `train` or the held-out `test` |
+| `task.simple_hands` | `weave_xhand` only: fitted primitive hand colliders |
+| `task.has_object` | `false` tracks the robot only; object terms are dropped and the run logs to `<task>_noobj` |
+
+Any other config key can be overridden on the command line, e.g. `wm_ema=null`, `imagine_wm=ema`,
 `iterations=5000`, `save_optim=true`.
 
 ### Play

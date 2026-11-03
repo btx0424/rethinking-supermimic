@@ -9,15 +9,23 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from supermimic.mdp import resolve_obs_terms
-from supermimic.tasks import make_task
+from supermimic.tasks import TaskSpec, make_task, make_task_from_config
 
 
-def _task_run_name(task: str, object_name: str | None, split: str | None) -> str:
+def _task_run_name(
+    task: str,
+    object_name: str | None,
+    split: str | None,
+    has_object: bool | None = None,
+    simple_hands: bool | None = None,
+) -> str:
     """Run label of a task spec, used for the log directory and the logger."""
     return make_task(
         str(task),
         object_name=None if object_name is None else str(object_name),
         split=None if split is None else str(split),
+        has_object=None if has_object is None else bool(has_object),
+        simple_hands=None if simple_hands is None else bool(simple_hands),
     ).run_name
 
 
@@ -25,11 +33,13 @@ def _task_run_name(task: str, object_name: str | None, split: str | None) -> str
 OmegaConf.register_new_resolver("task_run_name", _task_run_name, replace=True)
 
 
+def _task(cfg: DictConfig) -> TaskSpec:
+    """Task spec from the ``task`` config node (kept as an opaque node)."""
+    return make_task_from_config(cfg.task)
+
+
 def _obs_terms(cfg: DictConfig) -> tuple[str, ...]:
-    task = make_task(
-        str(cfg.get("task", "lafan1")),
-        object_name=cfg.get("object_name"),
-    )
+    task = _task(cfg)
     chosen = [name for name, enabled in cfg.obs.items() if enabled]
     if task.has_object:
         for name in ("object_pos", "object_ori"):
@@ -111,10 +121,6 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         pi_ema=_parse_ema(cfg, "pi_ema", 0.99),
         wm_ema=_parse_ema(cfg, "wm_ema", 0.99),
         imagine_wm=str(cfg.get("imagine_wm", "live")),
-        task=str(cfg.get("task", "lafan1")),
-        object_name=None if cfg.get("object_name") is None else str(cfg.object_name),
-        split=str(cfg.get("split", "train")),
-        simple_hands=bool(cfg.get("simple_hands", False)),
     )
 
 
@@ -193,9 +199,6 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment=_experiment_name(run_dir),
         pi_ema=_parse_ema(cfg, "pi_ema", 0.995),
-        task=str(cfg.get("task", "lafan1")),
-        object_name=None if cfg.get("object_name") is None else str(cfg.object_name),
-        split=str(cfg.get("split", "train")),
     )
 
 
@@ -211,15 +214,15 @@ def main(cfg: DictConfig) -> None:
     if algo == "supermimic":
         from supermimic.algos.supermimic import run
 
-        run(_build_supermimic_cfg(cfg, run_dir), run_dir)
+        run(_build_supermimic_cfg(cfg, run_dir), cfg.task, run_dir)
     elif algo == "nablamimic":
         from supermimic.algos.nablamimic import run
 
-        run(_build_nablamimic_cfg(cfg, run_dir), run_dir)
+        run(_build_nablamimic_cfg(cfg, run_dir), cfg.task, run_dir)
     elif algo == "sac":
         from supermimic.sac import run
 
-        run(_build_sac_cfg(cfg, run_dir), run_dir)
+        run(_build_sac_cfg(cfg, run_dir), cfg.task, run_dir)
     else:
         raise ValueError(f"Unknown algo={algo!r}. Expected 'supermimic', 'nablamimic', or 'sac'.")
 

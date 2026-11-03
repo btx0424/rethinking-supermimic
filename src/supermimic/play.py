@@ -18,12 +18,13 @@ import torch
 import viser
 from mjviser import ViserMujocoScene
 from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
+from omegaconf import OmegaConf
 
 from supermimic.utils.kinematics import make_kinematics
 from supermimic.mdp import GOAL_FRAMES, HIST, PAPER_OBS_TERMS, WorldModelState
 from supermimic.motion import MotionLib
 from supermimic.supermimic.network import InputNorms, build_policy
-from supermimic.tasks import TaskSpec, make_task
+from supermimic.tasks import TaskSpec, make_task, make_task_from_config
 
 # Solid policy from mjviser (model materials). Reference ghost is blue + translucent.
 _REF_RGB = (40, 120, 255)
@@ -89,14 +90,17 @@ def _resolve_task(ckpt: Path | None, task_name: str | None) -> tuple[TaskSpec, d
     if ckpt is not None:
         saved = torch.load(ckpt, map_location="cpu", weights_only=False)
         saved_cfg = dict(saved.get("cfg", {}))
-        return (
-            make_task(
-                str(saved_cfg.get("task", task_name or "lafan1")),
-                object_name=saved_cfg.get("object_name"),
-                split=saved_cfg.get("split"),
-            ),
-            saved_cfg,
-        )
+        node = saved.get("task_cfg")
+        if node is None:
+            node = {
+                "name": saved_cfg.get("task", task_name or "lafan1"),
+                "object_name": saved_cfg.get("object_name"),
+                "split": saved_cfg.get("split", "train"),
+                "simple_hands": saved_cfg.get("simple_hands", False),
+                "has_object": saved_cfg.get("has_object"),
+            }
+        saved_cfg["task_cfg"] = node
+        return make_task_from_config(OmegaConf.create(dict(node))), saved_cfg
     return make_task(str(task_name or "lafan1")), saved_cfg
 
 

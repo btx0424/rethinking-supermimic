@@ -1,4 +1,5 @@
 defaults:
+  - task: lafan1
   - algo: supermimic
   - _self_
 
@@ -27,15 +28,8 @@ obs:
   object_pos: false
   object_ori: false
 
-# lafan1: mjlab G1, 29 hinges. weave: inspire-hand G1 plus a free-joint object.
-# weave_xhand: XHand G1 plus a primitive-collided free object.
-task: lafan1
-# Object task only: which object to track, and which clip split to train on.
-object_name: null
-split: train
-# weave_xhand only: replace the hand mesh colliders with fitted box/cylinder
-# primitives (g1_hoi_learning's simplified URDF).
-simple_hands: true
+# Task options (robot, object, split, hand colliders) live in the `task` node:
+#   python -m supermimic.train task=weave_xhand task.has_object=false
 anchor: pelvis
 reward_style: gaussian
 
@@ -61,5 +55,6 @@ seed: 0
 swanlab:
   project: rethinking-supermimic
   mode: online
-  # Derived from the task spec: `<task>`, or `<task>_<object>[_<split>]` for object tasks.
-  experiment: ${task_run_name:${task},${object_name},${split}}
+  # Derived from the task spec: `<task>`, or `<task>_<object>[_<split>]` for object tasks,
+  # with a `_noobj` suffix when the object is switched off.
+  experiment: ${task_run_name:${task.name},${task.object_name},${task.split},${task.has_object},${task.simple_hands}}

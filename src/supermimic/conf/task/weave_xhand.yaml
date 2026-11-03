@@ -1,0 +1,10 @@
+# Weave G1-XHand-OMOMO: XHand G1 with a primitive-collided free-joint object.
+name: weave_xhand
+# Set false to track the robot motion only: the object is left out of the scene and
+# its observations/rewards are dropped. The clip library is still reused.
+has_object: true
+object_name: smalltable
+# Held-out clip split; ``test`` is what eval uses.
+split: train
+# Replace the hand *mesh* colliders with fitted box/cylinder primitives.
+simple_hands: true
