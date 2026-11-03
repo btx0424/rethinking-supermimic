@@ -107,9 +107,10 @@ class TaskSpec:
         object.__setattr__(clone, "cache_object_name", self.motions_object_name)
         object.__setattr__(clone, "object_name", None)
         object.__setattr__(clone, "hand_bodies", ())
-        # Object rewards/observations are the widest terms; fall back to the
-        # robot-only solver budget.
-        object.__setattr__(clone, "sim", SimCfg())
+        # Keep the task's solver budget. Dropping the object does not remove the
+        # robot's contacts: the XHand hand geoms alone overflow the robot-only
+        # default (``njmax=500``), which silently degrades the simulated data and
+        # with it the world-model fit.
         return clone
 
     @property

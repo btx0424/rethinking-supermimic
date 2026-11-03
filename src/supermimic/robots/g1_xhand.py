@@ -64,11 +64,29 @@ FEET = ("left_ankle_roll_link", "right_ankle_roll_link")
 # the URDF's <visual> meshes, which the importer drops by default.
 _MUJOCO_BLOCK = '<mujoco>\n    <compiler discardvisual="false"/>\n  </mujoco>\n'
 
-# XHand finger drive (g1_hoi_learning.robots.g1_xhand).
+# XHand finger drive (g1_hoi_learning.robots.g1_xhand), with the passive terms
+# raised for simulation stability.
+#
+# The reference values (armature 1e-4, no passive damping) leave the finger links
+# with almost no inertia or dissipation, so any impulse rings: with the tracking
+# action the finger velocity reaches p99 3.8 / p99.9 17 rad/s, against 0.14 rad/s
+# mean and 0.003 rad/s per-step change in the reference clips. That tail is the
+# dominant term in the world-model objective, whose 8-step error is ~64% joint
+# velocity. Measured here over 128 envs x 100 steps:
+#
+#   armature 1e-4, visc 0    -> p99 3.8  p99.9 17.0  jitter 0.28
+#   armature 0.01, visc 0.5  -> p99 0.6  p99.9  0.6  jitter 0.02
+#
+# Viscous damping is the dominant lever (armature alone barely moves p99); it
+# trades tail noise for grasp closure, which is why it stops at 0.5 rather than
+# going higher. kp stays at the reference 3.0: raising it improved responsiveness
+# only ~6% and made the noise slightly worse. Solver settings (iterations,
+# ls_iterations) do not affect this at all -- the Newton solve converges in ~10.
 _FINGER_STIFFNESS = 3.0
 _FINGER_DAMPING = 0.08
-_FINGER_ARMATURE = 1e-4
-_FINGER_FRICTIONLOSS = 0.005
+_FINGER_ARMATURE = 0.01
+_FINGER_FRICTIONLOSS = 0.01
+_FINGER_VISCOUS_DAMPING = 0.5
 # Two effort classes: proximal/bend joints are the stronger 1.1 N·m motors.
 _FINGER_STRONG = (
     ".*_hand_thumb_bend_joint",
@@ -102,6 +120,7 @@ ARTICULATION = EntityArticulationInfoCfg(
             effort_limit=1.1,
             armature=_FINGER_ARMATURE,
             frictionloss=_FINGER_FRICTIONLOSS,
+            viscous_damping=_FINGER_VISCOUS_DAMPING,
         ),
         BuiltinPositionActuatorCfg(
             target_names_expr=_FINGER_WEAK,
@@ -110,6 +129,7 @@ ARTICULATION = EntityArticulationInfoCfg(
             effort_limit=0.4,
             armature=_FINGER_ARMATURE,
             frictionloss=_FINGER_FRICTIONLOSS,
+            viscous_damping=_FINGER_VISCOUS_DAMPING,
         ),
     ),
     soft_joint_pos_limit_factor=0.9,
