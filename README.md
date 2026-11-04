@@ -9,18 +9,22 @@ simulator.
 
 We use mjlab for its lightweightness. The robot model will be the G1 shipped with mjlab.
 
-CUDA 12.6 is the default (`cu126` torch, Warp `1.18.0+cu12`) and matches a 12.8 driver:
+Torch / Warp are **not** in the base deps — pick one CUDA fork:
 
-```bash
-uv sync
-```
-
-CUDA 13 (driver 580 or newer) is the other fork. It uses the PyPI torch and Warp wheels:
+**CUDA 13** (driver 580+, this machine): PyPI torch ≥ 2.14 and Warp `1.18.0`:
 
 ```bash
 uv sync --no-default-groups --extra cu13
 ```
 
+**CUDA 12.6** (default group; older drivers): `cu126` torch and the Warp `+cu12` wheel.
+Put the wheel at `wheels/warp_lang-1.18.0+cu12-py3-none-manylinux_2_28_x86_64.whl`
+(from the [Warp v1.18.0 release](https://github.com/NVIDIA/warp/releases/tag/v1.18.0);
+GitHub release downloads often time out, so keep a local copy), then:
+
+```bash
+uv sync
+```
 ## Datasets
 
 Two motion sources are supported. Both resample to 50 Hz and cache into the repo-local
