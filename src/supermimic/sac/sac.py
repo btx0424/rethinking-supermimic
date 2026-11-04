@@ -144,7 +144,7 @@ class TrainConfig:
     swanlab_mode: str = "online"
     swanlab_experiment: str = "lafan1"
 
-    # RLPD prior data: a rollout archive from ``supermimic.sac.collect``. The
+    # RLPD prior data: a rollout archive from ``supermimic.collect``. The
     # archive's raw observations are normalized with this run's statistics.
     prior_data: str | None = None
     # Share of each update batch drawn from the archive (0 disables).
@@ -576,6 +576,7 @@ class Trainer:
             "r": [],
             "ep": [],
             "term": [],
+            "trunc": [],
             "done_n": [],
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},
@@ -631,7 +632,8 @@ class Trainer:
                 self.stats["ep_terms"][name].append(
                     _term_score(name, (value[done] / length).mean().detach(), style)
                 )
-            self.stats["term"].append(float(out["d"][done].float().sum()))
+            self.stats["term"].append(float(out["terminated"][done].float().sum()))
+            self.stats["trunc"].append(float(out["truncated"][done].float().sum()))
             self.stats["done_n"].append(float(done.sum()))
 
     def _accum_train_info(self, info: dict) -> None:
@@ -661,7 +663,8 @@ class Trainer:
             "critic": critic,
             "action": action,
             "reward": out["r"].unsqueeze(-1),
-            "terminated": out["d"].unsqueeze(-1).float(),
+            "terminated": out["terminated"].unsqueeze(-1).float(),
+            "truncated": out["truncated"].unsqueeze(-1).float(),
             "done": out["done"].unsqueeze(-1).float(),
             "is_init": fresh,
         }
@@ -678,6 +681,7 @@ class Trainer:
         cfg = self.cfg
         now = time.time()
         term = sum(self.stats["term"]) / max(sum(self.stats["done_n"]), 1.0)
+        trunc = sum(self.stats["trunc"]) / max(sum(self.stats["done_n"]), 1.0)
         seconds = {key: _mean(self.timing[key]) for key in self.timing}
         sim_score = _mean(self.stats["r"])
         ep_score = _mean(self.stats["ep"])
@@ -706,6 +710,7 @@ class Trainer:
             sim_score,
             ep_score,
             term,
+            trunc,
             rb_size,
             critic_loss,
             actor_loss,
@@ -732,6 +737,7 @@ class Trainer:
             "train/sim_score": sim_score,
             "train/ep_score": ep_score,
             "train/term_frac": term,
+            "train/trunc_frac": trunc,
             "train/rb_size": rb_size,
             "train/critic_loss": critic_loss,
             "train/actor_loss": actor_loss,
@@ -765,7 +771,8 @@ class Trainer:
         )
         q_term_s = f" Q_term {q_term:.3g}" if math.isfinite(q_term) else ""
         print(
-            f"it {iteration} | {row[1]:.3f} h | sim {sim_score:.3f} ep {ep_score:.3f} term {term:.2f} | "
+            f"it {iteration} | {row[1]:.3f} h | sim {sim_score:.3f} ep {ep_score:.3f} "
+            f"term {term:.2f} trunc {trunc:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} | "
             f"critic {critic_loss:.4f} actor {actor_loss:.3f} Q {q_value:.3f}{q_term_s} α {alpha:.4g} H {entropy:.3f} | "
             f"rb {rb_size:.0f} {it_per_s:.2f} it/s lr {lr:.2e} | "
@@ -778,6 +785,7 @@ class Trainer:
             "r": [],
             "ep": [],
             "term": [],
+            "trunc": [],
             "done_n": [],
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},
@@ -842,7 +850,7 @@ class Trainer:
         ep_cols = ",".join(f"ep_{n}" for n in self.term_names)
         self._log_f = (self.log_dir / "train_log.csv").open("w")
         self._log_f.write(
-            "iteration,wall_h,sim_score,ep_score,term_frac,rb_size,critic_loss,actor_loss,q_value,q_value_terminated,alpha,entropy,"
+            "iteration,wall_h,sim_score,ep_score,term_frac,trunc_frac,rb_size,critic_loss,actor_loss,q_value,q_value_terminated,alpha,entropy,"
             f"grad_critic,grad_actor,it_per_s,lr,t_collect,{term_cols},{ep_cols}\n"
         )
         self.started = time.time()

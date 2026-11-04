@@ -16,6 +16,9 @@ class VisFrame:
     mocap_body: str | None = None
     mocap_pos: Any | None = None  # (3,)
     mocap_quat: Any | None = None  # (4,) wxyz
+    # Optional hand–object contact bits, aligned with ``hand_contact_body_names``.
+    hand_contact: Any | None = None  # (H,) {0,1}
+    hand_contact_body_names: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

@@ -2,9 +2,10 @@
 
 Feet are already capsules; this replaces the *hand* mesh colliders with the
 box/cylinder primitives from ``g1_hoi_learning``'s
-``g1_29dof_rev_1_0_xhand_simplified.urdf``. Everything else -- links, joints,
-inertials, visual meshes, the feet -- is copied unchanged, so the two XMLs differ
-only in how the hands collide.
+``g1_29dof_rev_1_0_xhand_simplified.urdf``. Other ``*_collision_*`` geoms are
+dropped: body meshes that only duplicate a visual, and unused shoulder
+cylinders (training only enables hand and foot contacts). Links, joints,
+inertials, visual meshes, and the feet are otherwise unchanged.
 
 URDF fixed joints were merged into their parent bodies here, so a link's frame is
 not always its body's frame. The link->body transform is read from the existing
@@ -133,14 +134,18 @@ def build() -> Path:
     colliders = urdf_hand_colliders()
     print(f"URDF hand links with primitives: {len(colliders)}", flush=True)
 
-    # --- drop every existing hand collision geom ---------------------------
+    # --- drop every non-foot ``*_collision_*`` geom -------------------------
+    # Hands are replaced by URDF primitives below. Body collision meshes only
+    # duplicate a visual (contype=conaffinity=0); shoulder cylinders are likewise
+    # unused because training only enables hand and foot contacts.
     removed = 0
     for geom in list(spec.geoms):
         name = geom.name or ""
-        if "_collision_" in name and any(k in name for k in HAND_KEYS):
-            spec.delete(geom)
-            removed += 1
-    print(f"removed {removed} hand mesh colliders", flush=True)
+        if "_collision_" not in name or "foot_collision" in name:
+            continue
+        spec.delete(geom)
+        removed += 1
+    print(f"removed {removed} redundant collision geoms (kept foot capsules)", flush=True)
 
     # --- add the URDF primitives in the owning body's frame ----------------
     added = 0

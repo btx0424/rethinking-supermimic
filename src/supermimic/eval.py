@@ -51,7 +51,7 @@ def _task_from_cfg(saved_cfg: dict) -> TaskSpec:
             "name": saved_cfg.get("task", "lafan1"),
             "object_name": saved_cfg.get("object_name"),
             "split": saved_cfg.get("split", "train"),
-            "simple_hands": saved_cfg.get("simple_hands", False),
+            "simple_hands": saved_cfg.get("simple_hands", True),
             "has_object": saved_cfg.get("has_object"),
         }
     node = dict(node)
@@ -104,10 +104,19 @@ def _run_rollout(
     step_fn,
     *,
     progress: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Roll every clip and report ``returns, terminated, truncated, fail_*``.
+
+    ``terminated`` marks clips the policy actually failed; ``truncated`` marks
+    clips that simply ran out (time limit or end of the reference), which is not
+    a failure. A clip can be both, in which case it counts as terminated.
+    """
     alive = torch.ones(n, dtype=torch.bool, device=device)
     returns = torch.zeros(n, device=device)
-    failed = torch.zeros(n, dtype=torch.bool, device=device)
+    terminated = torch.zeros(n, dtype=torch.bool, device=device)
+    truncated = torch.zeros(n, dtype=torch.bool, device=device)
     fail_step = torch.full((n,), -1, dtype=torch.long, device=device)
     fail_height = torch.zeros(n, device=device)
     fail_tilt = torch.zeros(n, device=device)
@@ -115,7 +124,10 @@ def _run_rollout(
     step = 0
     while bool(alive.any()):
         out = step_fn(sim, motion, alive)
-        first = out["d"] & alive
+        # ``terminated`` is a genuine failure (the clip is marked failed and the
+        # error that caused it is recorded). ``truncated`` is a clean cut by the
+        # time limit or the end of the clip and must not count as a failure.
+        first = out["terminated"] & alive
         if bool(first.any()):
             p1, quat1, _, _, _, _ = sim.state()
             height, tilt = sim.mdp._errors(p1, quat1, sim.f)
@@ -123,14 +135,15 @@ def _run_rollout(
             fail_height = torch.where(first, height, fail_height)
             fail_tilt = torch.where(first, tilt, fail_tilt)
         returns = returns + out["r"] * alive.float()
-        failed = failed | first
+        terminated = terminated | first
+        truncated = truncated | (out["truncated"] & alive)
         alive = alive & ~out["done"]
         step += 1
         pbar.n = n - int(alive.sum().item())
-        pbar.set_postfix(steps=step, alive=int(alive.sum().item()), refresh=False)
-        pbar.refresh()
+    pbar.set_postfix(steps=step, alive=int(alive.sum().item()), refresh=False)
+    pbar.refresh()
     pbar.close()
-    return returns, failed, fail_step, fail_height, fail_tilt
+    return returns, terminated, truncated, fail_step, fail_height, fail_tilt
 
 
 def evaluate_supermimic(
@@ -176,10 +189,21 @@ def evaluate_supermimic(
             action = policy(obs_hist, goal, norms, deterministic=True)
         return sim.step(action, auto_reset=False)
 
-    returns, failed, fail_step, fail_height, fail_tilt = _run_rollout(
+    returns, terminated, truncated, fail_step, fail_height, fail_tilt = _run_rollout(
         sim, motion, n, device, step_fn, progress=progress
     )
-    _print_results(motion, sim, returns, failed, fail_step, fail_height, fail_tilt, live=live, algo="supermimic")
+    _print_results(
+        motion,
+        sim,
+        returns,
+        terminated,
+        truncated,
+        fail_step,
+        fail_height,
+        fail_tilt,
+        live=live,
+        algo="supermimic",
+    )
 
 
 def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progress: bool) -> None:
@@ -218,17 +242,29 @@ def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progr
             action = loc
         return sim.step(action, auto_reset=False)
 
-    returns, failed, fail_step, fail_height, fail_tilt = _run_rollout(
+    returns, terminated, truncated, fail_step, fail_height, fail_tilt = _run_rollout(
         sim, motion, n, device, step_fn, progress=progress
     )
-    _print_results(motion, sim, returns, failed, fail_step, fail_height, fail_tilt, live=live, algo="sac")
+    _print_results(
+        motion,
+        sim,
+        returns,
+        terminated,
+        truncated,
+        fail_step,
+        fail_height,
+        fail_tilt,
+        live=live,
+        algo="sac",
+    )
 
 
 def _print_results(
     motion: MotionLib,
     sim: TrackingSim,
     returns: torch.Tensor,
-    failed: torch.Tensor,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor,
     fail_step: torch.Tensor,
     fail_height: torch.Tensor,
     fail_tilt: torch.Tensor,
@@ -240,16 +276,23 @@ def _print_results(
     lengths = (motion.clip_end - motion.clip_start - 1).clamp(min=1)
     score = returns / (sim.mdp.max_step_reward * lengths.float())
     which = "online" if live else "eval"
-    print(f"[{algo} {which}] normalized return {float(score.mean()):.4f}  failed {int(failed.sum())}/{n}")
-    for name, value, fail, step, height, tilt in zip(
+    print(
+        f"[{algo} {which}] normalized return {float(score.mean()):.4f}  "
+        f"terminated {int(terminated.sum())}/{n}  truncated {int(truncated.sum())}/{n}"
+    )
+    for name, value, term, trunc, step, height, tilt in zip(
         motion.clip_names,
         score.tolist(),
-        failed.tolist(),
+        terminated.tolist(),
+        truncated.tolist(),
         fail_step.tolist(),
         fail_height.tolist(),
         fail_tilt.tolist(),
     ):
-        if not fail:
+        if trunc and not term:
+            print(f"  {name:28} {value:.3f}  ok (truncated)")
+            continue
+        if not term:
             print(f"  {name:28} {value:.3f}  ok")
             continue
         parts = []
@@ -258,7 +301,7 @@ def _print_results(
         if tilt > TERM_TILT:
             parts.append(f"tilt {tilt:.3f} > {TERM_TILT:.2f}")
         cause = " and ".join(parts) if parts else "hard termination"
-        print(f"  {name:28} {value:.3f}  fail  {cause} at frame {step} ({step * CONTROL_DT:.2f} s)")
+        print(f"  {name:28} {value:.3f}  terminated  {cause} at frame {step} ({step * CONTROL_DT:.2f} s)")
 
 
 def evaluate(ckpt: Path, device: str, *, live: bool = False, progress: bool = True) -> None:

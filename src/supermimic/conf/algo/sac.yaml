@@ -26,7 +26,7 @@ normalize_reward: true
 ckpt_every: 1000
 pi_ema: 0.995
 
-# RLPD prior data: a rollout archive from `python -m supermimic.sac.collect`.
+# RLPD prior data: a rollout archive from `python -m supermimic.collect`.
 # null disables mixing; the archive's raw observations are normalized with this
 # run's statistics, so it must match the task and observation config.
 prior_data: null

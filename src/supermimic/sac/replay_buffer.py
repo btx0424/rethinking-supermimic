@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from supermimic.utils.episode import check_transition_flags
+
 
 class ReplayBuffer:
     """Storage shape ``[max_size, num_envs, …]`` for each field.
@@ -12,6 +14,14 @@ class ReplayBuffer:
     ``sample(..., next_obs=True)``, ``next_obs`` / ``next_critic`` are rebuilt from
     the following ring row, with **fake bootstrap**: on ``done``, the successor is
     the same row's current features (not the post-reset state).
+
+    Each stored transition carries the episode-end decomposition
+    ``terminated`` / ``truncated`` / ``done`` with the invariant
+    ``done == terminated | truncated``. ``terminated`` is the task's own failure
+    (never bootstrapped); ``truncated`` is a time limit or the end of the
+    reference clip (bootstrapped as usual). ``done`` only exists as their union,
+    to mark the last valid step of a trajectory. The two causes may co-occur (a
+    fall on the last frame of a clip); ``terminated`` wins wherever they conflict.
     """
 
     def __init__(
@@ -36,6 +46,7 @@ class ReplayBuffer:
         self.action = torch.zeros(*shape, act_dim, device=dev)
         self.reward = torch.zeros(*shape, 1, device=dev)
         self.terminated = torch.zeros(*shape, 1, device=dev)
+        self.truncated = torch.zeros(*shape, 1, device=dev)
         self.done = torch.zeros(*shape, 1, device=dev)
         self.is_init = torch.zeros(*shape, 1, device=dev)
         self._ptr = 0
@@ -56,14 +67,23 @@ class ReplayBuffer:
         return self._size * self.num_envs
 
     def push(self, batch: dict[str, torch.Tensor]) -> None:
-        """``batch`` tensors are ``[num_envs, …]``."""
+        """``batch`` tensors are ``[num_envs, …]``.
+
+        Requires ``terminated``, ``truncated`` and ``done`` with
+        ``done == terminated | truncated``.
+        """
         i = self._ptr
+        terminated = batch["terminated"].reshape(self.num_envs, 1)
+        truncated = batch["truncated"].reshape(self.num_envs, 1)
+        done = batch["done"].reshape(self.num_envs, 1)
+        check_transition_flags(terminated, truncated, done, what="ReplayBuffer.push")
         self.obs[i] = batch["obs"]
         self.critic[i] = batch["critic"]
         self.action[i] = batch["action"]
         self.reward[i] = batch["reward"].reshape(self.num_envs, 1)
-        self.terminated[i] = batch["terminated"].reshape(self.num_envs, 1).float()
-        self.done[i] = batch["done"].reshape(self.num_envs, 1).float()
+        self.terminated[i] = terminated
+        self.truncated[i] = truncated
+        self.done[i] = done
         self.is_init[i] = batch["is_init"].reshape(self.num_envs, 1).float()
         self._ptr = (self._ptr + 1) % self.max_size
         self._size = min(self._size + 1, self.max_size)
@@ -98,6 +118,7 @@ class ReplayBuffer:
                 "action": self.action[t, e],
                 "reward": self.reward[t, e],
                 "terminated": self.terminated[t, e],
+                "truncated": self.truncated[t, e],
                 "done": self.done[t, e],
                 "is_init": self.is_init[t, e],
             }
@@ -115,6 +136,7 @@ class ReplayBuffer:
             "action": self.action[ts, e],
             "reward": self.reward[ts, e],
             "terminated": self.terminated[ts, e],
+            "truncated": self.truncated[ts, e],
             "done": self.done[ts, e],
             "is_init": self.is_init[ts, e],
         }

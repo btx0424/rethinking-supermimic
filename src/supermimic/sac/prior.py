@@ -20,11 +20,21 @@ from pathlib import Path
 import torch
 
 from supermimic.sac.replay_buffer import ReplayBuffer
+from supermimic.utils.episode import check_transition_flags
 
 ROLLOUT_FORMAT_VERSION = 1
 ARCHIVE_NAME = "rollout.pt"
 # Tensor fields of ``ReplayBuffer``, in the order they are written.
-FIELDS = ("obs", "critic", "action", "reward", "terminated", "done", "is_init")
+FIELDS = (
+    "obs",
+    "critic",
+    "action",
+    "reward",
+    "terminated",
+    "truncated",
+    "done",
+    "is_init",
+)
 
 
 def replay_mix_sizes(
@@ -105,9 +115,15 @@ def load_rollout(root: Path | str, *, map_location="cpu") -> dict:
     fields = payload.get("fields")
     if not isinstance(fields, dict):
         raise ValueError(f"{path} has no 'fields' dict.")
+    if "truncated" not in fields and "done" in fields and "terminated" in fields:
+        # Archives written before the terminated/truncated split stored only
+        # ``done``; recover the missing flag from the invariant:
+        # truncated = done & ~terminated.
+        fields["truncated"] = fields["done"].bool() & ~fields["terminated"].bool()
     missing = [name for name in FIELDS if name not in fields]
     if missing:
         raise ValueError(f"{path} is missing fields {missing}.")
+    check_transition_flags(fields["terminated"], fields["truncated"], fields["done"], what=str(path))
     return payload
 
 
