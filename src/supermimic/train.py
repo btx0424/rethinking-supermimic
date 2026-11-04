@@ -199,6 +199,9 @@ def _build_sac_cfg(cfg: DictConfig, run_dir: Path):
         swanlab_mode=str(cfg.swanlab.mode),
         swanlab_experiment=_experiment_name(run_dir),
         pi_ema=_parse_ema(cfg, "pi_ema", 0.995),
+        prior_data=None if cfg.get("prior_data") is None else str(cfg.prior_data),
+        prior_data_ratio=float(cfg.get("prior_data_ratio", 0.5)),
+        prior_fraction=float(cfg.get("prior_fraction", 1.0)),
     )
 
 

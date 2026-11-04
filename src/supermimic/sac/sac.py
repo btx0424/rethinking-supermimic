@@ -20,15 +20,13 @@ from torch.utils.tensorboard import SummaryWriter
 from supermimic.utils import experiment_log
 from supermimic.mdp import (
     CONTROL_DT,
-    GOAL_FRAMES,
-    REWARD_TERM_NAMES,
     REWARD_TERM_WEIGHT,
-    invariant_features,
-    normalize_xi,
     resolve_obs_terms,
+    reward_term_names,
 )
-from supermimic.mdp import WorldModelState
+from supermimic.sac import features as sac_features
 from supermimic.sac.network import AlphaModule, MultiStepReturn, NormalActor, make_critic
+from supermimic.sac.prior import mix_batches, replay_mix_sizes
 from supermimic.sac.replay_buffer import ReplayBuffer
 from supermimic.utils.nn import (
     IndependentNormal,
@@ -146,6 +144,14 @@ class TrainConfig:
     swanlab_mode: str = "online"
     swanlab_experiment: str = "lafan1"
 
+    # RLPD prior data: a rollout archive from ``supermimic.sac.collect``. The
+    # archive's raw observations are normalized with this run's statistics.
+    prior_data: str | None = None
+    # Share of each update batch drawn from the archive (0 disables).
+    prior_data_ratio: float = 0.5
+    # Keep this fraction of the archive's env columns (1 keeps all of it).
+    prior_fraction: float = 1.0
+
     # note that we do not need RLPD and symmetry in this version
     # we also do not need distributed training
 
@@ -260,7 +266,12 @@ class SACAgent:
             group["lr"] = lr
         return lr
 
-    def observe_transition(self, batch: dict[str, torch.Tensor], rb: ReplayBuffer) -> dict:
+    def observe_transition(
+        self,
+        batch: dict[str, torch.Tensor],
+        rb: ReplayBuffer,
+        rb_prior: ReplayBuffer | None = None,
+    ) -> dict:
         if self.vecnorm is not None:
             self.vecnorm.update(batch["obs"])
         if self.reward_norm is not None:
@@ -271,15 +282,50 @@ class SACAgent:
             return {}
         if self.global_step % self.cfg.train_every != 0:
             return {}
-        return self.train_op(rb)
+        return self.train_op(rb, rb_prior)
 
-    def train_op(self, rb: ReplayBuffer) -> dict:
+    def _sample_mixed(
+        self,
+        rb: ReplayBuffer,
+        rb_prior: ReplayBuffer | None,
+        batch_size: int,
+        *,
+        steps: int,
+        next_obs: bool,
+    ) -> dict[str, torch.Tensor]:
+        """One batch, part online and part prior (RLPD).
+
+        ``steps > 1`` produces ``[steps, B, …]`` fields, so the prior rows are
+        concatenated along the batch axis (dim 1) and the single-step case (dim 0)
+        needs no special case beyond that.
+        """
+        online_n, prior_n = replay_mix_sizes(
+            batch_size, self.cfg.prior_data_ratio, use_prior=rb_prior is not None
+        )
+        batch = None
+        if online_n > 0:
+            batch = rb.sample(online_n, steps=steps, next_obs=next_obs)
+        prior = None
+        if prior_n > 0:
+            assert rb_prior is not None
+            prior = rb_prior.sample(prior_n, steps=steps, next_obs=next_obs)
+        dim = 1 if steps > 1 else 0
+        mixed = mix_batches(batch, prior, dim)
+        if mixed is None:
+            raise RuntimeError("Mixed batch drew no rows; check prior_data_ratio.")
+        return mixed
+
+    def train_op(self, rb: ReplayBuffer, rb_prior: ReplayBuffer | None = None) -> dict:
         actor_lr = self._apply_actor_lr()
         infos: dict = {"rb_size": len(rb), "actor/lr": actor_lr}
+        if rb_prior is not None:
+            infos["rb_prior_size"] = len(rb_prior)
         critic_iters = self.cfg.train_every * self.cfg.utd_ratio
         last_info: dict = {}
         for i in range(critic_iters):
-            batch = rb.sample(
+            batch = self._sample_mixed(
+                rb,
+                rb_prior,
                 self.cfg.critic_batch_size,
                 steps=self.cfg.n_steps,
                 next_obs=True,
@@ -287,7 +333,13 @@ class SACAgent:
             last_info = self.train_critic(batch, diagnostics=i == critic_iters - 1)
         infos.update(last_info)
         for j in range(self.cfg.train_every):
-            batch = rb.sample(self.cfg.actor_batch_size, steps=1, next_obs=False)
+            batch = self._sample_mixed(
+                rb,
+                rb_prior,
+                self.cfg.actor_batch_size,
+                steps=1,
+                next_obs=False,
+            )
             last_info = self.train_actor(batch, diagnostics=j == self.cfg.train_every - 1)
         self._train_op_idx += 1
 
@@ -497,7 +549,9 @@ class Trainer:
         )
         self.r_max = self.sim.r_max
         self.policy_obs_dim = self.sim.mdp.obs_dim + self.task.goal_dim
-        self.critic_dim = self.task.inv_dim + self.task.goal_dim + self.task.xi_dim + self.task.priv_dim
+        self.critic_dim = sac_features.critic_feat_dim(self.task)
+        # Object tasks add the four object reward terms.
+        self.term_names = reward_term_names(self.task)
         critic_dim = self.critic_dim
         self.norms = InputNorms(self.sim.mdp.obs_dim, self.task).to(self.device)
         self.agent = SACAgent(
@@ -516,14 +570,15 @@ class Trainer:
             self.task.num_joints,
             self.device,
         )
+        self.rbp = self._load_prior()
         self._step_acc = 0.0
         self.stats = {
             "r": [],
             "ep": [],
             "term": [],
             "done_n": [],
-            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "sim_terms": {name: [] for name in self.term_names},
+            "ep_terms": {name: [] for name in self.term_names},
         }
         self.train_agg: dict[str, list] = defaultdict(list)
         self.timing = {"collect": []}
@@ -531,6 +586,37 @@ class Trainer:
         self.logged = 0.0
         self._log_f = None
         self._tb: SummaryWriter | None = None
+
+    def _load_prior(self) -> ReplayBuffer | None:
+        """Prior archive for RLPD mixing, or ``None`` when disabled."""
+        cfg = self.cfg
+        if cfg.prior_data is None:
+            return None
+        from supermimic.sac.prior import build_prior, split_prior_fraction
+
+        buffer, payload = build_prior(
+            cfg.prior_data,
+            self.device,
+            obs_dim=self.policy_obs_dim,
+            critic_dim=self.critic_dim,
+            act_dim=self.task.num_joints,
+        )
+        if cfg.prior_fraction < 1.0:
+            split_prior_fraction(buffer, cfg.prior_fraction, seed=cfg.seed)
+        print(
+            f"prior: {len(buffer)} steps x {buffer.num_envs} envs "
+            f"({buffer.num_samples} transitions) from {cfg.prior_data}",
+            flush=True,
+        )
+        if payload.get("task_cfg") is not None:
+            saved_task = payload["task_cfg"].get("name")
+            if saved_task is not None and saved_task != self.task.name:
+                print(
+                    f"prior warning: archive task {saved_task!r} != run task "
+                    f"{self.task.name!r}",
+                    flush=True,
+                )
+        return buffer
 
     def _record_sim_stats(self, out: dict[str, torch.Tensor]) -> None:
         style = self.cfg.reward_style
@@ -554,35 +640,13 @@ class Trainer:
                 self.train_agg[key].append(float(value))
 
     def _policy_features(self) -> torch.Tensor:
-        p, quat, v, w, q, qd = self.sim.state()
-        bodies = self.sim.tracked_bodies()
-        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
-        obs = self.sim.mdp.add_noise(self.sim.mdp.obs(state, self.sim.a_prev, self.sim.xi, self.sim.f))
-        goal = self.motion.goal(self.sim.f, GOAL_FRAMES)
-        return torch.cat([obs, goal], dim=-1)
+        return sac_features.policy_obs(self.sim)
 
     def _critic_features(self) -> torch.Tensor:
-        p, quat, v, w, q, qd = self.sim.state()
-        inv = invariant_features(p, quat, v, w, q, qd)
-        goal = self.motion.goal(self.sim.f, GOAL_FRAMES)
-        xi_n = normalize_xi(self.sim.xi)
-        priv = self.sim.mdp.privileged(p, quat, v, w, q, qd, self.sim.f)
-        return self.norms.critic(inv, goal, xi_n, priv)
+        return sac_features.critic_input(self.sim, self.norms)
 
     def _update_norms(self) -> None:
-        p, quat, v, w, q, qd = self.sim.state()
-        inv = invariant_features(p, quat, v, w, q, qd)
-        bodies = self.sim.tracked_bodies()
-        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
-        obs = self.sim.mdp.obs(state, self.sim.a_prev, self.sim.xi, self.sim.f)
-        goal = self.motion.goal(self.sim.f, GOAL_FRAMES)
-        xi_n = normalize_xi(self.sim.xi)
-        priv = self.sim.mdp.privileged(p, quat, v, w, q, qd, self.sim.f)
-        self.norms.state.update(inv)
-        self.norms.goal.update(goal)
-        self.norms.xi.update(xi_n)
-        self.norms.priv.update(priv)
-        self.norms.obs.update(obs)
+        sac_features.update_norms(self.sim, self.norms)
 
     def _collect_step(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self._update_norms()
@@ -607,7 +671,7 @@ class Trainer:
         for _ in range(n_steps):
             transition, out = self._collect_step()
             self._record_sim_stats(out)
-            info = self.agent.observe_transition(transition, self.buffer)
+            info = self.agent.observe_transition(transition, self.buffer, self.rbp)
             self._accum_train_info(info)
 
     def _log(self, iteration: int) -> None:
@@ -617,8 +681,8 @@ class Trainer:
         seconds = {key: _mean(self.timing[key]) for key in self.timing}
         sim_score = _mean(self.stats["r"])
         ep_score = _mean(self.stats["ep"])
-        sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in REWARD_TERM_NAMES}
-        ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in REWARD_TERM_NAMES}
+        sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in self.term_names}
+        ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in self.term_names}
 
         def train_metric(key: str, default: float = 0.0) -> float:
             return _mean(self.train_agg[key]) if self.train_agg[key] else default
@@ -655,9 +719,9 @@ class Trainer:
             lr,
             seconds["collect"],
         ]
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             row.append(sim_terms[name])
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             row.append(ep_terms[name])
 
         assert self._log_f is not None
@@ -680,7 +744,7 @@ class Trainer:
             "grad/actor": gn_actor,
             "time/collect_s": seconds["collect"],
         }
-        for name in REWARD_TERM_NAMES:
+        for name in self.term_names:
             metrics[f"score/sim_{name}"] = sim_terms[name]
             metrics[f"score/ep_{name}"] = ep_terms[name]
         if math.isfinite(q_term):
@@ -715,8 +779,8 @@ class Trainer:
             "ep": [],
             "term": [],
             "done_n": [],
-            "sim_terms": {name: [] for name in REWARD_TERM_NAMES},
-            "ep_terms": {name: [] for name in REWARD_TERM_NAMES},
+            "sim_terms": {name: [] for name in self.term_names},
+            "ep_terms": {name: [] for name in self.term_names},
         }
         self.train_agg = defaultdict(list)
         self.timing = {"collect": []}
@@ -774,8 +838,8 @@ class Trainer:
         tb_dir = self.log_dir / "tb"
         self._tb = SummaryWriter(log_dir=tb_dir)
         print(f"tensorboard={tb_dir}", flush=True)
-        term_cols = ",".join(f"sim_{n}" for n in REWARD_TERM_NAMES)
-        ep_cols = ",".join(f"ep_{n}" for n in REWARD_TERM_NAMES)
+        term_cols = ",".join(f"sim_{n}" for n in self.term_names)
+        ep_cols = ",".join(f"ep_{n}" for n in self.term_names)
         self._log_f = (self.log_dir / "train_log.csv").open("w")
         self._log_f.write(
             "iteration,wall_h,sim_score,ep_score,term_frac,rb_size,critic_loss,actor_loss,q_value,q_value_terminated,alpha,entropy,"

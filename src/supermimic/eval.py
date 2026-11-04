@@ -19,6 +19,7 @@ from supermimic.mdp import (
     WorldModelState,
 )
 from supermimic.motion import CONTROL_DT, MotionLib
+from supermimic.sac import features as sac_features
 from supermimic.sim import TrackingSim
 from supermimic.tasks import TaskSpec, make_task_from_config
 from supermimic.supermimic.network import InputNorms, build_policy
@@ -209,12 +210,8 @@ def evaluate_sac(saved: dict, saved_cfg: dict, device: str, *, live: bool, progr
         norms.load_state_dict(saved["norms"])
 
     def step_fn(sim: TrackingSim, motion: MotionLib, alive: torch.Tensor) -> dict:
-        p, quat, v, w, q, qd = sim.state()
-        bodies = sim.tracked_bodies()
-        state = WorldModelState(p, quat, v, w, q, qd, bodies[0], bodies[1])
-        obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
-        goal = motion.goal(sim.f, GOAL_FRAMES)
-        policy_obs = torch.cat([obs, goal], dim=-1)
+        # Shared builder so HOI tasks include the object block.
+        policy_obs = sac_features.policy_obs(sim, noise=False)
         with torch.no_grad():
             obs_n = vecnorm(policy_obs) if vecnorm is not None else policy_obs
             loc, _scale = actor(obs_n)
