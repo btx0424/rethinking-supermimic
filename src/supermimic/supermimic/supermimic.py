@@ -749,15 +749,17 @@ def imagine_horizon(
         reward, term_parts = mdp.reward_flat(reward_state, frames_flat, actions_flat, prev_flat)
     else:
         reward, term_parts = mdp.reward(reward_state, frames_flat, actions_flat, prev_flat, terms=True)
-    done = mdp.soft_termination(flat[0], flat[1], frames_flat)
+    # Imagined rollouts only ever *terminate*: the horizon cut is not a truncation,
+    # it is handled by the bootstrap value at the end of the horizon.
+    terminated = mdp.soft_termination(flat[0], flat[1], frames_flat)
     reward = reward.view(horizon, batch)
-    done = done.view(horizon, batch)
+    terminated = terminated.view(horizon, batch)
     term_raw = torch.stack([term_parts[name] for name in term_names]).view(len(term_names), horizon, batch)
     term_mean = term_raw.detach().mean(dim=(1, 2))
     reward_mean = reward.detach().mean()
     reward = reward / reward_scale
     term_r = term_raw / reward_scale
-    alive = torch.cumprod(1.0 - done, dim=0)
+    alive = torch.cumprod(1.0 - terminated, dim=0)
     survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
     discount = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
     weighted = discount[:, None] * survival
@@ -803,7 +805,7 @@ def imagine_horizon(
         bootstrap,
         term_loss,
         reward.detach(),
-        done.detach(),
+        terminated.detach(),
         alive[-1].detach(),
         reward_mean.detach(),
         term_mean,
@@ -1034,6 +1036,7 @@ class Trainer:
             "r": [],
             "ep": [],
             "term": [],
+            "trunc": [],
             "done_n": [],
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},
@@ -1097,7 +1100,7 @@ class Trainer:
         grad_r_cols = ",".join(f"grad_r_{n}" for n in self.term_names)
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,value_mean,imag_score,imag_survival,"
-            "sim_score,ep_score,term_frac,it_per_s,lr,pi_lr,entropy,"
+            "sim_score,ep_score,term_frac,trunc_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
             "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,wm_loss_contact,wm_contact_prec,wm_contact_recall,"
@@ -1268,7 +1271,8 @@ class Trainer:
                     self.stats["ep_terms"][name].append(
                         _term_score(name, (value[done] / length).mean().detach(), style)
                     )
-                self.stats["term"].append(out["d"][done].float().sum())
+                self.stats["term"].append(out["terminated"][done].float().sum())
+                self.stats["trunc"].append(out["truncated"][done].float().sum())
                 self.stats["done_n"].append(done.float().sum())
 
     def update_world_model(
@@ -1502,7 +1506,7 @@ class Trainer:
             bootstrap,
             term_loss,
             reward,
-            done,
+            terminated,
             alive_last,
             reward_mean,
             term_mean,
@@ -1553,7 +1557,9 @@ class Trainer:
             "goals": goals,
             "xi": xi.unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
             "reward": reward,
-            "done": done,
+            # Imagined rollouts only ever *terminate* (soft termination prob); the
+            # horizon cut is handled by the bootstrap term, not by truncation.
+            "terminated": terminated,
         }
         return {
             "policy_loss": policy_loss,
@@ -1736,7 +1742,9 @@ class Trainer:
             target = values[-1]
             targets = []
             reward = batch["reward"].unsqueeze(-1)
-            cont = (1.0 - batch["done"]).unsqueeze(-1)
+            # Imagined rollouts only ever *terminate*; the horizon cut is handled
+            # by the bootstrap term, not by truncation.
+            cont = (1.0 - batch["terminated"]).unsqueeze(-1)
             for t in range(horizon - 1, -1, -1):
                 nxt = (1.0 - cfg.lam) * values[t + 1] + cfg.lam * target
                 target = reward[t] + cfg.gamma * cont[t] * nxt
@@ -1767,6 +1775,7 @@ class Trainer:
         cfg = self.cfg
         now = time.time()
         term = sum(self.stats["term"]) / max(sum(self.stats["done_n"]), 1.0)
+        trunc = sum(self.stats["trunc"]) / max(sum(self.stats["done_n"]), 1.0)
         seconds = {key: _mean(self.timing[key]) for key in self.timing}
         gn_wm = _mean(self.agg["gn_wm"])
         gn_pi = _mean(self.agg["gn_pi"])
@@ -1794,6 +1803,7 @@ class Trainer:
             _mean(self.stats["r"]),
             _mean(self.stats["ep"]),
             term,
+            trunc,
             cfg.log_every / (now - self.logged),
             lr,
             pi_lr,
@@ -1860,6 +1870,7 @@ class Trainer:
             "train/sim_score": row[9],
             "train/ep_score": row[10],
             "train/term_frac": term,
+            "train/trunc_frac": trunc,
             "train/it_per_s": row[12],
             "train/lr": lr,
             "train/pi_lr": pi_lr,
@@ -1907,7 +1918,7 @@ class Trainer:
             f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} "
             f"contact {wm_contact:.4f} P {wm_contact_prec:.2f} R {wm_contact_recall:.2f} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} V {row[6]:.3f} imag {row[7]:.3f} surv {row[8]:.3f} | "
-            f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} | "
+            f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} trunc {trunc:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
             f"{ent_s} {row[12]:.2f} it/s | pi_lr {pi_lr:.2e} | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
@@ -1922,6 +1933,7 @@ class Trainer:
             "r": [],
             "ep": [],
             "term": [],
+            "trunc": [],
             "done_n": [],
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},

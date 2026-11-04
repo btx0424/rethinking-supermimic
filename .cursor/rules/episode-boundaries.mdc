@@ -1,0 +1,51 @@
+---
+description: Episode-end convention — terminated vs truncated vs done
+alwaysApply: true
+---
+
+# Episode ends: terminated, truncated, done
+
+Every rollout in this repo reports **two independent signals** plus their union:
+
+| flag | meaning | bootstrap |
+|---|---|---|
+| `terminated` | the MDP's own absorbing failure (a fall: height/tilt) | **no** |
+| `truncated` | stopped for a reason outside the MDP: time limit or end of the reference clip | **yes** |
+| `done` | exactly `terminated \| truncated` | — |
+
+`TrackingSim.step` also breaks `truncated` out into `timeout` and `clip_end`.
+
+## Rules
+
+- `done` is **only** "this is the last valid step of a trajectory". It is for replay
+  storage, window/index bookkeeping, and stopping a rollout loop.
+- Never use `done` where "the policy failed" is meant. Use `terminated`.
+- Never use `done` to zero a bootstrap discount. Use `terminated`, so a truncated
+  transition keeps its bootstrap.
+- Build `done` only with `supermimic.utils.episode.done_from(terminated, truncated)`.
+- Validate a batch of flags with `supermimic.utils.episode.check_transition_flags`.
+- `terminated` and `truncated` **may co-occur** (a fall on the last frame of a clip).
+  Never assert they are disjoint; only the union invariant is guaranteed. Where they
+  conflict, `terminated` wins.
+- Imagined rollouts have no time limit: they only ever `terminated` (soft termination).
+  Their horizon cut is handled by the bootstrap term, never by truncation.
+- New transitions must carry all of `terminated`, `truncated`, `done`. Do not
+  introduce a bare `"d"` key or overload `done`.
+
+## Reference
+
+```python
+# ❌ BAD — truncation treated as failure, and no bootstrap
+failed = out["done"]
+cont = 1.0 - out["done"]
+
+# ✅ GOOD
+failed = out["terminated"]
+cont = 1.0 - out["terminated"]
+done = done_from(out["terminated"], out["truncated"])
+```
+
+## When logging
+
+Report both: `term_frac` and `trunc_frac`, or "terminated N / truncated M". A run
+where every episode ends by truncation is a *good* run, not a failing one.

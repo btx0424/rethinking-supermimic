@@ -10,6 +10,7 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
+from .utils.episode import done_from
 from .utils.kinematics import TorchKinematics
 from .utils.math import quat_from_euler_xyz, quat_mul
 from .mdp import (
@@ -332,20 +333,37 @@ class TrackingSim:
             hand1,
         )
         reward, terms = self.mdp.reward(reward_state, f_next, action, a_prev, terms=True)
-        hard = self.mdp.termination(p1, quat1, f_next)
+        terminated = self.mdp.termination(p1, quat1, f_next)
         if self.survival_bonus:
-            reward = reward + self.survival_bonus * (~hard).float()
+            # The bonus is paid for staying alive, i.e. for not *terminating*.
+            # Truncation is not a failure and still earns the bonus.
+            reward = reward + self.survival_bonus * (~terminated).float()
         self.ep_step += 1
         self.lifetime += 1
+        # Episode-end signals, following the usual RL distinction (see
+        # ``supermimic.utils.episode``):
+        #   ``terminated`` — the MDP's own absorbing failure (a fall). Never
+        #       bootstrapped, and the only signal that means "the policy failed".
+        #   ``truncated``  — the episode stopped for a reason outside the MDP: the
+        #       time limit (``timeout``) or the end of the reference clip
+        #       (``clip_end``). The return beyond the cut is still real, so a
+        #       truncated transition IS bootstrapped from its last observation.
+        #   ``done``       — exactly ``terminated | truncated``. It only marks the
+        #       last valid step of a trajectory; never use it where "failed" is
+        #       meant.
+        # The two causes are reported independently and may co-occur (a fall on
+        # the very last frame is both). Where they conflict, ``terminated`` wins:
+        # the bootstrap discount is zeroed by termination alone.
         timeout = self.ep_step >= self.max_steps
         clip_end = f_next >= last
+        truncated = timeout | clip_end
+        done = done_from(terminated, truncated)
         self.ep_disc = self.ep_disc + torch.pow(self.gamma, (self.ep_step - 1).float()) * reward
         self.ep_ret = self.ep_ret + reward
         for name, value in terms.items():
             self.ep_term[name] = self.ep_term[name] + value
         self.f = f_next
         self.a_prev = action.detach().clone()
-        done = hard | timeout | clip_end
         out = {
             "s": s,
             "s1": flatten_state(p1, quat1, v1, w1, q1, qd1),
@@ -361,7 +379,8 @@ class TrackingSim:
             "step": step_id,
             "r": reward,
             "terms": terms,
-            "d": hard,
+            "terminated": terminated,
+            "truncated": truncated,
             "timeout": timeout,
             "clip_end": clip_end,
             "done": done,

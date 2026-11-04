@@ -18,10 +18,13 @@ _GROUND_Z = -0.02
 
 
 def _geom_group_kinds(model: mujoco.MjModel) -> tuple[set[int], set[int]]:
-    """Visual-only and collision-only geom groups.
+    """Visual and collision geom groups for the display toggles.
 
-    The two kinds do not share a group: mjlab G1 uses group 2 for meshes and
-    group 3 for collision, and the inspire-hand XML uses group 1 and group 0.
+    A group is collision if any of its geoms has nonzero contype/conaffinity,
+    otherwise visual. Mixed groups (XHand puts active hand/foot colliders and
+    disabled body ``*_collision_*`` meshes in group 3) are treated as collision
+    so the "Collision geoms" checkbox can show them; mjviser only toggles by
+    group, not per geom.
     """
     visual: set[int] = set()
     collision: set[int] = set()
@@ -33,7 +36,8 @@ def _geom_group_kinds(model: mujoco.MjModel) -> tuple[set[int], set[int]]:
             collision.add(group)
         else:
             visual.add(group)
-    return visual - collision, collision - visual
+    mixed = visual & collision
+    return visual - mixed, collision
 
 
 def _qpos_addresses(model: mujoco.MjModel, joint_names: tuple[str, ...]) -> list[int]:
@@ -92,6 +96,35 @@ def forward_scene(
         xpos = data.xpos.copy()
         xmat = data.xmat.reshape(-1, 3, 3).copy()
         scene.update_from_arrays(xpos[None], xmat[None])
+
+
+def _hand_contact_positions(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    frame: VisFrame,
+) -> np.ndarray:
+    """World positions of bodies marked in contact on ``frame``, shape ``(K, 3)``."""
+    names = frame.hand_contact_body_names
+    bits = frame.hand_contact
+    if names is None or bits is None:
+        return np.zeros((0, 3), dtype=np.float64)
+    bits = np.asarray(bits, dtype=np.float64).reshape(-1)
+    if bits.shape[0] != len(names):
+        raise ValueError(
+            f"hand_contact length {bits.shape[0]} does not match "
+            f"hand_contact_body_names ({len(names)})."
+        )
+    positions = []
+    for name, bit in zip(names, bits):
+        if bit <= 0.0:
+            continue
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            continue
+        positions.append(np.asarray(data.xpos[body_id], dtype=np.float64))
+    if not positions:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.stack(positions, axis=0)
 
 
 def play_viser(
@@ -153,9 +186,19 @@ def play_viser(
     with server.gui.add_folder("Display"):
         show_visual = server.gui.add_checkbox("Visual geoms", initial_value=True)
         show_collision = server.gui.add_checkbox("Collision geoms", initial_value=False)
+        show_hand_contact = server.gui.add_checkbox(
+            "Hand–object contact", initial_value=True
+        )
 
     scene: ViserMujocoScene | None = None
     active_key: str | None = None
+    contact_points = server.scene.add_point_cloud(
+        "/hand_contact_points",
+        points=np.zeros((0, 3), dtype=np.float64),
+        colors=(240, 60, 40),
+        point_size=0.022,
+        point_shape="circle",
+    )
 
     def apply_geom_visibility(vis_scene: ViserMujocoScene, model: mujoco.MjModel) -> None:
         visual_groups, collision_groups = _geom_group_kinds(model)
@@ -206,11 +249,21 @@ def play_viser(
             root_adr=root_adr,
             joint_adr=joint_adr,
         )
+        if show_hand_contact.value and frame.hand_contact is not None:
+            pts = _hand_contact_positions(model, data, frame)
+        else:
+            pts = np.zeros((0, 3), dtype=np.float64)
+        contact_points.points = pts
+        contact_points.visible = bool(show_hand_contact.value) and pts.shape[0] > 0
         if force or int(frame_slider.value) != local:
             frame_slider.value = local
         start = frame.root_pos
         server.initial_camera.position = start + np.array([2.5, -2.5, 1.5])
         server.initial_camera.look_at = start
+
+    @show_hand_contact.on_update
+    def _(_event: viser.GuiEvent) -> None:
+        publish(state["clip"], state["frame"], force=True)
 
     @clip_box.on_update
     def _(_event: viser.GuiEvent) -> None:

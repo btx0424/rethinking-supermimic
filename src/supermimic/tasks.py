@@ -394,7 +394,7 @@ class WeaveXHandTask(TaskSpec):
         self,
         object_name: str = "smalltable",
         split: str = "train",
-        simple_hands: bool = False,
+        simple_hands: bool = True,
         options: dict | None = None,
     ) -> None:
         from supermimic.utils.kinematics import XHAND_BODIES
@@ -454,7 +454,12 @@ class WeaveXHandTask(TaskSpec):
 
         name = self.motions_object_name
         assert name is not None
-        lib = WeaveXHandMotion.load(device=device, objects=(name,), split=self.split)
+        lib = WeaveXHandMotion.load(
+            device=device,
+            objects=(name,),
+            split=self.split,
+            simple_hands=self.simple_hands,
+        )
         return lib if self.has_object else lib.robot_only()
 
 

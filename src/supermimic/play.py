@@ -96,7 +96,7 @@ def _resolve_task(ckpt: Path | None, task_name: str | None) -> tuple[TaskSpec, d
                 "name": saved_cfg.get("task", task_name or "lafan1"),
                 "object_name": saved_cfg.get("object_name"),
                 "split": saved_cfg.get("split", "train"),
-                "simple_hands": saved_cfg.get("simple_hands", False),
+                "simple_hands": saved_cfg.get("simple_hands", True),
                 "has_object": saved_cfg.get("has_object"),
             }
         saved_cfg["task_cfg"] = node
@@ -191,6 +191,8 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
             with torch.no_grad():
                 action = policy(obs_hist, goal, norms, deterministic=True)
             out = sim.step(action, auto_reset=False)
+            # Playback stops at the end of the episode, whether the policy fell
+            # (``terminated``) or the clip ran out (``truncated``).
             return not bool(out["done"].any())
 
         return PolicyOverlay("supermimic", sim, reset, step, pose_np, object_pose_np)
@@ -227,6 +229,8 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
                 loc, _scale = actor(obs_n)
                 action = loc
             out = sim.step(action, auto_reset=False)
+            # Playback stops at the end of the episode, whether the policy fell
+            # (``terminated``) or the clip ran out (``truncated``).
             return not bool(out["done"].any())
 
         return PolicyOverlay("sac", sim, reset, step, pose_np, object_pose_np)

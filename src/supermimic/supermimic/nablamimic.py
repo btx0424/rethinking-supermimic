@@ -196,16 +196,18 @@ def nabla_imagine_horizon(
         _stack(prev_actions),
         terms=True,
     )
-    done = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
+    # Imagined rollouts only ever *terminate*: the horizon cut is not a truncation,
+    # it is handled by the bootstrap value at the end of the horizon.
+    terminated = mdp.soft_termination(flat[0], flat[1], _stack(frames[1:]))
     reward = reward.view(horizon, batch)
-    done = done.view(horizon, batch)
+    terminated = terminated.view(horizon, batch)
     term_raw = torch.stack([term_parts[name] for name in term_names]).view(
         len(term_names), horizon, batch
     )
     term_mean = term_raw.detach().mean(dim=(1, 2))
     reward_mean = reward.detach().mean()
     reward = reward / reward_scale
-    alive = torch.cumprod(1.0 - done, dim=0)
+    alive = torch.cumprod(1.0 - terminated, dim=0)
     survival = torch.cat((torch.ones(1, batch, device=device), alive[:-1]), dim=0)
     discount = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
     weighted = discount[:, None] * survival
@@ -237,7 +239,7 @@ def nabla_imagine_horizon(
     return {
         "policy_loss": policy_loss,
         "reward": reward.detach(),
-        "done": done.detach(),
+        "terminated": terminated.detach(),
         "alive_last": alive[-1].detach(),
         "reward_mean": reward_mean.detach(),
         "term_mean": term_mean,
@@ -348,7 +350,9 @@ class NablaTrainer(Trainer):
             "goals": raw["goals"],
             "xi": xi.unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
             "reward": raw["reward"],
-            "done": raw["done"],
+            # Imagined rollouts only ever *terminate*; the horizon cut is handled
+            # by the bootstrap term, not by truncation.
+            "terminated": raw["terminated"],
         }
         return {
             "policy_loss": raw["policy_loss"],

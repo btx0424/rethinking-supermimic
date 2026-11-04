@@ -16,6 +16,13 @@ class MultiStepReturn(nn.Module):
     Always consumes ``actions`` with shape ``[T, N, act_dim]`` and returns
     stacked actions with shape ``[N, T, act_dim]`` where steps beyond episode
     end are filled by repeating the terminal action.
+
+    ``done`` and ``terminated`` play different roles: accumulation stops at the
+    first ``done`` step (``done = terminated | truncated``, so a truncated row
+    contributes no reward from beyond the cut), but the bootstrap discount is
+    only zeroed by ``terminated``. A truncated transition therefore still
+    bootstraps from the value of its last observation, which is what makes
+    time-limited and clip-limited episodes unbiased.
     """
 
     def __init__(self, gamma: float, n_steps: int):

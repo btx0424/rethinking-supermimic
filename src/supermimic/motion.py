@@ -208,6 +208,9 @@ class MotionLib:
         if "hand_p" in data.files:
             lib.hand_p = torch.tensor(data["hand_p"])
             lib.hand_body_names = tuple(data["hand_body_names"].tolist())
+        if "hand_contact" in data.files:
+            lib.hand_contact = torch.tensor(data["hand_contact"])
+            lib.hand_contact_body_names = tuple(data["hand_contact_body_names"].tolist())
         return lib.to(device)
 
     @classmethod
@@ -241,8 +244,18 @@ class MotionLib:
         carries the object, but the goal, reward and critic layouts must match a
         robot-only task.
         """
-        for name in ("object_p", "object_quat", "object_v", "object_w",
-                     "object_v_local", "object_w_local", "hand_p", "hand_body_names"):
+        for name in (
+            "object_p",
+            "object_quat",
+            "object_v",
+            "object_w",
+            "object_v_local",
+            "object_w_local",
+            "hand_p",
+            "hand_body_names",
+            "hand_contact",
+            "hand_contact_body_names",
+        ):
             if hasattr(self, name):
                 delattr(self, name)
         self._prepare_goal()

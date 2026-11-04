@@ -1,0 +1,56 @@
+---
+description: Speed up smoke tests by disabling torch.compile and the compiled MDP
+alwaysApply: false
+globs: **/*.py, **/conf/**/*.yaml, scratch/**
+---
+
+# Smoke tests: disable compilation
+
+When you only need to prove a code path runs (a smoke test, a quick import/contract
+check, a 2–4 iteration run to catch shape or key errors), **turn compilation off**.
+Compilation costs tens of seconds per launch and is pure overhead when the run is
+too short to amortize it.
+
+## Flags
+
+The `supermimic` and `nablamimic` algorithms compile at startup:
+
+```
+compile=false compile_mdp=false
+```
+
+- `compile` — `torch.compile` of the world model, one imagination step, the critic,
+  and (for `nablamimic`) the nabla WM step.
+- `compile_mdp` — `torch.compile` of the analytic reward/FK heads.
+
+`sac` has no `torch.compile`; the flags are simply inert there.
+
+## Measured cost (`task=weave_xhand`, `num_envs=16`, 4 iterations, warm inductor cache)
+
+| | wall |
+|---|---|
+| `compile=false compile_mdp=false` | **15 s** |
+| defaults (`compile=true`) | **46 s** |
+
+`compile=false` is also what makes a smoke test fast on a *cold* cache — the
+difference grows to minutes there, since inductor has to trace and codegen before
+the first iteration.
+
+## Example
+
+```bash
+WEAVE_ROOT=$PWD/../Weave CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m supermimic.train \
+  task=weave_xhand algo=supermimic iterations=4 num_envs=16 wm_batch=8 horizon=4 \
+  log_every=2 compile=false compile_mdp=false swanlab.mode=disabled
+```
+
+Also worth adding to any throwaway run:
+
+- `log_every=1` — you want *an* iteration line in a 2–4 iteration run; the default
+  interval would print nothing.
+- `swanlab.mode=disabled` — no network, no run records.
+- `num_envs` small (8–16) and `wm_batch`/`horizon` small.
+
+Do **not** carry these flags into a real training run: they exist to make short
+runs fast, and removing them is what keeps the steady-state throughput measured in
+the config comments.
