@@ -59,6 +59,9 @@ def _supermimic_kwargs(cfg: DictConfig, run_dir: Path) -> dict:
         buffer_steps=int(cfg.buffer_steps),
         utd=float(cfg.utd),
         horizon=int(cfg.horizon),
+        horizon_pi=None if cfg.get("horizon_pi") is None else int(cfg.horizon_pi),
+        horizon_v=None if cfg.get("horizon_v") is None else int(cfg.horizon_v),
+        critic_source=str(cfg.get("critic_source", "imagined")),
         wm_window=int(cfg.wm_window),
         wm_batches=int(cfg.wm_batches),
         wm_batch=int(cfg.wm_batch),
@@ -218,6 +221,10 @@ def main(cfg: DictConfig) -> None:
         from supermimic.algos.supermimic import run
 
         run(_build_supermimic_cfg(cfg, run_dir), cfg.task, run_dir)
+    elif algo == "supermimic_vfirst":
+        from supermimic.algos.supermimic_vfirst import run
+
+        run(_build_supermimic_cfg(cfg, run_dir), cfg.task, run_dir)
     elif algo == "nablamimic":
         from supermimic.algos.nablamimic import run
 
@@ -227,7 +234,9 @@ def main(cfg: DictConfig) -> None:
 
         run(_build_sac_cfg(cfg, run_dir), cfg.task, run_dir)
     else:
-        raise ValueError(f"Unknown algo={algo!r}. Expected 'supermimic', 'nablamimic', or 'sac'.")
+        raise ValueError(
+            f"Unknown algo={algo!r}. Expected 'supermimic', 'supermimic_vfirst', 'nablamimic', or 'sac'."
+        )
 
 
 if __name__ == "__main__":

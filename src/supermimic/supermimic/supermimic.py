@@ -61,6 +61,14 @@ class TrainConfig:
     buffer_steps: int = 1000
     utd: float = 0.4
     horizon: int = 32
+    # Policy imagination length and critic-target length. ``None`` uses ``horizon``.
+    # The base trainer fits the critic on the policy rollout, so the two must match
+    # unless ``critic_source`` is ``sim``. ``supermimic_vfirst`` imagines them apart.
+    horizon_pi: int | None = None
+    horizon_v: int | None = None
+    # ``imagined``: λ-returns of the world-model rollout. ``sim``: λ-returns of the
+    # latest ``horizon_v`` simulator transitions in the replay buffer.
+    critic_source: str = "imagined"
     wm_window: int = 8
     wm_batches: int = 10
     wm_batch: int = 2048
@@ -1144,6 +1152,18 @@ class Trainer:
             if self._log_f is not None:
                 self._log_f.close()
 
+    @property
+    def horizon_pi(self) -> int:
+        """Imagination length the actor differentiates. ``horizon`` when unset."""
+        raw = self.cfg.horizon_pi
+        return self.cfg.horizon if raw is None else int(raw)
+
+    @property
+    def horizon_v(self) -> int:
+        """Rollout length the critic's λ-return is computed on. ``horizon`` when unset."""
+        raw = self.cfg.horizon_v
+        return self.cfg.horizon if raw is None else int(raw)
+
     def _step(self, iteration: int) -> None:
         cfg = self.cfg
         schedules = (
@@ -1172,10 +1192,22 @@ class Trainer:
 
         # One index build per iteration; sampling below is pure gathers.
         log_now = (iteration + 1) % cfg.log_every == 0
+        # One rollout supplies both gradients, so the two lengths are the same
+        # number. A sim critic reads the buffer instead and may use another length.
+        if cfg.critic_source == "imagined" and self.horizon_pi != self.horizon_v:
+            raise ValueError(
+                f"horizon_pi={self.horizon_pi} and horizon_v={self.horizon_v} differ, but "
+                "supermimic fits the critic on the policy rollout. Set them equal, or "
+                "use critic_source=sim, or algo=supermimic_vfirst."
+            )
+        if cfg.critic_source not in ("imagined", "sim"):
+            raise ValueError(
+                f"critic_source={cfg.critic_source!r}. Expected 'imagined' or 'sim'."
+            )
         motion = self.sim.mdp.motion
         clip_last = (motion.clip_end[motion.clip_id] - 1)[self.buffer.f]
         self.buffer.prepare(
-            cfg.wm_window, start_horizon=cfg.horizon, clip_last=clip_last
+            cfg.wm_window, start_horizon=self.horizon_pi, clip_last=clip_last
         )
 
         with timed(self.device):
@@ -1192,8 +1224,15 @@ class Trainer:
                 start, diagnose_reward=diagnose_reward, iteration=iteration
             )
 
+        if cfg.critic_source == "sim":
+            critic_batch = self.sim_critic_batch()
         with timed(self.device):
-            v_loss, gn_v, value_mean = self.update_critic(critic_batch)
+            if critic_batch is None:
+                v_loss = pi_loss.new_zeros(())
+                gn_v = 0.0
+                value_mean = v_loss
+            else:
+                v_loss, gn_v, value_mean = self.update_critic(critic_batch)
         self.timing["critic"].append(timed.last)
 
         # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
@@ -1515,7 +1554,7 @@ class Trainer:
             return self.wm_ema
         return self.wm
 
-    def _imagine_graph(self, start: dict[str, torch.Tensor]) -> dict:
+    def _imagine_graph(self, start: dict[str, torch.Tensor], horizon: int | None = None) -> dict:
         """Differentiable imagination rollout and return pieces (shared by train / diagnostics)."""
         cfg = self.cfg
         scale = (
@@ -1523,6 +1562,7 @@ class Trainer:
             if self.reward_norm is not None
             else start["s"].new_ones(())
         )
+        horizon = self.horizon_pi if horizon is None else int(horizon)
         (
             policy_loss,
             step_return,
@@ -1562,7 +1602,7 @@ class Trainer:
             start["body_pos"],
             start["body_quat"],
             scale,
-            cfg.horizon,
+            horizon,
             cfg.gamma,
             not cfg.stochastic_actor,
             self._imagine_step,
@@ -1580,7 +1620,7 @@ class Trainer:
             "objects": critic_objects,
             "frames": frames,
             "goals": goals,
-            "xi": xi.unsqueeze(0).expand(cfg.horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
+            "xi": xi.unsqueeze(0).expand(horizon + 1, -1, -1).reshape(-1, xi.shape[-1]),
             "reward": reward,
             # Imagined rollouts only ever *terminate* (soft termination prob); the
             # horizon cut is handled by the bootstrap term, not by truncation.
@@ -1599,12 +1639,16 @@ class Trainer:
             "bootstrap": bootstrap,
             "actions": actions,
             "survival": survival,
-            "horizon": cfg.horizon,
+            "horizon": horizon,
         }
 
-    def imagine(self, start: dict[str, torch.Tensor]):
-        """One differentiable rollout. Returns the policy loss and detached critic data."""
-        g = self._imagine_graph(start)
+    def imagine(self, start: dict[str, torch.Tensor], horizon: int | None = None):
+        """One differentiable rollout. Returns the policy loss and detached critic data.
+
+        ``horizon`` defaults to :attr:`horizon_pi`. The value pass of
+        ``supermimic_vfirst`` passes :attr:`horizon_v` instead.
+        """
+        g = self._imagine_graph(start, horizon=horizon)
         return (
             g["policy_loss"],
             g["critic_batch"],
@@ -1736,6 +1780,84 @@ class Trainer:
         if self.pi_ema_tau is not None and self.policy_ema is not None:
             soft_copy_(self.policy, self.policy_ema, self.pi_ema_tau)
         return grad_norm
+
+    def sim_critic_batch(self) -> dict | None:
+        """λ-return batch from the latest ``horizon_v`` simulator transitions.
+
+        One window per environment, ending at that environment's newest row and
+        staying inside one episode. The states are the ones the simulator wrote
+        into the replay buffer; the reward and the hard termination are the
+        analytic MDP evaluated on those states, which is what the simulator
+        itself used. ``None`` when no environment has a full window yet.
+        """
+        horizon = self.horizon_v
+        buf = self.buffer
+        if buf.filled < horizon or horizon < 1:
+            return None
+        device = buf.device
+        if buf.filled < buf.capacity:
+            last = buf.filled - 1
+            rows = last - torch.arange(horizon - 1, -1, -1, device=device)
+        else:
+            last = (buf.ptr - 1) % buf.capacity
+            rows = (last - torch.arange(horizon - 1, -1, -1, device=device)) % buf.capacity
+        rows = rows[:, None].expand(horizon, buf.num_envs).contiguous()
+        env = torch.arange(buf.num_envs, device=device)
+        ep = buf.ep[rows, env]
+        step = buf.step[rows, env]
+        valid = (ep == ep[:1]).all(0) & ((step[1:] - step[:-1]) == 1).all(0)
+        if horizon == 1:
+            valid = (ep == ep[:1]).all(0)
+        if not bool(valid.any()):
+            return None
+        rows, env = rows[:, valid], env[valid]
+        s = buf.s[rows, env]
+        s1 = buf.s1[rows, env]
+        action = buf.a[rows, env]
+        a_prev = buf.a_prev[rows, env]
+        frame = buf.f[rows, env]
+        xi = buf.xi[rows, env]
+        # Decision states, plus the successor of the last transition. Intermediate
+        # successors are the next row's ``s`` because the window never crosses a reset.
+        s_seq = torch.cat((s, s1[-1:]), dim=0)
+        motion = self.sim.mdp.motion
+        clip_last = motion.clip_end[motion.clip_id[frame]] - 1
+        f_next = torch.minimum(frame + 1, clip_last)
+        f_seq = torch.cat((frame, f_next[-1:]), dim=0)
+        xi_seq = torch.cat((xi, xi[-1:]), dim=0)
+        steps, n = action.shape[:2]
+        flat_n = steps * n
+        p1, quat1, v1, w1, q1, qd1 = unflatten_state(s1.reshape(flat_n, -1))
+        obj_flat = None
+        obj_seq = None
+        if buf.obj is not None:
+            obj = buf.obj[rows, env]
+            obj1 = buf.obj1[rows, env]
+            op, oq, ov, ow = unflatten_object(obj1.reshape(flat_n, -1))
+            successor = WorldModelState(p1, quat1, v1, w1, q1, qd1, None, None, op, oq, ov, ow)
+            obj_seq = torch.cat((obj, obj1[-1:]), dim=0)
+            op_s, oq_s, ov_s, ow_s = unflatten_object(obj_seq.reshape((steps + 1) * n, -1))
+            obj_flat = (op_s, oq_s, ov_s, ow_s)
+        else:
+            successor = WorldModelState(p1, quat1, v1, w1, q1, qd1, None, None)
+        mdp = self.sim.mdp
+        reward = mdp.reward(
+            successor, f_next.reshape(flat_n), action.reshape(flat_n, -1), a_prev.reshape(flat_n, -1)
+        ).view(steps, n)
+        terminated = mdp.termination(p1, quat1, f_next.reshape(flat_n)).view(steps, n)
+        scale = self.reward_norm.scale().detach() if self.reward_norm is not None else reward.new_ones(())
+        p, quat, v, w, q, qd = unflatten_state(s_seq.reshape((steps + 1) * n, -1))
+        return {
+            "states": (p, quat, v, w, q, qd),
+            "objects": obj_flat,
+            "frames": f_seq.reshape(-1),
+            "goals": motion.goal(f_seq.reshape(-1), GOAL_FRAMES),
+            "xi": xi_seq.reshape(-1, xi_seq.shape[-1]),
+            "reward": (reward / scale).detach(),
+            # Hard fall, not the imagination's soft termination. Truncation is not
+            # a termination, so a time-limit or clip-end step still bootstraps.
+            "terminated": terminated.detach().float(),
+        }
 
     def update_critic(self, batch: dict) -> tuple[torch.Tensor, float, torch.Tensor]:
         cfg = self.cfg

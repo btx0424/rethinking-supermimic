@@ -5,6 +5,13 @@ defaults:
 algo: supermimic
 
 horizon: 32
+# null uses `horizon`. supermimic requires horizon_pi == horizon_v unless
+# critic_source is sim. supermimic_vfirst imagines the two lengths separately.
+horizon_pi: null
+horizon_v: null
+# imagined: critic λ-returns on the world-model rollout.
+# sim: critic λ-returns on the latest horizon_v simulator transitions.
+critic_source: imagined
 wm_window: 8
 wm_batches: 10
 wm_batch: 2048
