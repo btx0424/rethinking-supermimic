@@ -12,22 +12,20 @@ dependencies = [
     "matplotlib>=3.11.2",
     "mjlab>=1.6.0",
     "mujoco>=3.11.0,<3.12",
-    "torch>=2.7.0",
-    "torchvision",
-    "warp-lang>=1.14.0",
 ]
 
 [project.optional-dependencies]
-# PyPI torch 2.14 and warp-lang 1.18 are CUDA 13 builds (driver >= 580).
+# CUDA 13 (driver >= 580): PyPI torch / Warp are CUDA 13 builds.
 # uv sync --no-default-groups --extra cu13
 cu13 = [
-    "torch>=2.7.0",
+    "torch>=2.14.0",
     "torchvision",
     "warp-lang==1.18.0",
 ]
 
 [dependency-groups]
-# CUDA 12.6 torch and Warp's +cu12 wheel. Default, for the driver 12.8 machine.
+# CUDA 12.6 torch + Warp +cu12 wheel. Default for older drivers.
+# Requires wheels/warp_lang-1.18.0+cu12-*.whl (GitHub releases often time out).
 # uv sync
 cu12 = [
     "torch>=2.7.0",
@@ -52,7 +50,7 @@ torchvision = [
     { index = "pytorch-cu126", group = "cu12" },
 ]
 warp-lang = [
-    { url = "https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0%2Bcu12-py3-none-manylinux_2_28_x86_64.whl", group = "cu12" },
+    { path = "wheels/warp_lang-1.18.0+cu12-py3-none-manylinux_2_28_x86_64.whl", group = "cu12" },
 ]
 
 [[tool.uv.index]]
