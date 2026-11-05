@@ -126,7 +126,10 @@ def cache_path_for(
 
 
 def _contact_scene(object_name: str, *, simple_hands: bool = True) -> tuple[mujoco.MjModel, dict]:
-    """Robot + free object with the same collision policy as :class:`WeaveXHandTask`.
+    """Robot + free object for hand–object contact labels.
+
+    Collision flags match :class:`WeaveXHandTask`, except fingertip detection uses
+    :data:`FINGERTIP_CONTACT_GAP` (5 cm) rather than the 1 cm training adhesion gap.
 
     Returns the compiled model and a dict of qpos addresses / geom→body maps used by
     :func:`label_hand_object_contacts`. CollisionCfg is applied to each entity
@@ -144,9 +147,16 @@ def _contact_scene(object_name: str, *, simple_hands: bool = True) -> tuple[mujo
     for collision in object_cfg(object_name).collisions:
         collision.edit_spec(obj)
     robot.attach(obj, prefix="", frame=robot.worldbody.add_frame())
-    from supermimic.robots.g1_xhand import add_fingertip_object_adhesion
+    from supermimic.robots.g1_xhand import (
+        FINGERTIP_CONTACT_GAP,
+        add_fingertip_object_adhesion,
+        set_fingertip_contact_gap,
+    )
 
     add_fingertip_object_adhesion(robot)
+    # Labeling needs a wider band than the 1 cm training adhesion gap. Pairs
+    # still carry the 2 N value, but this scene is kinematic and never steps.
+    set_fingertip_contact_gap(robot, FINGERTIP_CONTACT_GAP)
     model = robot.compile()
 
     joint_names = hinge_joint_names(model)
@@ -277,8 +287,9 @@ class HandObjectContactLabeler:
             bits = labels[i]
             for c in range(data.ncon):
                 con = data.contact[c]
-                if con.dist >= con.includemargin:
-                    continue
+                # ``ncon`` already keeps only ``dist < margin + gap``. Do not also
+                # require ``dist < includemargin``: that drops the prospective
+                # band the wider contact gap exists to capture.
                 g1 = int(con.geom1)
                 g2 = int(con.geom2)
                 if g1 in hand_geom_body and g2 in obj_geoms:
@@ -303,9 +314,9 @@ def label_hand_object_contacts(
 
     Poses the training robot + object colliders at each reference frame, runs
     ``mj_forward`` (no dynamics), and marks a hand body in contact when one of its
-    geoms has an active contact with an object collision geom
-    (``dist < includemargin``). Shape ``(T, H)`` float32 in ``{0, 1}``, with body
-    names in model-body order (wrists then fingers).
+    geoms is within the fingertip contact gap of an object collision geom
+    (``dist < margin + gap``, wider than the training adhesion gap). Shape
+    ``(T, H)`` float32 in ``{0, 1}``, with body names in model-body order.
     """
     labeler = HandObjectContactLabeler(object_name, simple_hands=simple_hands)
     labels = labeler.label(
@@ -461,6 +472,41 @@ class WeaveXHandMotion(Motion):
         )
 
 
+def _add_prospective_contact_pairs(
+    spec: mujoco.MjSpec,
+    object_name: str,
+    *,
+    gap: float,
+) -> None:
+    """Fingertip-sphere vs object-primitive pairs so the viewer can read contacts.
+
+    The object primitives stay non-colliding for the rest of the scene (contype 0).
+    An explicit pair still reports the closest points inside ``gap``. Both hands,
+    thumb included. No adhesion: this scene is not simulated.
+    """
+    spheres = [
+        geom.name
+        for geom in spec.geoms
+        if geom.name and "_sensor_link_sph_" in geom.name
+    ]
+    objects = [
+        geom.name
+        for geom in spec.geoms
+        if geom.name and geom.name.startswith(f"{object_name}_collision_")
+    ]
+    existing = {(pair.geomname1, pair.geomname2) for pair in spec.pairs}
+    for sphere in spheres:
+        for obj in objects:
+            if (sphere, obj) in existing or (obj, sphere) in existing:
+                continue
+            pair = spec.add_pair()
+            pair.geomname1 = sphere
+            pair.geomname2 = obj
+            pair.condim = 1
+            pair.gap = gap
+            existing.add((sphere, obj))
+
+
 def _object_collision_xml(object_name: str) -> str:
     """Object primitive colliders for the viewer (group 3, non-contacting)."""
     from supermimic.robots.object_xhand import _primitive_xml
@@ -509,10 +555,11 @@ def _scene_xml(object_name: str, *, simple_hands: bool = True) -> str:
     merged = robot_xml.replace("</asset>", f"{asset}</asset>").replace(
         "</worldbody>", f"{body}</worldbody>"
     )
-    from supermimic.robots.g1_xhand import add_fingertip_spheres
+    from supermimic.robots.g1_xhand import FINGERTIP_CONTACT_GAP, add_fingertip_spheres
 
     spec = mujoco.MjSpec.from_string(merged)
     add_fingertip_spheres(spec)
+    _add_prospective_contact_pairs(spec, object_name, gap=FINGERTIP_CONTACT_GAP)
     for geom in spec.geoms:
         name = geom.name or ""
         if name.startswith(f"{object_name}_collision_"):

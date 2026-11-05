@@ -210,9 +210,14 @@ def compile_g1_xhand(simple: bool = False) -> tuple[mujoco.MjModel, tuple[str, .
 
 
 # Small sphere on each XHand sensor pad (the fingertip). Radius matches the
-# ~16 mm pad width. ``gap`` is the adhesion detection band beyond the surface.
+# ~16 mm pad width.
 FINGERTIP_SPHERE_RADIUS = 0.008
-FINGERTIP_GAP = 0.01
+# Training pull turns on only inside this band. A pair replaces geom gap, so
+# this is the adhesion range during simulation.
+FINGERTIP_ADHESION_GAP = 0.01
+# Wider band used only when labeling prospective hand–object contacts. The
+# 1 cm adhesion gap misses near approaches that should still count as contact.
+FINGERTIP_CONTACT_GAP = 0.05
 # Constant pull (newtons) of a non-thumb fingertip sphere on the object.
 FINGERTIP_ADHESION = 2.0
 _FINGERTIP_SPHERE = r"^(left|right)_hand_.*_sensor_link_sph_[0-9]+$"
@@ -260,7 +265,7 @@ def robot_cfg(simple: bool = False) -> EntityCfg:
                 priority={pattern: 1 for pattern in groups},
                 friction={pattern: (1.0, 5e-3, 5e-4) for pattern in groups},
                 # Only the fingertip spheres; other matched geoms keep gap 0.
-                gap={_FINGERTIP_SPHERE: FINGERTIP_GAP},
+                gap={_FINGERTIP_SPHERE: FINGERTIP_ADHESION_GAP},
             ),
         ),
     )
@@ -269,9 +274,9 @@ def robot_cfg(simple: bool = False) -> EntityCfg:
 def add_fingertip_spheres(spec: mujoco.MjSpec) -> None:
     """One sphere on each XHand sensor pad, in that visual's frame.
 
-    Both hands, thumb included. ``condim`` 6 and ``gap`` 0.01 are set here and
-    again by :func:`robot_cfg` so a spec that skips ``CollisionCfg`` (the
-    kinematic viewer) still has them. Massless, so the URDF inertial is unchanged.
+    Both hands, thumb included. ``condim`` 6 and the training adhesion gap are
+    set here and again by :func:`robot_cfg`. Massless, so the URDF inertial is
+    unchanged. Contact labeling widens the gap afterwards; this default does not.
     """
     present = {geom.name for geom in spec.geoms if geom.name}
     for geom in list(spec.geoms):
@@ -293,7 +298,7 @@ def add_fingertip_spheres(spec: mujoco.MjSpec) -> None:
         sphere.priority = 1
         sphere.friction = [1.0, 5e-3, 5e-4]
         sphere.solref = [0.01, 1.0]
-        sphere.gap = FINGERTIP_GAP
+        sphere.gap = FINGERTIP_ADHESION_GAP
         sphere.group = 3
         sphere.density = 0.0
         sphere.rgba = [0.85, 0.25, 0.2, 1.0]
@@ -330,10 +335,31 @@ def add_fingertip_object_adhesion(spec: mujoco.MjSpec) -> None:
             pair.geomname2 = obj
             pair.condim = 6
             pair.adhesion = FINGERTIP_ADHESION
-            pair.gap = FINGERTIP_GAP
+            pair.gap = FINGERTIP_ADHESION_GAP
             pair.friction = [1.0, 1.0, 5e-3, 5e-4, 5e-4]
             pair.solref = [0.01, 1.0]
             existing.add((sphere, obj))
+
+
+def set_fingertip_contact_gap(spec: mujoco.MjSpec, gap: float = FINGERTIP_CONTACT_GAP) -> None:
+    """Widen fingertip detection without changing the training adhesion range.
+
+    Explicit pairs replace geom gap, so both the spheres and the fingertip–object
+    pairs are updated. Adhesion magnitude is left alone. Call this on the
+    kinematic labeling scene only.
+    """
+    for geom in spec.geoms:
+        leaf = (geom.name or "").rsplit("/", 1)[-1]
+        if leaf.endswith("_sph_0") and "_sensor_link_" in leaf:
+            geom.gap = gap
+    for pair in spec.pairs:
+        g1 = pair.geomname1.rsplit("/", 1)[-1]
+        g2 = pair.geomname2.rsplit("/", 1)[-1]
+        names = (g1, g2)
+        if any(name.endswith("_sph_0") and "_sensor_link_" in name for name in names) and any(
+            name.startswith("object_collision_") for name in names
+        ):
+            pair.gap = gap
 
 
 def action_scale(joint_names: tuple[str, ...]) -> list[float]:

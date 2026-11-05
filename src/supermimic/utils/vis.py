@@ -115,6 +115,39 @@ def _named_body_positions(
     return np.stack(positions, axis=0)
 
 
+def _prospective_contact_segments(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+) -> np.ndarray:
+    """Normal segments from each fingertip sphere to the object surface.
+
+    Shape ``(N, 2, 3)``. For a sphere the closest-point segment is the contact
+    normal: ``contact.pos`` is the midpoint, ``frame[0]`` points from geom 1
+    toward geom 2, and ``dist`` is the signed separation.
+    """
+    segments: list[np.ndarray] = []
+    for index in range(data.ncon):
+        con = data.contact[index]
+        name1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(con.geom1)) or ""
+        name2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(con.geom2)) or ""
+        sphere_first = "_sensor_link_sph_" in name1
+        sphere_second = "_sensor_link_sph_" in name2
+        if sphere_first == sphere_second:
+            continue
+        normal = np.asarray(con.frame[:3], dtype=np.float64)
+        midpoint = np.asarray(con.pos, dtype=np.float64)
+        half = 0.5 * float(con.dist) * normal
+        # normal points from geom1 to geom2, so geom2's witness is midpoint + half.
+        point1 = midpoint - half
+        point2 = midpoint + half
+        fingertip = point1 if sphere_first else point2
+        surface = point2 if sphere_first else point1
+        segments.append(np.stack((fingertip, surface), axis=0))
+    if not segments:
+        return np.zeros((0, 2, 3), dtype=np.float64)
+    return np.stack(segments, axis=0)
+
+
 def _hand_contact_positions(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -206,6 +239,9 @@ def play_viser(
         show_hand_contact = server.gui.add_checkbox(
             "Hand–object contact", initial_value=True
         )
+        show_prospective = server.gui.add_checkbox(
+            "Prospective contacts", initial_value=True
+        )
         hand_obj_bodies = tuple(getattr(session, "hand_obj_bodies", ()) or ())
         show_hand_obj = None
         if hand_obj_bodies:
@@ -220,6 +256,14 @@ def play_viser(
         point_size=0.022,
         point_shape="circle",
     )
+    prospective_lines = server.scene.add_line_segments(
+        "/prospective_contacts",
+        points=np.zeros((1, 2, 3), dtype=np.float64),
+        colors=(40, 210, 160),
+        thickness=2.5,
+        thickness_units="screen",
+    )
+    prospective_lines.visible = False
     hand_obj_points = None
     if hand_obj_bodies:
         hand_obj_points = server.scene.add_point_cloud(
@@ -285,6 +329,15 @@ def play_viser(
             pts = np.zeros((0, 3), dtype=np.float64)
         contact_points.points = pts
         contact_points.visible = bool(show_hand_contact.value) and pts.shape[0] > 0
+        if show_prospective.value:
+            segments = _prospective_contact_segments(model, data)
+        else:
+            segments = np.zeros((0, 2, 3), dtype=np.float64)
+        if segments.shape[0] == 0:
+            prospective_lines.visible = False
+        else:
+            prospective_lines.points = segments
+            prospective_lines.visible = True
         if hand_obj_points is not None and show_hand_obj is not None:
             if show_hand_obj.value:
                 hand_pts = _named_body_positions(model, data, hand_obj_bodies)
@@ -299,6 +352,10 @@ def play_viser(
         server.initial_camera.look_at = start
 
     @show_hand_contact.on_update
+    def _(_event: viser.GuiEvent) -> None:
+        publish(state["clip"], state["frame"], force=True)
+
+    @show_prospective.on_update
     def _(_event: viser.GuiEvent) -> None:
         publish(state["clip"], state["frame"], force=True)
 
