@@ -47,8 +47,8 @@ def policy_obs(sim, *, noise: bool = True) -> torch.Tensor:
     return torch.cat([obs, goal], dim=-1)
 
 
-def critic_input(sim, norms) -> torch.Tensor:
-    """Normalized critic input, including the object block for HOI tasks."""
+def critic_parts(sim) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Raw critic blocks ``(inv, goal, xi, priv, obj_or_none)`` before ``InputNorms``."""
     p, quat, v, w, q, qd = sim.state()
     inv = invariant_features(p, quat, v, w, q, qd)
     goal = sim.motion.goal(sim.f, GOAL_FRAMES)
@@ -56,6 +56,26 @@ def critic_input(sim, norms) -> torch.Tensor:
     obj = sim.object_state() if sim.task.has_object else None
     priv = sim.mdp.privileged(p, quat, v, w, q, qd, sim.f, object_state=obj)
     obj_feat = object_features(p, quat, *obj) if obj is not None else None
+    return inv, goal, xi_n, priv, obj_feat
+
+
+def critic_input_raw(sim) -> torch.Tensor:
+    """Unnormalized critic input (same layout as :func:`critic_input`).
+
+    Stored in the replay / prior archive so a training run can renormalize with
+    its own ``InputNorms``.
+    """
+    inv, goal, xi_n, priv, obj_feat = critic_parts(sim)
+    parts = [inv]
+    if obj_feat is not None:
+        parts.append(obj_feat)
+    parts.extend((goal, xi_n, priv))
+    return torch.cat(parts, dim=-1)
+
+
+def critic_input(sim, norms) -> torch.Tensor:
+    """Normalized critic input, including the object block for HOI tasks."""
+    inv, goal, xi_n, priv, obj_feat = critic_parts(sim)
     return norms.critic(inv, goal, xi_n, priv, obj_feat)
 
 

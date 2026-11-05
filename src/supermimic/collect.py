@@ -27,15 +27,16 @@ mean; plain RLPD mixes demonstrations, so the default is deterministic.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 from supermimic.policies import (
     build_sim,
     has_ema,
-    load_critic_norms,
     load_policy,
     task_from_checkpoint,
 )
@@ -46,6 +47,10 @@ from supermimic.sac.replay_buffer import ReplayBuffer
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Prior archives live beside the motion caches; ``data/`` is git-ignored.
 PRIOR_DIR = _REPO_ROOT / "data" / "prior"
+# Matches ``TrainConfig.soft_bound`` in ``sac.sac`` (mean-action L6 penalty scale).
+_SAC_SOFT_BOUND = 3.0 * math.pi
+# Trim this fraction from each tail when reporting a "practical" range.
+_ACTION_TAIL = 0.005
 
 
 def default_out_dir(ckpt: Path | str) -> Path:
@@ -99,9 +104,6 @@ def collect(
     # from the tracking reward alone (bonus removed) to match ``supermimic.eval``.
     sim = build_sim(task, cfg, device, num_envs=n, survival_bonus=1.0)
     policy = load_policy(saved, cfg, task, sim, device, live=live)
-    # The archive always uses SAC's critic layout, so it needs SAC's normalizers
-    # regardless of which trainer produced the policy.
-    critic_norms = load_critic_norms(saved, task, sim.mdp.obs_dim, device)
     weights = "online" if live else ("EMA" if has_ema(saved) else "only")
     print(f"policy: {policy.algo} ({policy.kind}, {weights}) · {n} envs", flush=True)
 
@@ -126,17 +128,27 @@ def collect(
     track_returns = torch.zeros(n, device=device)
     terminated_any = torch.zeros(n, dtype=torch.bool, device=device)
     truncated_any = torch.zeros(n, dtype=torch.bool, device=device)
+    # Actual steps taken while the episode was live (not the full clip length).
+    ep_lengths = torch.zeros(n, device=device)
+    # Live-step actions only (post-done steps are still pushed to the ring but
+    # should not set the practical action range).
+    live_actions: list[torch.Tensor] = []
     bonus = sim.survival_bonus
     t0 = time.time()
+    pbar = tqdm(total=n, desc="Collect clips", unit="clip")
     with torch.no_grad():
         while steps < horizon and bool(live_mask.any()):
             policy_obs = sac_features.policy_obs(sim, noise=False)
-            critic = sac_features.critic_input(sim, critic_norms)
+            # Raw critic features: the consuming SAC run renormalizes with its own
+            # ``InputNorms`` (same path as online transitions).
+            critic = sac_features.critic_input_raw(sim)
             fresh = (sim.ep_step == 0).float().unsqueeze(-1)
             action = policy.act()
             recorded = action
             if action_noise > 0:
                 recorded = action + action_noise * torch.randn_like(action)
+            if bool(live_mask.any()):
+                live_actions.append(recorded[live_mask].detach())
             out = sim.step(recorded, auto_reset=False)
             buffer.push(
                 {
@@ -156,8 +168,16 @@ def collect(
             track_returns = track_returns + tracking * live_mask.float()
             terminated_any = terminated_any | (out["terminated"].bool() & live_mask)
             truncated_any = truncated_any | (out["truncated"].bool() & live_mask)
+            finished = live_mask & out["done"]
+            ep_lengths = torch.where(finished, out["ep_len"].float(), ep_lengths)
             live_mask = live_mask & ~out["done"]
             steps += 1
+            pbar.n = n - int(live_mask.sum().item())
+            pbar.set_postfix(steps=steps, alive=int(live_mask.sum().item()), refresh=False)
+            pbar.refresh()
+    # Horizon cut: still-live envs contribute their steps so far.
+    ep_lengths = torch.where(live_mask, sim.ep_step.float(), ep_lengths).clamp(min=1.0)
+    pbar.close()
     if steps < 1:
         raise RuntimeError("Rollout produced no transitions.")
 
@@ -166,9 +186,16 @@ def collect(
         track_returns,
         terminated_any,
         truncated_any,
+        ep_lengths,
         steps,
         live=live,
         algo=policy.algo,
+    )
+    action_stats = _report_action_ranges(
+        torch.cat(live_actions, dim=0) if live_actions else recorded.new_zeros(0, task.num_joints),
+        joint_names=tuple(sim.robot.joint_names),
+        soft_bound=_SAC_SOFT_BOUND,
+        tail=_ACTION_TAIL,
     )
 
     path = save_rollout(
@@ -188,6 +215,7 @@ def collect(
             "episodes": n,
             "action_noise": float(action_noise),
             "deterministic": action_noise <= 0,
+            "action_ranges": action_stats,
         },
     )
     print(
@@ -203,6 +231,7 @@ def _report_scores(
     returns: torch.Tensor,
     terminated: torch.Tensor,
     truncated: torch.Tensor,
+    ep_lengths: torch.Tensor,
     steps: int,
     *,
     live: bool,
@@ -210,21 +239,18 @@ def _report_scores(
 ) -> float:
     """Print the evaluation-protocol score of the collected policy.
 
-    ``normalized_return`` is the clip return over the maximum attainable reward —
-    the same quantity ``supermimic.eval`` reports — so the archive can be judged
-    before it is used as prior data. Each env rolls out one clip, so the clip
-    lengths are gathered by the env's clip id rather than taking all 779.
+    ``normalized_return`` is the episode return over the maximum attainable
+    reward for the steps actually taken (termination, truncation, or horizon
+    cut), not the full reference clip length. Early falls are not diluted by
+    the remaining clip frames the policy never saw.
 
     ``terminated`` and ``truncated`` are reported separately: a clip that was
     cut by the time limit or the end of the reference clip did not fail, so it
-    must not be counted as one. ``returns`` are discounted only to the extent
-    the simulator accumulates them undiscounted; ``sim.ep_ret`` already does the
-    same accounting, so the ratio is the evaluation metric either way.
+    must not be counted as one.
     """
     motion = sim.motion
     clip_of_env = motion.clip_id[sim.f].long()
-    lengths = (motion.clip_end[clip_of_env] - motion.clip_start[clip_of_env] - 1).clamp(min=1).float()
-    score = returns / (sim.mdp.max_step_reward * lengths)
+    score = returns / (sim.mdp.max_step_reward * ep_lengths)
     mean = float(score.mean())
     which = "online" if live else "policy"
     print(
@@ -243,8 +269,90 @@ def _report_scores(
             flag = "TRNC"
         else:
             flag = "    "
-        print(f"  {flag} {names[int(clip_of_env[idx])]:32s} {float(score[idx]):.3f}", flush=True)
+        print(
+            f"  {flag} {names[int(clip_of_env[idx])]:32s} {float(score[idx]):.3f}  "
+            f"len {int(ep_lengths[idx])}",
+            flush=True,
+        )
     return mean
+
+
+def _report_action_ranges(
+    actions: torch.Tensor,
+    *,
+    joint_names: tuple[str, ...],
+    soft_bound: float,
+    tail: float = _ACTION_TAIL,
+) -> dict:
+    """Robust per-joint and global action ranges from live rollout actions.
+
+    ``tail`` is trimmed from each end (default 0.5%), so a few spikes do not set
+    the reported range. Compares the practical |a| envelope to SAC's
+    ``soft_bound`` (the L6 mean penalty scale), which is what motivated this
+    report.
+    """
+    if actions.numel() == 0:
+        print("[action ranges] no live actions recorded", flush=True)
+        return {}
+    if actions.dim() != 2:
+        raise ValueError(f"actions must be [N, act_dim], got {tuple(actions.shape)}")
+    n, act_dim = actions.shape
+    low_q = float(tail)
+    high_q = 1.0 - float(tail)
+    # ``quantile`` needs a float tensor; keep on the action device.
+    a = actions.float()
+    per_low = torch.quantile(a, low_q, dim=0)
+    per_high = torch.quantile(a, high_q, dim=0)
+    per_abs = torch.maximum(per_low.abs(), per_high.abs())
+    flat = a.reshape(-1)
+    abs_flat = flat.abs()
+    global_low = float(torch.quantile(flat, low_q))
+    global_high = float(torch.quantile(flat, high_q))
+    global_abs = float(torch.quantile(abs_flat, high_q))
+    global_abs_max = float(abs_flat.max())
+    frac_above = float((abs_flat > soft_bound).float().mean())
+    names = list(joint_names) if len(joint_names) == act_dim else [f"a{i}" for i in range(act_dim)]
+
+    print(
+        f"[action ranges] n={n}  trim={100 * tail:.2f}% each tail  "
+        f"soft_bound={soft_bound:.4g} (=3π)",
+        flush=True,
+    )
+    print(
+        f"  global p{100 * low_q:.1f}..p{100 * high_q:.1f} "
+        f"[{global_low:.4g}, {global_high:.4g}]  "
+        f"|a| p{100 * high_q:.1f}={global_abs:.4g}  "
+        f"|a|_max={global_abs_max:.4g}  "
+        f"frac(|a|>soft_bound)={frac_above:.3g}",
+        flush=True,
+    )
+    # Joints with the largest practical |a|, so a soft_bound that is too tight
+    # shows up as a short list of offenders rather than a 29-line dump.
+    order = torch.argsort(per_abs, descending=True).tolist()
+    print("  per-joint practical |a| (largest first):", flush=True)
+    for idx in order:
+        lo = float(per_low[idx])
+        hi = float(per_high[idx])
+        print(
+            f"    {names[idx]:32s}  [{lo: .4g}, {hi: .4g}]  "
+            f"|a|≤{float(per_abs[idx]):.4g}",
+            flush=True,
+        )
+
+    return {
+        "tail": float(tail),
+        "soft_bound": float(soft_bound),
+        "n_live_actions": int(n),
+        "global_low": global_low,
+        "global_high": global_high,
+        "global_abs_p_high": global_abs,
+        "global_abs_max": global_abs_max,
+        "frac_abs_above_soft_bound": frac_above,
+        "joint_names": names,
+        "per_joint_low": per_low.cpu().tolist(),
+        "per_joint_high": per_high.cpu().tolist(),
+        "per_joint_abs": per_abs.cpu().tolist(),
+    }
 
 
 def main() -> None:

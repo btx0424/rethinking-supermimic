@@ -102,14 +102,38 @@ class ReplayBuffer:
         next_critic = self._bootstrap(cur_crit, succ_crit, boot)
         return next_obs, next_critic
 
+    def _sample_time_indices(self, batch_size: int, steps: int, *, next_obs: bool) -> torch.Tensor:
+        """Time indices whose forward window stays in contiguous episode time.
+
+        When the ring is full, ``_ptr`` is the oldest slot and ``(_ptr - 1) % max``
+        is the newest. A window that walks from the newest back onto the oldest
+        crosses the write frontier and mixes unrelated segments — those starts
+        are rejected. ``next_obs=True`` also requires one valid successor past
+        the last transition in the window.
+        """
+        need = steps + (1 if next_obs else 0)
+        if self._size < need:
+            raise RuntimeError(
+                f"Replay needs {need} contiguous steps to sample (steps={steps}, "
+                f"next_obs={next_obs}), but buffer only has {self._size}."
+            )
+        n_valid = self._size - need + 1
+        # Offsets from the oldest filled slot along increasing time.
+        offset = torch.randint(0, n_valid, (batch_size,), device=self.device)
+        if self._size < self.max_size:
+            # Contiguous fill from index 0; oldest is 0, newest is size - 1.
+            return offset
+        # Full ring: oldest is ``_ptr``.
+        return (self._ptr + offset) % self.max_size
+
     def sample(self, batch_size: int, steps: int = 1, *, next_obs: bool = False) -> dict[str, torch.Tensor]:
         if self._size == 0:
             raise RuntimeError("Cannot sample from an empty replay buffer.")
         if steps < 1:
             raise ValueError(f"steps must be >= 1, got {steps}.")
         batch_size = int(batch_size)
-        idx = torch.randint(0, self.num_samples, (batch_size,), device=self.device)
-        t, e = torch.unravel_index(idx, (self._size, self.num_envs))
+        e = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+        t = self._sample_time_indices(batch_size, steps, next_obs=next_obs)
 
         if steps == 1:
             out = {

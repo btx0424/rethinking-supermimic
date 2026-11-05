@@ -325,6 +325,39 @@ class InputNorms(nn.Module):
         parts.extend((self.goal(goal), self.xi(xi_n), self.priv(priv)))
         return torch.cat(parts, dim=-1)
 
+    def normalize_critic_features(self, flat: torch.Tensor) -> torch.Tensor:
+        """Apply running norms to a flat raw critic vector from :func:`critic_input_raw`.
+
+        Layout matches :meth:`critic`: ``inv``, optional ``obj``, ``goal``, ``xi``, ``priv``.
+        """
+        dim = flat.shape[-1]
+        expected = (
+            self.state.mean.numel()
+            + (self.obj.mean.numel() if self.obj is not None else 0)
+            + self.goal.mean.numel()
+            + self.xi.mean.numel()
+            + self.priv.mean.numel()
+        )
+        if dim != expected:
+            raise ValueError(f"Critic feature width {dim} != {expected} from InputNorms.")
+        i0 = 0
+        i1 = i0 + self.state.mean.numel()
+        parts = [self.state(flat[..., i0:i1])]
+        i0 = i1
+        if self.obj is not None:
+            i1 = i0 + self.obj.mean.numel()
+            parts.append(self.obj(flat[..., i0:i1]))
+            i0 = i1
+        i1 = i0 + self.goal.mean.numel()
+        parts.append(self.goal(flat[..., i0:i1]))
+        i0 = i1
+        i1 = i0 + self.xi.mean.numel()
+        parts.append(self.xi(flat[..., i0:i1]))
+        i0 = i1
+        i1 = i0 + self.priv.mean.numel()
+        parts.append(self.priv(flat[..., i0:i1]))
+        return torch.cat(parts, dim=-1)
+
     def update(self, inv: torch.Tensor, obs: torch.Tensor, goal: torch.Tensor, action: torch.Tensor, xi_n: torch.Tensor) -> None:
         self.state.update(inv)
         self.obs.update(obs)

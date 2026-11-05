@@ -98,6 +98,23 @@ def forward_scene(
         scene.update_from_arrays(xpos[None], xmat[None])
 
 
+def _named_body_positions(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    names: tuple[str, ...],
+) -> np.ndarray:
+    """World origins of ``names``, shape ``(K, 3)``. Missing bodies are skipped."""
+    positions = []
+    for name in names:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            continue
+        positions.append(np.asarray(data.xpos[body_id], dtype=np.float64))
+    if not positions:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.stack(positions, axis=0)
+
+
 def _hand_contact_positions(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -189,6 +206,10 @@ def play_viser(
         show_hand_contact = server.gui.add_checkbox(
             "Hand–object contact", initial_value=True
         )
+        hand_obj_bodies = tuple(getattr(session, "hand_obj_bodies", ()) or ())
+        show_hand_obj = None
+        if hand_obj_bodies:
+            show_hand_obj = server.gui.add_checkbox("hand_obj_pos bodies", initial_value=True)
 
     scene: ViserMujocoScene | None = None
     active_key: str | None = None
@@ -199,6 +220,15 @@ def play_viser(
         point_size=0.022,
         point_shape="circle",
     )
+    hand_obj_points = None
+    if hand_obj_bodies:
+        hand_obj_points = server.scene.add_point_cloud(
+            "/hand_obj_pos",
+            points=np.zeros((0, 3), dtype=np.float64),
+            colors=(255, 196, 40),
+            point_size=0.02,
+            point_shape="circle",
+        )
 
     def apply_geom_visibility(vis_scene: ViserMujocoScene, model: mujoco.MjModel) -> None:
         visual_groups, collision_groups = _geom_group_kinds(model)
@@ -255,6 +285,13 @@ def play_viser(
             pts = np.zeros((0, 3), dtype=np.float64)
         contact_points.points = pts
         contact_points.visible = bool(show_hand_contact.value) and pts.shape[0] > 0
+        if hand_obj_points is not None and show_hand_obj is not None:
+            if show_hand_obj.value:
+                hand_pts = _named_body_positions(model, data, hand_obj_bodies)
+            else:
+                hand_pts = np.zeros((0, 3), dtype=np.float64)
+            hand_obj_points.points = hand_pts
+            hand_obj_points.visible = bool(show_hand_obj.value) and hand_pts.shape[0] > 0
         if force or int(frame_slider.value) != local:
             frame_slider.value = local
         start = frame.root_pos
@@ -264,6 +301,12 @@ def play_viser(
     @show_hand_contact.on_update
     def _(_event: viser.GuiEvent) -> None:
         publish(state["clip"], state["frame"], force=True)
+
+    if show_hand_obj is not None:
+
+        @show_hand_obj.on_update
+        def _(_event: viser.GuiEvent) -> None:
+            publish(state["clip"], state["frame"], force=True)
 
     @clip_box.on_update
     def _(_event: viser.GuiEvent) -> None:

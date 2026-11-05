@@ -420,19 +420,28 @@ class RewardL1Loss(nn.Module):
         action = batch["a"].transpose(0, 1).reshape(steps * batch_size, -1)
         a_prev = batch["a_prev"].transpose(0, 1).reshape(steps * batch_size, -1)
         obj_pred = obj_true = None
+        obj_prev = None
         if self.mdp.task.has_object:
-            if obj_preds is None or "obj1" not in batch:
-                raise ValueError("Object reward-L1 needs obj_preds and batch['obj1'].")
+            if obj_preds is None or "obj1" not in batch or "obj" not in batch:
+                raise ValueError("Object reward-L1 needs obj_preds and batch['obj'/'obj1'].")
             obj_pred = unflatten_object(obj_preds.reshape(steps * batch_size, -1))
             obj_true = unflatten_object(batch["obj1"].transpose(0, 1).reshape(steps * batch_size, -1))
+            obj_prev = unflatten_object(batch["obj"].transpose(0, 1).reshape(steps * batch_size, -1))
+
         def _reward_state(flat: torch.Tensor, obj):
             root = unflatten_state(flat)
             obj_fields = obj if obj is not None else (None, None, None, None)
-            return WorldModelState(*root, None, None, *obj_fields)
+            prev_p = prev_q = None
+            if obj_prev is not None:
+                prev_p, prev_q = obj_prev[0], obj_prev[1]
+            return WorldModelState(*root, None, None, *obj_fields, None, None, None, prev_p, prev_q)
 
-        reward_pred = self.mdp.reward(_reward_state(pred, obj_pred), frame, action, a_prev)
+        # Real transitions: hard object-motion gate (matches the simulator reward).
+        reward_pred = self.mdp.reward(_reward_state(pred, obj_pred), frame, action, a_prev, surrogate=False)
         with torch.no_grad():
-            reward_true = self.mdp.reward(_reward_state(true, obj_true), frame, action, a_prev)
+            reward_true = self.mdp.reward(
+                _reward_state(true, obj_true), frame, action, a_prev, surrogate=False
+            )
         return (reward_pred - reward_true).abs().mean()
 
 
@@ -741,14 +750,30 @@ def imagine_horizon(
     flat = _flatten_time(states[1:])
     object_state = _flatten_object_time(states[1:]) if mdp.task.has_object else None
     obj_fields = object_state if object_state is not None else (None, None, None, None)
-    reward_state = WorldModelState(*flat, None, None, *obj_fields)
+    obj_p_prev = obj_quat_prev = None
+    if mdp.task.has_object:
+        # states[0]..states[-2] are the pre-step object poses for each imagination step.
+        prev_object = _flatten_object_time(states[:-1])
+        obj_p_prev, obj_quat_prev = prev_object[0], prev_object[1]
+    reward_state = WorldModelState(
+        *flat, None, None, *obj_fields, None, None, None, obj_p_prev, obj_quat_prev
+    )
     frames_flat = _stack(frames[1:])
     actions_flat = _stack(actions)
     prev_flat = _stack(prev_actions)
-    if getattr(mdp, "reward_terms_compiled", False):
-        reward, term_parts = mdp.reward_flat(reward_state, frames_flat, actions_flat, prev_flat)
-    else:
-        reward, term_parts = mdp.reward(reward_state, frames_flat, actions_flat, prev_flat, terms=True)
+    # Imagination uses the surrogate object-motion gate so a resting predicted
+    # object still gets a gradient toward the reference increment.
+    prev_surrogate = mdp.object_reward_surrogate
+    mdp.object_reward_surrogate = True
+    try:
+        if getattr(mdp, "reward_terms_compiled", False):
+            reward, term_parts = mdp.reward_flat(reward_state, frames_flat, actions_flat, prev_flat)
+        else:
+            reward, term_parts = mdp.reward(
+                reward_state, frames_flat, actions_flat, prev_flat, terms=True, surrogate=True
+            )
+    finally:
+        mdp.object_reward_surrogate = prev_surrogate
     # Imagined rollouts only ever *terminate*: the horizon cut is not a truncation,
     # it is handled by the bootstrap value at the end of the horizon.
     terminated = mdp.soft_termination(flat[0], flat[1], frames_flat)

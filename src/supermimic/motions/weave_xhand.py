@@ -144,6 +144,9 @@ def _contact_scene(object_name: str, *, simple_hands: bool = True) -> tuple[mujo
     for collision in object_cfg(object_name).collisions:
         collision.edit_spec(obj)
     robot.attach(obj, prefix="", frame=robot.worldbody.add_frame())
+    from supermimic.robots.g1_xhand import add_fingertip_object_adhesion
+
+    add_fingertip_object_adhesion(robot)
     model = robot.compile()
 
     joint_names = hinge_joint_names(model)
@@ -506,7 +509,10 @@ def _scene_xml(object_name: str, *, simple_hands: bool = True) -> str:
     merged = robot_xml.replace("</asset>", f"{asset}</asset>").replace(
         "</worldbody>", f"{body}</worldbody>"
     )
+    from supermimic.robots.g1_xhand import add_fingertip_spheres
+
     spec = mujoco.MjSpec.from_string(merged)
+    add_fingertip_spheres(spec)
     for geom in spec.geoms:
         name = geom.name or ""
         if name.startswith(f"{object_name}_collision_"):
@@ -533,6 +539,8 @@ class _WeaveXHandVisSession:
     clip_lengths: np.ndarray
     hand_contact: np.ndarray
     hand_contact_body_names: tuple[str, ...]
+    # Fingertip links whose world positions enter the ``hand_obj_pos`` reward.
+    hand_obj_bodies: tuple[str, ...] = ()
     simple_hands: bool = True
 
     @property
@@ -550,6 +558,7 @@ class _WeaveXHandVisSession:
         simple_hands: bool = True,
     ) -> _WeaveXHandVisSession:
         from supermimic.motion import TARGET_FPS, _resample
+        from supermimic.utils.kinematics import XHAND_BODIES
 
         unknown = [name for name in objects if name not in AVAILABLE_OBJECTS]
         if unknown:
@@ -633,6 +642,7 @@ class _WeaveXHandVisSession:
             clip_lengths=clip_lengths,
             hand_contact=hand_contact,
             hand_contact_body_names=contact_bodies,
+            hand_obj_bodies=XHAND_BODIES,
             simple_hands=simple_hands,
         )
 

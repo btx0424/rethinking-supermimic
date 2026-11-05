@@ -59,6 +59,9 @@ class TaskSpec:
     sim: SimCfg = field(default_factory=SimCfg)
     # Object tasks: which clip split the motion cache was built from.
     split: str = "train"
+    # Subset of ``mdp.OBJECT_REWARD_TERM_NAMES`` used when ``has_object``.
+    # ``None`` keeps the absolute Weave defaults (pose/twist + hand_obj_pos).
+    object_rewards: tuple[str, ...] | None = None
     # Every other key of the task config node. Tasks may read their own flags from
     # here; the shared fields above are the ones the MDP and the networks need.
     options: dict = field(default_factory=dict)
@@ -76,6 +79,17 @@ class TaskSpec:
             raise ValueError(f"{self.name}: object_name set but has_object is False.")
         if self.hand_bodies and not self.has_object:
             raise ValueError(f"{self.name}: hand_bodies require has_object.")
+        if self.object_rewards is not None and not self.has_object:
+            raise ValueError(f"{self.name}: object_rewards require has_object.")
+        if self.object_rewards is not None:
+            from supermimic.mdp import OBJECT_REWARD_TERM_NAMES
+
+            known = set(OBJECT_REWARD_TERM_NAMES)
+            unknown = [name for name in self.object_rewards if name not in known]
+            if unknown:
+                raise ValueError(
+                    f"{self.name}: unknown object_rewards {unknown}. Known: {sorted(known)}."
+                )
 
     @property
     def motions_object_name(self) -> str | None:
@@ -107,6 +121,7 @@ class TaskSpec:
         object.__setattr__(clone, "cache_object_name", self.motions_object_name)
         object.__setattr__(clone, "object_name", None)
         object.__setattr__(clone, "hand_bodies", ())
+        object.__setattr__(clone, "object_rewards", None)
         # Keep the task's solver budget. Dropping the object does not remove the
         # robot's contacts: the XHand hand geoms alone overflow the robot-only
         # default (``njmax=500``), which silently degrades the simulated data and
@@ -321,6 +336,7 @@ class WeaveTask(TaskSpec):
         self,
         object_name: str = "smalltable",
         split: str = "train",
+        object_rewards: tuple[str, ...] | None = None,
         options: dict | None = None,
     ) -> None:
         super().__init__(
@@ -335,6 +351,7 @@ class WeaveTask(TaskSpec):
             # Finger + object contacts: overflow asked for njmax≈554.
             sim=SimCfg(nconmax=256, njmax=768),
             split=split,
+            object_rewards=object_rewards,
             options=dict(options or {}),
         )
 
@@ -395,6 +412,7 @@ class WeaveXHandTask(TaskSpec):
         object_name: str = "smalltable",
         split: str = "train",
         simple_hands: bool = True,
+        object_rewards: tuple[str, ...] | None = None,
         options: dict | None = None,
     ) -> None:
         from supermimic.utils.kinematics import XHAND_BODIES
@@ -413,6 +431,7 @@ class WeaveXHandTask(TaskSpec):
             # object contact and the solver's warm-start rows.
             sim=SimCfg(nconmax=256, njmax=1200),
             split=split,
+            object_rewards=object_rewards,
             options=dict(options or {}),
         )
         self.simple_hands = bool(simple_hands)
@@ -470,7 +489,7 @@ _TASKS: dict[str, type[TaskSpec]] = {
 }
 
 # Keys of the ``task`` config node that map to explicit constructor arguments.
-_TASK_FIELDS = ("name", "object_name", "split", "simple_hands", "has_object")
+_TASK_FIELDS = ("name", "object_name", "split", "simple_hands", "has_object", "object_rewards")
 
 
 def _task_options(task_cfg) -> dict:
@@ -484,13 +503,23 @@ def _task_options(task_cfg) -> dict:
     return {key: value for key, value in items if key not in _TASK_FIELDS}
 
 
+def _object_rewards_from_config(task_cfg) -> tuple[str, ...] | None:
+    """Parse the optional ``object_rewards`` list from a task config node."""
+    if task_cfg is None or not hasattr(task_cfg, "get"):
+        return None
+    value = task_cfg.get("object_rewards")
+    if value is None:
+        return None
+    return tuple(str(name) for name in value)
+
+
 def make_task_from_config(task_cfg) -> TaskSpec:
     """Build the task from a ``task`` config node (one per task config group).
 
     The node carries the shared keys (``name``, ``object_name``, ``split``,
-    ``simple_hands``, ``has_object``) plus any task-specific flags, which are
-    forwarded verbatim as :attr:`TaskSpec.options` so a task can define its own
-    without touching the trainer config.
+    ``simple_hands``, ``has_object``, ``object_rewards``) plus any task-specific
+    flags, which are forwarded verbatim as :attr:`TaskSpec.options` so a task
+    can define its own without touching the trainer config.
     """
     if task_cfg is None:
         raise ValueError("A task config node is required (defaults: `task: lafan1`).")
@@ -505,6 +534,7 @@ def make_task_from_config(task_cfg) -> TaskSpec:
         split=opt("split", str),
         simple_hands=opt("simple_hands", bool),
         has_object=opt("has_object", bool),
+        object_rewards=_object_rewards_from_config(task_cfg),
         options=_task_options(task_cfg),
     )
 
@@ -525,6 +555,7 @@ def make_task(
     split: str | None = None,
     simple_hands: bool | None = None,
     has_object: bool | None = None,
+    object_rewards: tuple[str, ...] | None = None,
     options: dict | None = None,
 ) -> TaskSpec:
     """Task with per-run overrides.
@@ -533,6 +564,9 @@ def make_task(
     ``weave_xhand`` only: its cache path is split-tagged, while the older
     ``weave`` cache holds both splits under one file. ``simple_hands`` likewise
     reaches ``weave_xhand`` only.
+
+    ``object_rewards`` selects which HOI reward terms to sum (see
+    ``mdp.OBJECT_REWARD_TERM_NAMES``). ``None`` keeps the absolute Weave defaults.
 
     ``has_object=False`` switches an object task to robot-only tracking: the scene
     object and every object observation/reward/termination term are dropped, while
@@ -551,6 +585,8 @@ def make_task(
         kwargs["split"] = split
     if name == "weave_xhand" and simple_hands is not None:
         kwargs["simple_hands"] = simple_hands
+    if name in ("weave", "weave_xhand") and object_rewards is not None:
+        kwargs["object_rewards"] = tuple(object_rewards)
     if name not in ("weave", "weave_xhand"):
         # Robot-only tasks have no options to forward.
         kwargs.pop("options")

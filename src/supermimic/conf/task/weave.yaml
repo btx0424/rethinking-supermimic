@@ -8,3 +8,13 @@ object_name: smalltable
 # The Weave release ships one rollout per object; the cache is not split-tagged.
 split: train
 simple_hands: false
+# HOI reward terms to sum (subset of mdp.OBJECT_REWARD_TERM_NAMES).
+# Absolute pose/twist (default) and/or ScaleTrack increment-gated motion/relation.
+object_rewards:
+  - object_pos
+  - object_ori
+  - object_lin_vel
+  - object_ang_vel
+  - hand_obj_pos
+  # - object_motion
+  # - object_relation

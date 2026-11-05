@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .utils.math import quat_error_angle
+from .utils.math import quat_conjugate, quat_error_angle, quat_apply_inverse, quat_mul, quat_to_rotvec
 from .mdp import (
     CONTROL_DT,
     REWARD_TERM_SCALE,
@@ -17,7 +17,97 @@ from .mdp import (
     gaussian_linear_kernel,
     hand_obj_relative_pos,
     hard_joint_violation,
+    previous_frame,
 )
+
+# Translation-equivalent length of a rotation (m / rad), shared by object_motion progress.
+_ROTATION_LENGTH = 0.15
+
+
+def _object_increment(p_prev, q_prev, p, q):
+    """Position delta and world-frame rotation vector of ``q * q_prev^-1``."""
+    return p - p_prev, quat_to_rotvec(quat_mul(q, quat_conjugate(q_prev)))
+
+
+def _object_tracking_components(dp, dr, target_dp, target_dr, pos_err, rot_err, vel_err, ang_vel_err, surrogate: bool):
+    """ScaleTrack ``tracking_components``: progress along the reference object increment.
+
+    Sim (``surrogate=False``) gates on both reference and object motion so a resting
+    object scores 0 with no gradient. Imagination (``surrogate=True``) keeps only the
+    reference gate so a still predicted object still gets a gradient toward moving.
+    The scalar is 0 in both cases when the object is still; only the gradient differs.
+    """
+    actual = torch.cat([dp, _ROTATION_LENGTH * dr], -1)
+    target = torch.cat([target_dp, _ROTATION_LENGTH * target_dr], -1)
+    energy = target.square().sum(-1)
+    alignment = (actual * target).sum(-1)
+    # Branch-free gate so ``torch.compile`` does not specialize on the bool.
+    ref_active = energy > 1e-8
+    obj_active = actual.square().sum(-1) > 1e-8
+    surrogate_t = energy.new_tensor(1.0 if surrogate else 0.0)
+    active = ref_active & (obj_active | (surrogate_t > 0.5))
+    # Cap at 1 from above; zero negative progress with ``where`` so a resting object
+    # (alignment == 0) still has ∂progress/∂actual under the surrogate. ``clamp(0, 1)``
+    # would kill that boundary gradient in PyTorch.
+    raw = alignment / energy.clamp_min(1e-12)
+    capped = raw.clamp(max=1.0)
+    nonneg = torch.where(raw >= 0, capped, torch.zeros_like(raw))
+    progress = torch.where(active, nonneg, torch.zeros_like(energy))
+    position = 0.5 * torch.exp(-(pos_err / 0.4).square()) + 0.5 * torch.exp(-(pos_err / 0.15).square())
+    rotation = torch.exp(-(rot_err / 0.4).square())
+    velocity = torch.exp(-(vel_err / 1.0).square())
+    angular = torch.exp(-(ang_vel_err / 3.14).square())
+    score = progress * position * (0.5 + 0.25 * rotation + 0.125 * velocity + 0.125 * angular)
+    return score, progress, position
+
+
+def _relation_error(body_pos, ref_body_pos, obj_p, obj_quat, ref_p, ref_quat) -> torch.Tensor:
+    """Weighted body positions in the object frame vs the demo (ScaleTrack ``relation_error``)."""
+    p = obj_p.unsqueeze(-2)
+    q = obj_quat.unsqueeze(-2)
+    rp = ref_p.unsqueeze(-2)
+    rq = ref_quat.unsqueeze(-2)
+    actual = quat_apply_inverse(q.expand(*body_pos.shape[:-1], 4), body_pos - p)
+    reference = quat_apply_inverse(rq.expand(*ref_body_pos.shape[:-1], 4), ref_body_pos - rp)
+    weight = torch.exp(-reference.square().sum(-1) / 0.4**2)
+    return ((actual - reference).square().sum(-1) * weight).sum(-1) / weight.sum(-1).clamp_min(1e-8)
+
+
+def _object_motion_parts(mdp, state: WorldModelState, frame: torch.Tensor):
+    """Shared object_motion / object_relation pieces for one step ending at ``frame``."""
+    if state.obj_p is None or state.obj_quat is None or state.obj_v is None or state.obj_w is None:
+        raise ValueError("object_motion reward needs state.obj_*.")
+    obj_p_prev, obj_quat_prev = state.object_prev()
+    if state.body_pos is None:
+        raise ValueError("object_relation reward needs state.body_pos.")
+    motion = mdp.motion
+    frame_prev = previous_frame(motion, frame)
+    dp, dr = _object_increment(obj_p_prev, obj_quat_prev, state.obj_p, state.obj_quat)
+    tdp, tdr = _object_increment(
+        motion.object_p[frame_prev],
+        motion.object_quat[frame_prev],
+        motion.object_p[frame],
+        motion.object_quat[frame],
+    )
+    pos_err = (state.obj_p - motion.object_p[frame]).norm(dim=-1)
+    rot_err = quat_error_angle(state.obj_quat, motion.object_quat[frame])
+    vel_err = (state.obj_v - motion.object_v[frame]).norm(dim=-1)
+    ang_err = (state.obj_w - motion.object_w[frame]).norm(dim=-1)
+    score, progress, position = _object_tracking_components(
+        dp, dr, tdp, tdr, pos_err, rot_err, vel_err, ang_err, mdp.object_reward_surrogate
+    )
+    relation = progress * position * torch.exp(
+        -_relation_error(
+            state.body_pos,
+            motion.body_p[frame],
+            state.obj_p,
+            state.obj_quat,
+            motion.object_p[frame],
+            motion.object_quat[frame],
+        )
+        / 0.15**2
+    )
+    return score, relation
 
 
 def _kernel_fn(style: str):
@@ -142,6 +232,36 @@ class ObjectAngVel(_TrackingReward):
         return (self.mdp.motion.object_w[frame] - state.obj_w).square().sum(-1)
 
 
+class ObjectMotion(RewardTerm):
+    """Increment-gated object tracking (ScaleTrack ``object_motion``)."""
+
+    name = "object_motion"
+    penalty = False
+    scale = None
+
+    def __call__(self, state, action, a_prev, frame):
+        score, relation = _object_motion_parts(self.mdp, state, frame)
+        # Stash for ``ObjectRelation`` in the same ``MDP.reward`` call.
+        self.mdp._object_reward_parts = (score, relation)
+        return self.weight * score * CONTROL_DT
+
+
+class ObjectRelation(RewardTerm):
+    """Body–object spatial relation gated by object progress (ScaleTrack ``object_relation``)."""
+
+    name = "object_relation"
+    penalty = False
+    scale = None
+
+    def __call__(self, state, action, a_prev, frame):
+        parts = getattr(self.mdp, "_object_reward_parts", None)
+        if parts is None:
+            _, relation = _object_motion_parts(self.mdp, state, frame)
+        else:
+            _, relation = parts
+        return self.weight * relation * CONTROL_DT
+
+
 class HandObjPos(_TrackingReward):
     name = "hand_obj_pos"
 
@@ -193,6 +313,8 @@ REWARD_TERM_CLASSES: dict[str, type[RewardTerm]] = {
     "object_ori": ObjectOri,
     "object_lin_vel": ObjectLinVel,
     "object_ang_vel": ObjectAngVel,
+    "object_motion": ObjectMotion,
+    "object_relation": ObjectRelation,
     "hand_obj_pos": HandObjPos,
     "action_rate": ActionRate,
     "joint_limit": JointLimit,
@@ -208,8 +330,9 @@ def build_reward_terms(mdp, names: tuple[str, ...]) -> list[RewardTerm]:
         cls = REWARD_TERM_CLASSES.get(name)
         if cls is None:
             raise KeyError(f"No reward term class for {name!r}.")
-        if getattr(cls, "penalty", False):
-            terms.append(cls(mdp, weight=pen_weights[name]))
+        if getattr(cls, "penalty", False) or name in ("object_motion", "object_relation"):
+            weight = pen_weights[name] if getattr(cls, "penalty", False) else style_weights[name]
+            terms.append(cls(mdp, weight=weight))
         else:
             terms.append(cls(mdp, weight=style_weights[name], scale=REWARD_TERM_SCALE[name]))
     return terms

@@ -96,16 +96,29 @@ REWARD_TERM_NAMES = (
     "action_rate",
     "joint_limit",
 )
-# Object HOI extras. Same σ / weights as root pose and body twist in object_hoi.
+# Object HOI extras. Tasks pick a subset via ``TaskSpec.object_rewards`` / the
+# ``object_rewards`` list in the task YAML. Absolute pose/twist terms match the
+# original Weave rewards; ``object_motion`` / ``object_relation`` are ScaleTrack's
+# increment-gated terms; ``hand_obj_pos`` is the local fingertip match.
 OBJECT_REWARD_TERM_NAMES = (
     "object_pos",
     "object_ori",
     "object_lin_vel",
     "object_ang_vel",
-    # Hand tips in the object frame vs the demo (object_hoi motion_hand_obj_relative_pos).
+    "object_motion",
+    "object_relation",
+    "hand_obj_pos",
+)
+# Default when an object task does not set ``object_rewards``.
+DEFAULT_OBJECT_REWARD_TERM_NAMES = (
+    "object_pos",
+    "object_ori",
+    "object_lin_vel",
+    "object_ang_vel",
     "hand_obj_pos",
 )
 # Shared length-scales (σ). Tracking uses the paper values; regularizers are style-specific uses.
+# ``object_motion`` / ``object_relation`` bake their own kernels and ignore this table.
 REWARD_TERM_SCALE = {
     "body_pos": 0.3,
     "body_ori": 0.4,
@@ -117,11 +130,14 @@ REWARD_TERM_SCALE = {
     "object_ori": 0.4,
     "object_lin_vel": 1.0,
     "object_ang_vel": 3.14,
+    "object_motion": 1.0,
+    "object_relation": 1.0,
     "hand_obj_pos": 0.1,
     "action_rate": 1.0,
     "joint_limit": 0.1,
 }
 # Peak |weight| before ×dt. Tracking weights match the paper; cauchy joint_limit is a bonus.
+# Object motion/relation weights match ScaleTrack ``ObjectHeadsCfg`` (w_motion / w_relation).
 _TRACKING_WEIGHTS = {
     "body_pos": 1.0,
     "body_ori": 1.0,
@@ -133,6 +149,8 @@ _TRACKING_WEIGHTS = {
     "object_ori": 1.0,
     "object_lin_vel": 1.0,
     "object_ang_vel": 1.0,
+    "object_motion": 2.0,
+    "object_relation": 0.5,
     "hand_obj_pos": 4.0,
 }
 REWARD_TERM_WEIGHT = {
@@ -194,21 +212,41 @@ def resolve_reward_style(style: str) -> str:
     return style
 
 
+def resolve_object_reward_terms(task: TaskSpec) -> tuple[str, ...]:
+    """Object reward terms selected by the task (empty when ``has_object`` is false)."""
+    if not task.has_object:
+        return ()
+    chosen = task.object_rewards
+    if chosen is None:
+        chosen = DEFAULT_OBJECT_REWARD_TERM_NAMES
+    known = set(OBJECT_REWARD_TERM_NAMES)
+    unknown = [name for name in chosen if name not in known]
+    if unknown:
+        raise ValueError(
+            f"{task.name}: unknown object_rewards {unknown}. Known: {sorted(known)}."
+        )
+    if not task.hand_bodies:
+        chosen = tuple(name for name in chosen if name != "hand_obj_pos")
+    return tuple(chosen)
+
+
 def reward_term_names(task: TaskSpec | None = None) -> tuple[str, ...]:
     """Reward terms that sum to the step reward for this task."""
     if task is not None and task.has_object:
         # Object terms sit with the other tracking kernels, before the penalties.
         base = REWARD_TERM_NAMES[:-2]
-        object_terms = OBJECT_REWARD_TERM_NAMES
-        if not task.hand_bodies:
-            object_terms = tuple(name for name in object_terms if name != "hand_obj_pos")
-        return base + object_terms + REWARD_TERM_NAMES[-2:]
+        return base + resolve_object_reward_terms(task) + REWARD_TERM_NAMES[-2:]
     return REWARD_TERM_NAMES
 
 
 def hand_obj_relative_pos(hand_p, obj_p, obj_quat) -> torch.Tensor:
     """Finger/hand link positions in the object frame, ``(..., n_hand, 3)``."""
     return quat_apply_inverse(obj_quat.unsqueeze(-2), hand_p - obj_p.unsqueeze(-2))
+
+
+def previous_frame(motion: MotionLib, frame: torch.Tensor) -> torch.Tensor:
+    """Clip-clamped ``frame - 1`` (the reference pose before this control step)."""
+    return torch.maximum(frame - 1, motion.clip_start[motion.clip_id[frame]])
 
 
 def max_step_reward(style: str = "gaussian", task: TaskSpec | None = None) -> float:
@@ -356,6 +394,10 @@ class WorldModelState(NamedTuple):
     """World-frame tracked-body angular velocity, (..., n_body, 3). Reward only."""
     hand_pos: torch.Tensor | None = None
     """World-frame finger link positions, (..., n_hand, 3). HOI reward only."""
+    obj_p_prev: torch.Tensor | None = None
+    """Object position before the control step. Needed by ``object_motion``."""
+    obj_quat_prev: torch.Tensor | None = None
+    """Object orientation before the control step. Needed by ``object_motion``."""
 
     def root(self) -> tuple[torch.Tensor, ...]:
         """The six root-and-joint tensors the buffer stores."""
@@ -366,6 +408,12 @@ class WorldModelState(NamedTuple):
         if self.obj_p is None or self.obj_quat is None or self.obj_v is None or self.obj_w is None:
             raise ValueError("WorldModelState is missing object fields.")
         return (self.obj_p, self.obj_quat, self.obj_v, self.obj_w)
+
+    def object_prev(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Object pose before the step. Raises if either prev field is missing."""
+        if self.obj_p_prev is None or self.obj_quat_prev is None:
+            raise ValueError("WorldModelState is missing object prev fields.")
+        return (self.obj_p_prev, self.obj_quat_prev)
 
     def flatten(self) -> torch.Tensor:
         return torch.cat(self.root(), dim=-1)
@@ -541,6 +589,9 @@ class MDP:
         self._reward_terms = build_reward_terms(self, self.term_names)
         # Set by ``compile_heads``; ``imagine_horizon`` reads it to pick the fused path.
         self.reward_terms_compiled = False
+        # When True, ``object_motion`` / ``object_relation`` keep a gradient on a
+        # resting object (imagination). Sim leaves this False; scalars still match.
+        self.object_reward_surrogate = False
         self.obs_dim = sum(term.dim for term in self._obs_terms)
         self.noise = torch.cat(
             [
@@ -618,6 +669,8 @@ class MDP:
         action,
         a_prev,
         terms: bool = False,
+        *,
+        surrogate: bool | None = None,
     ):
         """Per-step reward (×dt). ``reward_style`` changes tracking kernels only.
 
@@ -625,17 +678,28 @@ class MDP:
         Missing body pose/twist are filled with FK. Action-rate and joint-limit stay
         the paper penalties ``-w · feature · dt``.
 
+        ``surrogate=True`` (imagination) keeps the object-motion gradient when the
+        predicted object is still; sim leaves the default hard gate.
+
         With ``terms=True``, also return a name→tensor dict that sums to the reward.
         """
-        state = self._complete_reward_state(state)
-        parts = {term.name: term(state, action, a_prev, frame) for term in self._reward_terms}
-        names = self.term_names
-        reward = parts[names[0]]
-        for name in names[1:]:
-            reward = reward + parts[name]
-        if terms:
-            return reward, parts
-        return reward
+        prev_surrogate = self.object_reward_surrogate
+        if surrogate is not None:
+            self.object_reward_surrogate = bool(surrogate)
+        try:
+            self._object_reward_parts = None
+            state = self._complete_reward_state(state)
+            parts = {term.name: term(state, action, a_prev, frame) for term in self._reward_terms}
+            names = self.term_names
+            reward = parts[names[0]]
+            for name in names[1:]:
+                reward = reward + parts[name]
+            if terms:
+                return reward, parts
+            return reward
+        finally:
+            self.object_reward_surrogate = prev_surrogate
+            self._object_reward_parts = None
 
     def reward_flat(
         self,
@@ -649,12 +713,16 @@ class MDP:
         Compiling this (see :meth:`compile_heads`) fuses the analytic MDP, including
         the FK that fills missing body poses, into one graph. A ``WorldModelState`` is
         not a tensor, so it is unpacked here rather than by ``torch.compile`` itself.
+        Callers that want the imagination surrogate must set
+        ``object_reward_surrogate`` before calling.
         """
+        self._object_reward_parts = None
         state = self._complete_reward_state(state)
         parts = {term.name: term(state, action, a_prev, frame) for term in self._reward_terms}
         reward = parts[self.term_names[0]]
         for name in self.term_names[1:]:
             reward = reward + parts[name]
+        self._object_reward_parts = None
         return reward, parts
 
     def compile_heads(self, enabled: bool = True) -> None:

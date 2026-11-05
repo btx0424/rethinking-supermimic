@@ -188,13 +188,20 @@ def nabla_imagine_horizon(
     flat = _flatten_time(states[1:])
     object_state = _flatten_object_time(states[1:]) if mdp.task.has_object else None
     obj_fields = object_state if object_state is not None else (None, None, None, None)
-    reward_state = WorldModelState(*flat, None, None, *obj_fields)
+    obj_p_prev = obj_quat_prev = None
+    if mdp.task.has_object:
+        prev_object = _flatten_object_time(states[:-1])
+        obj_p_prev, obj_quat_prev = prev_object[0], prev_object[1]
+    reward_state = WorldModelState(
+        *flat, None, None, *obj_fields, None, None, None, obj_p_prev, obj_quat_prev
+    )
     reward, term_parts = mdp.reward(
         reward_state,
         _stack(frames[1:]),
         _stack(actions),
         _stack(prev_actions),
         terms=True,
+        surrogate=True,
     )
     # Imagined rollouts only ever *terminate*: the horizon cut is not a truncation,
     # it is handled by the bootstrap value at the end of the horizon.

@@ -162,7 +162,9 @@ def xhand_spec(simple: bool = False) -> mujoco.MjSpec:
     path = XML_SIMPLE_PATH if simple else XML_PATH
     if not path.is_file():
         raise FileNotFoundError(f"XHand MJCF not found at {path}.")
-    return mujoco.MjSpec.from_file(str(path))
+    spec = mujoco.MjSpec.from_file(str(path))
+    add_fingertip_spheres(spec)
+    return spec
 
 
 def _name_geoms(spec: mujoco.MjSpec) -> None:
@@ -207,17 +209,27 @@ def compile_g1_xhand(simple: bool = False) -> tuple[mujoco.MjModel, tuple[str, .
     return model, hinge_joint_names(model)
 
 
+# Small sphere on each XHand sensor pad (the fingertip). Radius matches the
+# ~16 mm pad width. ``gap`` is the adhesion detection band beyond the surface.
+FINGERTIP_SPHERE_RADIUS = 0.008
+FINGERTIP_GAP = 0.01
+# Constant pull (newtons) of a non-thumb fingertip sphere on the object.
+FINGERTIP_ADHESION = 2.0
+_FINGERTIP_SPHERE = r"^(left|right)_hand_.*_sensor_link_sph_[0-9]+$"
+
 # Colliders of the mesh-collided MJCF (``<link>_collision_<i>``).
 _MESH_COLLIDERS = (
     r"^(left|right)_foot_collision_[0-9]+$",
     r"^(left|right)_(hand|thumb|index|mid|ring|pinky)[a-z0-9_]*_collision_[0-9]+$",
     r"^(left|right)_xhand_adapter_link_collision_[0-9]+$",
+    _FINGERTIP_SPHERE,
 )
 # Colliders of the primitive-collided MJCF: feet plus ``<link>_{box,cyl,sph}_<i>``.
 _PRIMITIVE_COLLIDERS = (
     r"^(left|right)_foot_collision_[0-9]+$",
     r"^(left|right)_(hand|thumb|index|mid|ring|pinky)[a-z0-9_]*_(box|cyl|sph)_[0-9]+$",
     r"^(left|right)_xhand_adapter_link_(box|cyl|sph)_[0-9]+$",
+    _FINGERTIP_SPHERE,
 )
 
 
@@ -247,9 +259,81 @@ def robot_cfg(simple: bool = False) -> EntityCfg:
                 condim={pattern: 6 for pattern in groups},
                 priority={pattern: 1 for pattern in groups},
                 friction={pattern: (1.0, 5e-3, 5e-4) for pattern in groups},
+                # Only the fingertip spheres; other matched geoms keep gap 0.
+                gap={_FINGERTIP_SPHERE: FINGERTIP_GAP},
             ),
         ),
     )
+
+
+def add_fingertip_spheres(spec: mujoco.MjSpec) -> None:
+    """One sphere on each XHand sensor pad, in that visual's frame.
+
+    Both hands, thumb included. ``condim`` 6 and ``gap`` 0.01 are set here and
+    again by :func:`robot_cfg` so a spec that skips ``CollisionCfg`` (the
+    kinematic viewer) still has them. Massless, so the URDF inertial is unchanged.
+    """
+    present = {geom.name for geom in spec.geoms if geom.name}
+    for geom in list(spec.geoms):
+        name = geom.name or ""
+        if "_hand_" not in name or "_sensor_link_visual_" not in name:
+            continue
+        sphere_name = name.split("_visual_", 1)[0] + "_sph_0"
+        if sphere_name in present:
+            continue
+        sphere = geom.parent.add_geom()
+        sphere.name = sphere_name
+        sphere.type = mujoco.mjtGeom.mjGEOM_SPHERE
+        sphere.size = [FINGERTIP_SPHERE_RADIUS, 0.0, 0.0]
+        sphere.pos = list(geom.pos)
+        sphere.quat = list(geom.quat)
+        sphere.contype = 0
+        sphere.conaffinity = 1
+        sphere.condim = 6
+        sphere.priority = 1
+        sphere.friction = [1.0, 5e-3, 5e-4]
+        sphere.solref = [0.01, 1.0]
+        sphere.gap = FINGERTIP_GAP
+        sphere.group = 3
+        sphere.density = 0.0
+        sphere.rgba = [0.85, 0.25, 0.2, 1.0]
+        present.add(sphere_name)
+
+
+def add_fingertip_object_adhesion(spec: mujoco.MjSpec) -> None:
+    """2 N adhesion pairs from non-thumb fingertip spheres to object colliders.
+
+    An explicit pair keeps the pull off the floor: geom adhesion would stick
+    every contact of that sphere, while a pair applies only to the named
+    object geoms. The pair copies the sphere's condim and gap, because a pair
+    replaces those geom fields for its contact. The thumb spheres stay
+    ordinary contacts.
+    """
+    spheres: list[str] = []
+    objects: list[str] = []
+    for geom in spec.geoms:
+        name = geom.name or ""
+        leaf = name.rsplit("/", 1)[-1]
+        if leaf.endswith("_sph_0") and "_sensor_link_" in leaf and "_thumb_" not in leaf:
+            spheres.append(name)
+        elif leaf.startswith("object_collision_"):
+            objects.append(name)
+    if not spheres or not objects:
+        return
+    existing = {(pair.geomname1, pair.geomname2) for pair in spec.pairs}
+    for sphere in spheres:
+        for obj in objects:
+            if (sphere, obj) in existing or (obj, sphere) in existing:
+                continue
+            pair = spec.add_pair()
+            pair.geomname1 = sphere
+            pair.geomname2 = obj
+            pair.condim = 6
+            pair.adhesion = FINGERTIP_ADHESION
+            pair.gap = FINGERTIP_GAP
+            pair.friction = [1.0, 1.0, 5e-3, 5e-4, 5e-4]
+            pair.solref = [0.01, 1.0]
+            existing.add((sphere, obj))
 
 
 def action_scale(joint_names: tuple[str, ...]) -> list[float]:

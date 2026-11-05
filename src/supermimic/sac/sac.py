@@ -168,17 +168,20 @@ class SACAgent:
         device: torch.device,
         *,
         r_max: float,
+        norms: InputNorms,
     ):
         self.cfg = cfg
         self.device = device
         self.policy_obs_dim = policy_obs_dim
         self.critic_dim = critic_dim
         self.act_dim = act_dim
+        self.norms = norms
         self.entropy_scale = 1.0 / math.sqrt(act_dim)
 
         self.vecnorm = ObsVecNorm(policy_obs_dim).to(device) if cfg.vecnorm else None
         g_max = r_max / (1.0 - cfg.gamma)
-        if cfg.critic_kind == "classification" and cfg.normalize_reward:
+        # ``c51`` is the HL-Gauss / classification critic (see ``make_critic``).
+        if cfg.critic_kind in ("classification", "c51") and cfg.normalize_reward:
             v_min, v_max = -g_max, g_max
         else:
             v_min, v_max = cfg.critic_v_min, cfg.critic_v_max
@@ -358,8 +361,10 @@ class SACAgent:
         else:
             reward = reward * (1.0 - self.cfg.gamma)
 
-        obs_raw = batch["critic"]
-        next_q_raw = batch["next_critic"]
+        # Critic columns are stored raw; normalize with this run's InputNorms so
+        # prior rows and online rows share the same feature scale.
+        obs_raw = self._norm_critic(batch["critic"])
+        next_q_raw = self._norm_critic(batch["next_critic"])
         next_policy_raw = batch["next_obs"]
         if self.cfg.n_steps == 1:
             q = obs_raw
@@ -393,6 +398,12 @@ class SACAgent:
             act = act_n[:, 0]
             is_init = batch["is_init"][0]
         return q, act, next_q, next_policy, reward, discount, terminated, is_init
+
+    def _norm_critic(self, critic: torch.Tensor) -> torch.Tensor:
+        """Normalize a raw critic batch ``[..., critic_dim]`` (any leading shape)."""
+        flat = critic.reshape(-1, critic.shape[-1])
+        out = self.norms.normalize_critic_features(flat)
+        return out.reshape_as(critic)
 
     def train_critic(self, batch: dict[str, torch.Tensor], *, diagnostics: bool) -> dict:
         self.Q.train()
@@ -459,7 +470,7 @@ class SACAgent:
 
     def train_actor(self, batch: dict[str, torch.Tensor], *, diagnostics: bool) -> dict:
         policy_obs = self._norm_obs(batch["obs"])
-        q_state = batch["critic"]
+        q_state = self._norm_critic(batch["critic"])
         is_init = batch["is_init"]
         with hold_out_net(self.Q), autocast(self.device, self._amp):
             loc, scale = self.actor(policy_obs)
@@ -561,6 +572,7 @@ class Trainer:
             self.task.num_joints,
             self.device,
             r_max=self.r_max,
+            norms=self.norms,
         )
         self.buffer = ReplayBuffer(
             cfg.buffer_steps,
@@ -645,7 +657,9 @@ class Trainer:
         return sac_features.policy_obs(self.sim)
 
     def _critic_features(self) -> torch.Tensor:
-        return sac_features.critic_input(self.sim, self.norms)
+        # Raw features; ``SACAgent`` applies ``self.norms`` at update time so prior
+        # rows renormalize with the same running statistics as online rows.
+        return sac_features.critic_input_raw(self.sim)
 
     def _update_norms(self) -> None:
         sac_features.update_norms(self.sim, self.norms)

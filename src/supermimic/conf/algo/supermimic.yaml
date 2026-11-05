@@ -32,7 +32,7 @@ compile_mdp: true
 stochastic_actor: false
 grad_clip_norm: 1.0
 grad_clip_value: null
-normalize_reward: false
+normalize_reward: true
 compile: true
 compile_wm: window
 amp: bf16

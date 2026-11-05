@@ -29,6 +29,13 @@ DECIMATION = 4
 MAX_EPISODE_STEPS = 500  # 10 s at 50 Hz.
 
 
+def _fingertip_adhesion(spec) -> None:
+    """2 N pairs from non-thumb XHand fingertip spheres to the object. No-op otherwise."""
+    from supermimic.robots.g1_xhand import add_fingertip_object_adhesion
+
+    add_fingertip_object_adhesion(spec)
+
+
 def _as_torch(value) -> torch.Tensor:
     """Contact fields are tensor proxies in this mjlab build and warp arrays in others."""
     tensor = getattr(value, "_tensor", value)
@@ -75,6 +82,7 @@ class TrackingSim:
             env_spacing=2.0,
             terrain=TerrainEntityCfg(terrain_type="plane"),
             entities=entities,
+            spec_fn=_fingertip_adhesion if self.task.has_object else None,
         )
         self.scene = Scene(scene_cfg, device)
         sc = self.task.sim
@@ -318,6 +326,9 @@ class TrackingSim:
         hand1 = self.hand_positions() if self._hand_local is not None else None
         body_p, body_quat, body_v, body_w = bodies1
         obj_fields = obj1 if obj1 is not None else (None, None, None, None)
+        # ``object_motion`` scores the increment obj -> obj1 against the reference step.
+        obj_p_prev = obj[0] if obj is not None else None
+        obj_quat_prev = obj[1] if obj is not None else None
         reward_state = WorldModelState(
             p1,
             quat1,
@@ -331,8 +342,12 @@ class TrackingSim:
             body_v,
             body_w,
             hand1,
+            obj_p_prev,
+            obj_quat_prev,
         )
-        reward, terms = self.mdp.reward(reward_state, f_next, action, a_prev, terms=True)
+        reward, terms = self.mdp.reward(
+            reward_state, f_next, action, a_prev, terms=True, surrogate=False
+        )
         terminated = self.mdp.termination(p1, quat1, f_next)
         if self.survival_bonus:
             # The bonus is paid for staying alive, i.e. for not *terminating*.

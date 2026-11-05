@@ -21,6 +21,7 @@ from mjviser.conversions import get_body_name, is_fixed_body, merge_geoms
 from omegaconf import OmegaConf
 
 from supermimic.utils.kinematics import make_kinematics
+from supermimic.utils.vis import _geom_group_kinds
 from supermimic.mdp import GOAL_FRAMES, HIST, PAPER_OBS_TERMS, WorldModelState
 from supermimic.motion import MotionLib
 from supermimic.supermimic.network import InputNorms, build_policy
@@ -406,6 +407,50 @@ def play(
             initial_value=0,
         )
         legend = server.gui.add_markdown("")
+    hand_body_ids = [
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name) for name in task.hand_bodies
+    ]
+    missing_hands = [name for name, bid in zip(task.hand_bodies, hand_body_ids) if bid < 0]
+    if missing_hands:
+        raise KeyError(f"Play model is missing hand_obj_pos bodies: {missing_hands}")
+    with server.gui.add_folder("Display"):
+        show_visual = server.gui.add_checkbox("Visual geoms", initial_value=True)
+        show_collision = server.gui.add_checkbox("Collision geoms", initial_value=False)
+        show_hands = None
+        if hand_body_ids:
+            show_hands = server.gui.add_checkbox("hand_obj_pos bodies", initial_value=True)
+
+    def apply_geom_visibility() -> None:
+        visual_groups, collision_groups = _geom_group_kinds(model)
+        for group in visual_groups:
+            scene.geom_groups_visible[group] = bool(show_visual.value)
+        for group in collision_groups:
+            scene.geom_groups_visible[group] = bool(show_collision.value)
+        scene._sync_visibilities()
+        if ghost is not None:
+            visible = bool(show_visual.value)
+            for _body_id, handle in ghost.handles:
+                handle.visible = visible
+
+    apply_geom_visibility()
+
+    # World-frame origins of the bodies whose positions enter ``hand_obj_pos``.
+    hand_pts = server.scene.add_point_cloud(
+        "/hand_obj_pos",
+        points=np.zeros((0, 3), dtype=np.float64),
+        colors=(255, 196, 40),
+        point_size=0.02,
+        point_shape="circle",
+    )
+    hand_ref_pts = None
+    if overlay and hand_body_ids:
+        hand_ref_pts = server.scene.add_point_cloud(
+            "/hand_obj_pos_reference",
+            points=np.zeros((0, 3), dtype=np.float64),
+            colors=_REF_RGB,
+            point_size=0.016,
+            point_shape="circle",
+        )
 
     state = {"clip": 0, "need_reset": True, "frame": 0}
 
@@ -419,11 +464,17 @@ def play(
             legend.content = (
                 "solid = **policy**, blue ghost = **reference**"
                 + (", orange / blue meshes = **objects**" if has_object else "")
+                + (
+                    "; gold / blue points = **hand_obj_pos** bodies"
+                    if hand_body_ids
+                    else ""
+                )
             )
         else:
             legend.content = (
                 "**reference** only (pass `--ckpt` to overlay tracking)"
                 + ("; object mesh follows the clip" if has_object else "")
+                + ("; gold points = **hand_obj_pos** bodies" if hand_body_ids else "")
             )
 
     def reference_pose(clip: int, local: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -460,6 +511,18 @@ def play(
             elif obj_ref is not None and solid_obj is not None and not overlay:
                 # Reference-only: one object mesh follows the clip.
                 obj_ref.update(*solid_obj)
+            if show_hands is not None and show_hands.value:
+                hand_pts.points = xpos[hand_body_ids]
+                hand_pts.visible = True
+                if hand_ref_pts is not None and ghost is not None and ghost_pose is not None:
+                    hand_ref_pts.points = gx[hand_body_ids]
+                    hand_ref_pts.visible = True
+            else:
+                hand_pts.points = np.zeros((0, 3), dtype=np.float64)
+                hand_pts.visible = False
+                if hand_ref_pts is not None:
+                    hand_ref_pts.points = np.zeros((0, 3), dtype=np.float64)
+                    hand_ref_pts.visible = False
             server.flush()
 
     @clip_box.on_update
@@ -490,6 +553,15 @@ def play(
     last = time.perf_counter()
     # Republishing a held pose every loop tick is what saturates an SSH tunnel.
     shown: dict[str, tuple[int, int] | None] = {"key": None}
+
+    def _refresh_display(_event: viser.GuiEvent) -> None:
+        apply_geom_visibility()
+        shown["key"] = None
+
+    show_visual.on_update(_refresh_display)
+    show_collision.on_update(_refresh_display)
+    if show_hands is not None:
+        show_hands.on_update(_refresh_display)
 
     def publish(
         clip_i: int,
