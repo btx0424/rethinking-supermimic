@@ -81,25 +81,30 @@ class TorchKinematics:
         model: mujoco.MjModel,
         joint_names: tuple[str, ...],
         hand_bodies: tuple[str, ...] = (),
+        body_names: tuple[str, ...] | None = None,
     ):
         self.joint_names = joint_names
-        self.body_names = TRACKED_BODIES
+        self.body_names = TRACKED_BODIES if body_names is None else tuple(body_names)
         self.hand_body_names = tuple(hand_bodies)
         self.nbody = int(model.nbody)
         name_to_body = {
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i): i for i in range(model.nbody)
         }
-        missing = [name for name in TRACKED_BODIES if name not in name_to_body]
+        missing = [name for name in self.body_names if name not in name_to_body]
         if missing:
-            raise KeyError(f"Tracked bodies missing from the G1 model: {missing}")
+            raise KeyError(f"Tracked bodies missing from the robot model: {missing}")
         missing_hands = [name for name in self.hand_body_names if name not in name_to_body]
         if missing_hands:
             raise KeyError(f"Hand bodies missing from the robot model: {missing_hands}")
-        self.tracked_ids = [name_to_body[name] for name in TRACKED_BODIES]
+        self.tracked_ids = [name_to_body[name] for name in self.body_names]
         self.hand_ids = [name_to_body[name] for name in self.hand_body_names]
-        self.anchor_index = TRACKED_BODIES.index("torso_link")
-        self.pelvis_index = TRACKED_BODIES.index("pelvis")
-        self.anchor_name = "torso"
+        if "torso_link" in self.body_names:
+            self.anchor_index = self.body_names.index("torso_link")
+            self.anchor_name = "torso"
+        else:
+            self.anchor_index = 0
+            self.anchor_name = self.body_names[0]
+        self.pelvis_index = self.body_names.index("pelvis") if "pelvis" in self.body_names else 0
 
         qpos_adr = {}
         dof_adr = {}

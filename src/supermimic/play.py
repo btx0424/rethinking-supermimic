@@ -165,6 +165,10 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
         start_f = sim.motion.clip_start[clip].to(device).view(1)
         sim.reset(torch.zeros(1, dtype=torch.long, device=device), start_f)
 
+    wm_state = saved.get("wm") or {}
+    if any(str(key).startswith("encoder.") for key in wm_state):
+        return _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_pose_np, device)
+
     if "pi" in saved:
         policy = build_policy(
             sim.mdp.obs_dim, sim.mdp.task.goal_dim, HIST, saved_cfg, sim.mdp.task.num_joints
@@ -188,7 +192,7 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
                 obs[:, None, :].expand(-1, HIST, -1),
                 torch.cat((obs_hist[:, 1:], obs[:, None, :]), dim=1),
             )
-            goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+            goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
             with torch.no_grad():
                 action = policy(obs_hist, goal, norms, deterministic=True)
             out = sim.step(action, auto_reset=False)
@@ -223,7 +227,7 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
         def step() -> bool:
             state = _wm_state(sim)
             obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
-            goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+            goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
             policy_obs = torch.cat([obs, goal], dim=-1)
             with torch.no_grad():
                 obs_n = vecnorm(policy_obs) if vecnorm is not None else policy_obs
@@ -237,7 +241,56 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
         return PolicyOverlay("sac", sim, reset, step, pose_np, object_pose_np)
 
     keys = ", ".join(sorted(saved.keys()))
-    raise ValueError(f"Checkpoint is not SuperMimic (pi) or SAC (actor). Keys: {keys}")
+    raise ValueError(f"Checkpoint is not SuperMimic (pi), latent (encoder), or SAC (actor). Keys: {keys}")
+
+
+def _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_pose_np, device: str) -> PolicyOverlay:
+    """Play a ``supermimic_latent`` checkpoint: encode the real state, then act on ``z``."""
+    from supermimic.supermimic.supermimic_latent import LatentActor, LatentWorldModel
+
+    task = sim.mdp.task
+    latent_dim = int(saved_cfg.get("latent_dim", 256))
+    wm = LatentWorldModel(
+        task,
+        latent_dim,
+        task.goal_dim,
+        str(saved_cfg.get("wm_norm", "rms")),
+        str(saved_cfg.get("wm_frame", "pelvis")),
+        simnorm_dim=int(saved_cfg.get("simnorm_dim", 8)),
+        wm_step=str(saved_cfg.get("wm_step", "absolute")),
+    ).to(device)
+    wm.load_state_dict(saved["wm"])
+    wm.eval()
+    trunk = tuple(saved_cfg.get("policy_trunk", (512, 512, 512)))
+    actor = LatentActor(
+        latent_dim,
+        task.goal_dim,
+        task.num_joints,
+        trunk,
+        bool(saved_cfg.get("stochastic_actor", False)),
+        float(saved_cfg.get("ref_residual", 0.0)),
+    ).to(device)
+    actor.load_state_dict(saved["pi"])
+    actor.eval()
+    if float(saved_cfg.get("ref_residual", 0.0)) > 0:
+        actor.set_reference_action(sim.default_q, sim.action_scale)
+    norms = InputNorms(sim.mdp.obs_dim, task).to(device)
+    norms.load_state_dict(saved["norms"])
+
+    def reset(clip: int) -> None:
+        reset_policy(clip)
+
+    def step() -> bool:
+        p, quat, v, w, q, qd = sim.state()
+        obj = sim.object_state() if sim.task.has_object else None
+        goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
+        with torch.no_grad():
+            z = wm.encode(norms, sim.mdp, p, quat, v, w, q, qd, sim.xi, sim.ground_contact(), obj)
+            action = actor(z, goal, norms, deterministic=True)
+        out = sim.step(action, auto_reset=False)
+        return not bool(out["done"].any())
+
+    return PolicyOverlay("supermimic_latent", sim, reset, step, pose_np, object_pose_np)
 
 
 class GhostRobot:
@@ -325,6 +378,206 @@ class ObjectMesh:
         self.handle.wxyz = tuple(float(x) for x in quat_wxyz)
 
 
+def _play_velocity(
+    task: TaskSpec,
+    saved_cfg: dict,
+    ckpt: Path | None,
+    port: int,
+    device: str,
+    hz: float,
+) -> None:
+    """Play a flat velocity policy. There is no reference clip and no ghost."""
+    from supermimic.velocity import VelocitySim
+
+    if hz <= 0:
+        raise ValueError(f"hz must be positive, got {hz}.")
+    robot = "go1" if task.name == "go1_flat" else "g1"
+    sim = VelocitySim(1, device, robot=robot, seed=0, task=task)
+    model, joint_names = task.compile_model()
+    data = mujoco.MjData(model)
+    qpos_adr = _qpos_addresses(model, joint_names)
+
+    saved = torch.load(ckpt, map_location=device, weights_only=False) if ckpt is not None else {}
+    act = _velocity_actor(sim, saved, saved_cfg, device)
+
+    server = viser.ViserServer(port=port, label=f"SuperMimic play ({task.name})")
+    scene = ViserMujocoScene(server, model, num_envs=1)
+    scene.camera_tracking_enabled = False
+    server.scene.set_up_direction("+z")
+    server.scene.add_grid(
+        "/ground",
+        plane="xy",
+        cell_size=0.5,
+        section_size=2.0,
+        infinite_grid=True,
+        fade_distance=40.0,
+        shadow_opacity=0.15,
+        plane_opacity=0.25,
+        position=(0.0, 0.0, _GROUND_Z),
+    )
+    with server.gui.add_folder("Playback"):
+        playing = server.gui.add_checkbox("Play", initial_value=True)
+        loop = server.gui.add_checkbox("Loop", initial_value=True)
+        speed = server.gui.add_slider("Speed", min=0.1, max=4.0, step=0.1, initial_value=1.0)
+        info = server.gui.add_markdown("")
+        legend = server.gui.add_markdown(
+            "**policy** only" if ckpt is not None else "zero action (pass `--ckpt` to load a policy)"
+        )
+    with server.gui.add_folder("Display"):
+        show_visual = server.gui.add_checkbox("Visual geoms", initial_value=True)
+        show_collision = server.gui.add_checkbox("Collision geoms", initial_value=False)
+
+    def apply_geom_visibility() -> None:
+        visual_groups, collision_groups = _geom_group_kinds(model)
+        for group in visual_groups:
+            scene.geom_groups_visible[group] = bool(show_visual.value)
+        for group in collision_groups:
+            scene.geom_groups_visible[group] = bool(show_collision.value)
+        scene._sync_visibilities()
+
+    apply_geom_visibility()
+    show_visual.on_update(lambda _event: apply_geom_visibility())
+    show_collision.on_update(lambda _event: apply_geom_visibility())
+
+    def push() -> None:
+        p, quat, _v, _w, q, _qd = sim.state()
+        xpos, _xquat = _fk(
+            model,
+            data,
+            p[0].detach().cpu().numpy(),
+            quat[0].detach().cpu().numpy(),
+            q[0].detach().cpu().numpy(),
+            qpos_adr,
+        )
+        scene.update_from_arrays(xpos[None], data.xmat.reshape(-1, 3, 3).copy()[None])
+        cmd = sim._command()[0].detach().cpu()
+        info.content = (
+            f"**{task.name}**  \n"
+            f"command `{cmd[0]:+.2f} {cmd[1]:+.2f} {cmd[2]:+.2f}`"
+            f" · step {int(sim.ep_step[0].item())}"
+        )
+
+    push()
+    look = sim.state()[0][0].detach().cpu().numpy()
+    server.initial_camera.position = look + np.array([2.5, -2.5, 1.5])
+    server.initial_camera.look_at = look
+    print(f"Viewer at http://localhost:{port} ({hz:g} Hz) · task={task.name}", flush=True)
+    if ckpt is not None:
+        print(f"Policy checkpoint: {ckpt}", flush=True)
+
+    view_dt = 1.0 / hz
+    control_dt = float(sim.env.step_dt)
+    accumulator = 0.0
+    view_acc = 0.0
+    last = time.perf_counter()
+    try:
+        while True:
+            now = time.perf_counter()
+            dt = now - last
+            last = now
+            view_acc += dt
+            draw = view_acc >= view_dt
+            if draw:
+                view_acc -= view_dt
+                if view_acc > view_dt:
+                    view_acc = 0.0
+            if playing.value:
+                accumulator += dt * float(speed.value)
+                steps = int(accumulator / control_dt)
+                if steps > 0:
+                    accumulator -= steps * control_dt
+                    alive = True
+                    for _ in range(steps):
+                        action = act()
+                        out = sim.step(action)
+                        alive = not bool(out["done"].any())
+                        if not alive and not loop.value:
+                            playing.value = False
+                            break
+            else:
+                accumulator = 0.0
+            if draw:
+                push()
+            time.sleep(min(0.02, 0.5 * view_dt))
+    except KeyboardInterrupt:
+        return
+    finally:
+        server.stop()
+
+
+def _velocity_actor(sim, saved: dict, saved_cfg: dict, device: str):
+    """Return a zero-argument action function for one velocity environment."""
+    if not saved:
+        zeros = torch.zeros(1, sim.act_dim, device=device)
+        return lambda: zeros
+
+    wm_state = saved.get("wm") or {}
+    if any(str(key).startswith("encoder.") for key in wm_state):
+        raise ValueError("Latent checkpoints are not supported for flat velocity playback.")
+
+    if "pi" in saved:
+        policy = build_policy(
+            sim.mdp.obs_dim, sim.mdp.task.goal_dim, HIST, saved_cfg, sim.mdp.task.num_joints
+        ).to(device)
+        policy.load_state_dict(saved["pi"])
+        policy.eval()
+        norms = InputNorms(sim.mdp.obs_dim, sim.mdp.task).to(device)
+        if "norms" in saved:
+            norms.load_state_dict(saved["norms"])
+        obs_hist = torch.zeros(1, HIST, sim.mdp.obs_dim, device=device)
+
+        def act() -> torch.Tensor:
+            state = _wm_state(sim)
+            obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
+            fresh = sim.ep_step == 0
+            obs_hist[:] = torch.where(
+                fresh[:, None, None],
+                obs[:, None, :].expand(-1, HIST, -1),
+                torch.cat((obs_hist[:, 1:], obs[:, None, :]), dim=1),
+            )
+            goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
+            with torch.no_grad():
+                return policy(obs_hist, goal, norms, deterministic=True)
+
+        return act
+
+    if "actor" in saved:
+        from supermimic.sac.network import NormalActor
+        from supermimic.utils.nn import ObsVecNorm
+
+        obs_dim = int(saved.get("policy_obs_dim", sim.obs_dim))
+        actor = NormalActor(
+            obs_dim,
+            sim.act_dim,
+            action_init=str(saved_cfg.get("actor_init", "zeros")),
+        ).to(device)
+        actor.load_state_dict(saved["actor"])
+        actor.eval()
+        use_vecnorm = bool(saved_cfg.get("vecnorm", True))
+        vecnorm = ObsVecNorm(obs_dim).to(device) if use_vecnorm else None
+        if vecnorm is not None and "vecnorm" in saved:
+            vecnorm.load_state_dict(saved["vecnorm"])
+            vecnorm.eval()
+
+        def act() -> torch.Tensor:
+            if obs_dim == sim.obs_dim:
+                policy_obs = sim.actor_obs()
+            else:
+                state = _wm_state(sim)
+                obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
+                goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
+                policy_obs = torch.cat([obs, goal], dim=-1)
+            with torch.no_grad():
+                obs_n = vecnorm(policy_obs) if vecnorm is not None else policy_obs
+                loc, _scale = actor(obs_n)
+                return loc
+
+        return act
+
+    keys = ", ".join(sorted(saved.keys()))
+    raise ValueError(f"Checkpoint is not SuperMimic (pi) or SAC (actor). Keys: {keys}")
+
+
 def play(
     port: int = 8080,
     ckpt: Path | None = None,
@@ -333,6 +586,9 @@ def play(
     task_name: str | None = None,
 ) -> None:
     task, saved_cfg = _resolve_task(ckpt, task_name)
+    if task.name in ("g1_flat", "go1_flat"):
+        _play_velocity(task, saved_cfg, ckpt, port, device, hz)
+        return
     motion = task.load_motion("cpu")
     model, joint_names = task.compile_model()
     data = mujoco.MjData(model)
@@ -695,7 +951,7 @@ def main() -> None:
         "--ckpt",
         type=Path,
         default=None,
-        help="SuperMimic (pi) or SAC (actor) checkpoint for overlay.",
+        help="SuperMimic, supermimic_latent, or SAC checkpoint for overlay.",
     )
     parser.add_argument(
         "--task",

@@ -18,13 +18,15 @@ import torch
 from omegaconf import DictConfig
 
 from supermimic.supermimic.supermimic import (
-    TrainConfig,
     Trainer,
     hold_out_net,
     lr_at,
     pi_lr_at,
+    standalone_config,
     timed,
 )
+
+VFirstTrainConfig = standalone_config("VFirstTrainConfig", "supermimic_vfirst")
 
 
 class VFirstTrainer(Trainer):
@@ -66,8 +68,7 @@ class VFirstTrainer(Trainer):
         start_horizon = self.horizon_pi
         if cfg.critic_source == "imagined":
             start_horizon = max(start_horizon, self.horizon_v)
-        motion = self.sim.mdp.motion
-        clip_last = (motion.clip_end[motion.clip_id] - 1)[self.buffer.f]
+        clip_last = self.sim.mdp.episode_last(self.buffer.f)
         self.buffer.prepare(
             cfg.wm_window, start_horizon=start_horizon, clip_last=clip_last
         )
@@ -108,12 +109,7 @@ class VFirstTrainer(Trainer):
             )
 
         self.agg["wm"].append(wm_loss.detach())
-        self.agg["wm_mse"].append(disc_stats["mse"])
-        self.agg["wm_adv"].append(disc_stats["adv"])
-        self.agg["wm_reward"].append(disc_stats["reward"])
-        self.agg["wm_contact"].append(disc_stats["contact"])
-        self.agg["wm_contact_prec"].append(disc_stats["contact_prec"])
-        self.agg["wm_contact_recall"].append(disc_stats["contact_recall"])
+        self._record_wm_stats(disc_stats)
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -123,10 +119,6 @@ class VFirstTrainer(Trainer):
         self.agg["gn_wm"].append(gn_wm)
         self.agg["gn_pi"].append(gn_pi)
         self.agg["gn_v"].append(gn_v)
-        self.agg["disc"].append(disc_stats["loss"])
-        self.agg["disc_real"].append(disc_stats["real"])
-        self.agg["disc_fake"].append(disc_stats["fake"])
-        self.agg["disc_acc"].append(disc_stats["acc"])
         for name, value in imag_terms.items():
             self.agg["imag_terms"][name].append(value)
 
@@ -136,5 +128,5 @@ class VFirstTrainer(Trainer):
             self.save_checkpoint(iteration + 1)
 
 
-def run(cfg: TrainConfig, task_cfg: DictConfig, log_dir) -> None:
+def run(cfg: VFirstTrainConfig, task_cfg: DictConfig, log_dir) -> None:
     VFirstTrainer(cfg, task_cfg, log_dir).fit()

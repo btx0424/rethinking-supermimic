@@ -6,8 +6,9 @@ import contextlib
 import copy
 import math
 import time
+from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, field, fields, make_dataclass
 from pathlib import Path
 
 import torch
@@ -34,7 +35,6 @@ from supermimic.mdp import (
     pelvis_features,
     nominal_error,
     normalize_xi,
-    reward_term_names,
     unflatten_object,
     unflatten_state,
 )
@@ -56,6 +56,7 @@ from supermimic.utils import experiment_log
 
 @dataclass
 class TrainConfig:
+    algo: str = "supermimic"
     num_envs: int = 4096
     iterations: int = 40_000
     buffer_steps: int = 1000
@@ -76,8 +77,8 @@ class TrainConfig:
     wm_lr: float = 2e-4
     pi_lr: float = 5e-4
     # Actor stays at 0 until the world model has a usable 8-step error (~200 iters).
-    pi_warmup: int = 250
-    v_lr: float = 2e-4
+    pi_warmup: int = 50
+    v_lr: float = 5e-4
     gamma: float = 0.99
     lam: float = 0.95
     action_noise: float = 0.1
@@ -87,10 +88,10 @@ class TrainConfig:
     # The policy bootstrap uses their mean. 1 is the single critic.
     critic_ensemble: int = 2
     lr_decay_iters: int = 250_000
-    wm_norm: str = "none"
+    wm_norm: str = "rms"
     wm_residual: bool | float = 0.0
     # heading: yaw frame. pelvis: full pelvis frame, continuous when crawling.
-    wm_frame: str = "heading"
+    wm_frame: str = "pelvis"
     stochastic_actor: bool = False
     # Encoder and decoder widths. Depth is the list length. Paper Table A.4 is four layers.
     policy_z_dim: int = 32
@@ -103,20 +104,20 @@ class TrainConfig:
     policy_trunk: tuple[int, ...] = (512, 512, 512)
     # The task (robot, clips, object, colliders and its own flags) is a separate
     # config node, passed to the trainer as-is; see ``make_task_from_config``.
-    anchor: str = "torso"
+    anchor: str = "pelvis"
     obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "base_ang_vel", "projected_gravity", "last_action")
     # ``gaussian`` | ``cauchy`` | ``gaussian_linear``.
     reward_style: str = "gaussian"
     swanlab_project: str = "rethinking-supermimic"
-    swanlab_mode: str = "offline"
+    swanlab_mode: str = "online"
     swanlab_experiment: str = "lafan1"
     device: str = "cuda"
     # None / <=0 disables. Grad norms are always logged.
-    grad_clip_norm: float | None = None
+    grad_clip_norm: float | None = 1.0
     grad_clip_value: float | None = None  # policy only; None disables
     # Scale policy/critic rewards by 1/max(√Var(G), G_r_max/G_max). Stats from sim collect.
     # G_max = max_step_reward(style)/(1-γ) is fixed by the MDP.
-    normalize_reward: bool = False
+    normalize_reward: bool = True
     # torch.compile the world model and one imagination step. False runs both eager.
     compile: bool = True
     # World-model compile unit: ``window`` (whole K-loop) or ``step`` (one transition;
@@ -129,7 +130,7 @@ class TrainConfig:
     # LSGAN generator weight added to the world-model MSE. 0 leaves MSE unchanged.
     adv_coef: float = 0.0
     # L1 reward-match weight added to the world-model MSE. 0 leaves MSE unchanged.
-    reward_coef: float = 0.0
+    reward_coef: float = 1.0
     # Per-body contact BCE weight. The bits also enter the increment, so the state
     # loss trains them even at 0. 0.01 keeps BCE on the scale of the state MSE.
     contact_coef: float = 0.01
@@ -154,7 +155,7 @@ class TrainConfig:
     wm_ckpt: str | None = None
     # frozen: the loaded model and those normalizers stay fixed.
     # tunable: keep training them. Ignored when wm_ckpt is null.
-    wm_tune: str = "frozen"
+    wm_tune: str = "tunable"
     # adam | muon. Muon covers hidden 2D weights of the world model and the policy.
     # The first Linear, the output head, biases, and the critic stay Adam.
     optim: str = "muon"
@@ -178,6 +179,33 @@ class TrainConfig:
     critic_sigma_ratio: float = 0.75
     # When false, the actor loss is the H-step return only. The critic still trains.
     policy_bootstrap: bool = True
+
+
+def standalone_config(
+    name: str,
+    algo: str,
+    *,
+    overrides: dict | None = None,
+    extra: list | None = None,
+):
+    """A dataclass with :class:`TrainConfig`'s fields that does not inherit from it.
+
+    ``overrides`` replace defaults. ``extra`` is a list of
+    ``(name, type, field)`` entries appended after the shared fields.
+    """
+    overrides = overrides or {}
+    specs = []
+    for item in fields(TrainConfig):
+        if item.default_factory is not MISSING:
+            spec = field(default_factory=item.default_factory)
+        else:
+            default = overrides[item.name] if item.name in overrides else item.default
+            if item.name == "algo" and "algo" not in overrides:
+                default = algo
+            spec = field(default=default)
+        specs.append((item.name, item.type, spec))
+    specs.extend(extra or [])
+    return make_dataclass(name, specs)
 
 
 @contextmanager
@@ -279,7 +307,11 @@ def _term_score(
     """
     if name in ("action_rate", "joint_limit"):
         return value / CONTROL_DT
-    return value / (REWARD_TERM_WEIGHT[style][name] * CONTROL_DT)
+    weights = REWARD_TERM_WEIGHT[style]
+    if name not in weights:
+        # Velocity terms are already weight × kernel. Tracking terms are not.
+        return value
+    return value / (weights[name] * CONTROL_DT)
 
 
 def _grads_norm(grads: list[torch.Tensor | None]) -> float:
@@ -423,7 +455,7 @@ class RewardL1Loss(nn.Module):
         pred = preds.reshape(steps * batch_size, -1)
         true = batch["s1"].transpose(0, 1).reshape(steps * batch_size, -1)
         frame = batch["f"].transpose(0, 1).reshape(steps * batch_size)
-        last = self.mdp.motion.clip_end[self.mdp.motion.clip_id[frame]] - 1
+        last = self.mdp.episode_last(frame)
         frame = torch.minimum(frame + 1, last)
         action = batch["a"].transpose(0, 1).reshape(steps * batch_size, -1)
         a_prev = batch["a_prev"].transpose(0, 1).reshape(steps * batch_size, -1)
@@ -652,7 +684,7 @@ def imagine_step(
     action = policy(obs_hist, goal, norms, deterministic=deterministic)
     state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     frame = frame + 1
-    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    goal = mdp.goal(frame, GOAL_FRAMES)
     obs = mdp.add_noise(mdp.obs(state, action, xi, frame))
     obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), dim=1)
     return obs_hist, goal, state, frame, action, logit.sigmoid()
@@ -726,7 +758,7 @@ def imagine_horizon(
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1)
     state = _init_wm_state(s, body_pos, body_quat, obj)
     xi_n = normalize_xi(xi)
-    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    goal = mdp.goal(frame, GOAL_FRAMES)
     states = [state]
     frames = [frame]
     goals = [goal]
@@ -852,6 +884,51 @@ def imagine_horizon(
     )
 
 
+# World-model stats with a fixed column. Any other key returned by an update is
+# stored on ``agg`` under that name and logged with it.
+# Series already written by the fixed log line. Anything else on ``agg`` is printed
+# and recorded under its own name.
+_LOGGED_SERIES = frozenset(
+    {
+        "wm",
+        "err",
+        "pi",
+        "v",
+        "value_mean",
+        "score",
+        "surv",
+        "wm_mse",
+        "wm_adv",
+        "wm_reward",
+        "wm_contact",
+        "wm_contact_prec",
+        "wm_contact_recall",
+        "gn_wm",
+        "gn_pi",
+        "gn_v",
+        "disc",
+        "disc_real",
+        "disc_fake",
+        "disc_acc",
+        "reward_grad_boot",
+    }
+)
+_WM_STAT_KEYS = frozenset(
+    {
+        "loss",
+        "real",
+        "fake",
+        "acc",
+        "mse",
+        "adv",
+        "reward",
+        "contact",
+        "contact_prec",
+        "contact_recall",
+    }
+)
+
+
 class Trainer:
     """Owns the simulator, buffer, networks, and the Algorithm A.1 loop."""
 
@@ -882,32 +959,46 @@ class Trainer:
             functorch_config.donated_buffer = False
 
         self.task = make_task_from_config(task_cfg)
-        self.motion = self.task.load_motion(self.device)
-        model, names = self.task.compile_model()
-        self.kin = make_kinematics(
-            model, names, cfg.fk, self.device, hand_bodies=self.task.hand_bodies
-        )
-        # Torch FK caches device tensors on first forward. Prewarm so the first
-        # compiled call does not treat as_tensor copies as graph outputs.
-        if cfg.fk == "torch":
-            with torch.no_grad():
-                zeros = torch.zeros(1, self.task.state_dim, device=self.device)
-                self.kin.forward(*unflatten_state(zeros, self.task.num_joints))
-        self.sim = TrackingSim(
-            cfg.num_envs,
-            self.motion,
-            self.kin,
-            self.device,
-            gamma=cfg.gamma,
-            anchor=cfg.anchor,
-            obs_terms=cfg.obs_terms,
-            reward_style=cfg.reward_style,
-            task=self.task,
-        )
+        self.kin = None
+        if self.task.name in ("g1_flat", "go1_flat"):
+            from supermimic.velocity import VelocitySim
+
+            robot = "go1" if self.task.name == "go1_flat" else "g1"
+            self.sim = VelocitySim(
+                cfg.num_envs,
+                self.device,
+                robot=robot,
+                seed=cfg.seed,
+                history=cfg.buffer_steps,
+                task=self.task,
+            )
+        else:
+            self.motion = self.task.load_motion(self.device)
+            model, names = self.task.compile_model()
+            self.kin = make_kinematics(
+                model, names, cfg.fk, self.device, hand_bodies=self.task.hand_bodies
+            )
+            # Torch FK caches device tensors on first forward. Prewarm so the first
+            # compiled call does not treat as_tensor copies as graph outputs.
+            if cfg.fk == "torch":
+                with torch.no_grad():
+                    zeros = torch.zeros(1, self.task.state_dim, device=self.device)
+                    self.kin.forward(*unflatten_state(zeros, self.task.num_joints))
+            self.sim = TrackingSim(
+                cfg.num_envs,
+                self.motion,
+                self.kin,
+                self.device,
+                gamma=cfg.gamma,
+                anchor=cfg.anchor,
+                obs_terms=cfg.obs_terms,
+                reward_style=cfg.reward_style,
+                task=self.task,
+            )
         if cfg.compile_mdp:
             # The reward runs over H*B predicted states every iteration, eagerly.
             self.sim.mdp.compile_heads(True)
-        probe = self.motion.goal(self.motion.clip_start[:1].to(self.device), self.task.goal_frames)
+        probe = self.sim.mdp.goal(self.sim.f[:1], self.task.goal_frames)
         if probe.shape[-1] != self.task.goal_dim:
             raise RuntimeError(
                 f"Task {self.task.name} expects goal width {self.task.goal_dim}, "
@@ -1000,7 +1091,7 @@ class Trainer:
             raise ValueError(f"imagine_wm must be 'live' or 'ema', got {cfg.imagine_wm!r}.")
         if cfg.imagine_wm == "ema" and self.wm_ema is None:
             raise ValueError("imagine_wm='ema' requires wm_ema to be enabled (not null).")
-        self.term_names = reward_term_names(self.task)
+        self.term_names = self.sim.mdp.term_names
         in_dim = (
             self.task.inv_dim
             + self.task.object_feat_dim
@@ -1074,31 +1165,7 @@ class Trainer:
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},
         }
-        self.agg = {
-            "wm": [],
-            "wm_mse": [],
-            "wm_adv": [],
-            "wm_reward": [],
-            "wm_contact": [],
-            "wm_contact_prec": [],
-            "wm_contact_recall": [],
-            "err": [],
-            "pi": [],
-            "v": [],
-            "value_mean": [],
-            "score": [],
-            "surv": [],
-            "gn_wm": [],
-            "gn_pi": [],
-            "gn_v": [],
-            "disc": [],
-            "disc_real": [],
-            "disc_fake": [],
-            "disc_acc": [],
-            "imag_terms": {name: [] for name in self.term_names},
-            "reward_grads": {name: [] for name in self.term_names},
-            "reward_grad_boot": [],
-        }
+        self.agg = self._new_agg()
         self.timing = {"collect": [], "wm": [], "imagine": [], "policy": [], "critic": []}
         self.step_acc = 0.0
         self.started = 0.0
@@ -1120,7 +1187,11 @@ class Trainer:
         experiment_log.init(
             project=cfg.swanlab_project,
             name=cfg.swanlab_experiment or None,
-            config={**logged_cfg, "obs_dim": self.sim.mdp.obs_dim, "anchor_body": self.kin.anchor_name},
+            config={
+                **logged_cfg,
+                "obs_dim": self.sim.mdp.obs_dim,
+                "anchor_body": self.kin.anchor_name if self.kin is not None else "root",
+            },
             mode=cfg.swanlab_mode,
         )
         tb_dir = self.log_dir / "tb"
@@ -1164,6 +1235,44 @@ class Trainer:
         raw = self.cfg.horizon_v
         return self.cfg.horizon if raw is None else int(raw)
 
+    def _record_wm_stats(self, stats: dict) -> None:
+        """Copy a world-model update into ``agg``. Missing keys are not recorded."""
+        named = {
+            "mse": "wm_mse",
+            "adv": "wm_adv",
+            "reward": "wm_reward",
+            "contact": "wm_contact",
+            "contact_prec": "wm_contact_prec",
+            "contact_recall": "wm_contact_recall",
+            "loss": "disc",
+            "real": "disc_real",
+            "fake": "disc_fake",
+            "acc": "disc_acc",
+        }
+        for src, dst in named.items():
+            if src in stats:
+                self.agg[dst].append(stats[src])
+        for key, value in stats.items():
+            if key not in _WM_STAT_KEYS:
+                self.agg[key].append(value)
+
+    def _series(self, key: str) -> float | None:
+        """Mean of a recorded series, or ``None`` when this run never wrote it."""
+        values = self.agg.get(key)
+        if not values or not isinstance(values, list):
+            return None
+        return _mean(values)
+
+    def _new_agg(self) -> defaultdict:
+        """Per-iteration series. List keys are created on first append.
+
+        ``imag_terms`` and ``reward_grads`` are dicts of series, one per reward term.
+        """
+        agg: defaultdict = defaultdict(list)
+        agg["imag_terms"] = {name: [] for name in self.term_names}
+        agg["reward_grads"] = {name: [] for name in self.term_names}
+        return agg
+
     def _step(self, iteration: int) -> None:
         cfg = self.cfg
         schedules = (
@@ -1204,11 +1313,7 @@ class Trainer:
             raise ValueError(
                 f"critic_source={cfg.critic_source!r}. Expected 'imagined' or 'sim'."
             )
-        motion = self.sim.mdp.motion
-        clip_last = (motion.clip_end[motion.clip_id] - 1)[self.buffer.f]
-        self.buffer.prepare(
-            cfg.wm_window, start_horizon=self.horizon_pi, clip_last=clip_last
-        )
+        self.prepare_replay(self.sim.mdp.episode_last(self.buffer.f))
 
         with timed(self.device):
             wm_loss, err8, gn_wm, disc_stats = self.update_world_model(log_now=log_now)
@@ -1238,12 +1343,7 @@ class Trainer:
         # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
         # Keep CUDA scalars on-device; ``_mean`` syncs once at log time.
         self.agg["wm"].append(wm_loss.detach())
-        self.agg["wm_mse"].append(disc_stats["mse"])
-        self.agg["wm_adv"].append(disc_stats["adv"])
-        self.agg["wm_reward"].append(disc_stats["reward"])
-        self.agg["wm_contact"].append(disc_stats["contact"])
-        self.agg["wm_contact_prec"].append(disc_stats["contact_prec"])
-        self.agg["wm_contact_recall"].append(disc_stats["contact_recall"])
+        self._record_wm_stats(disc_stats)
         self.agg["err"].append(err8.detach())
         self.agg["pi"].append(pi_loss.detach())
         self.agg["v"].append(v_loss.detach() if isinstance(v_loss, torch.Tensor) else v_loss)
@@ -1253,10 +1353,6 @@ class Trainer:
         self.agg["gn_wm"].append(gn_wm)
         self.agg["gn_pi"].append(gn_pi)
         self.agg["gn_v"].append(gn_v)
-        self.agg["disc"].append(disc_stats["loss"])
-        self.agg["disc_real"].append(disc_stats["real"])
-        self.agg["disc_fake"].append(disc_stats["fake"])
-        self.agg["disc_acc"].append(disc_stats["acc"])
         for name, value in imag_terms.items():
             self.agg["imag_terms"][name].append(value)
 
@@ -1264,6 +1360,10 @@ class Trainer:
             self._log(iteration + 1, lr, pi_lr)
         if (iteration + 1) % cfg.ckpt_every == 0 or iteration + 1 == cfg.iterations:
             self.save_checkpoint(iteration + 1)
+
+    def prepare_replay(self, clip_last: torch.Tensor) -> None:
+        """Index replay windows of ``wm_window`` and actor starts of ``horizon_pi``."""
+        self.buffer.prepare(int(self.cfg.wm_window), start_horizon=self.horizon_pi, clip_last=clip_last)
 
     def collect(self, n_steps: int) -> None:
         cfg = self.cfg
@@ -1291,7 +1391,7 @@ class Trainer:
                 obs[:, None, :].expand(-1, HIST, -1),
                 torch.cat((self.obs_hist[:, 1:], obs[:, None, :]), dim=1),
             )
-            goal = self.motion.goal(self.sim.f, GOAL_FRAMES)
+            goal = self.sim.mdp.goal(self.sim.f, GOAL_FRAMES)
             xi_n = normalize_xi(self.sim.xi)
             self.norms.obs.update(obs)
             self.norms.goal.update(goal)
@@ -1820,8 +1920,7 @@ class Trainer:
         # Decision states, plus the successor of the last transition. Intermediate
         # successors are the next row's ``s`` because the window never crosses a reset.
         s_seq = torch.cat((s, s1[-1:]), dim=0)
-        motion = self.sim.mdp.motion
-        clip_last = motion.clip_end[motion.clip_id[frame]] - 1
+        clip_last = self.sim.mdp.episode_last(frame)
         f_next = torch.minimum(frame + 1, clip_last)
         f_seq = torch.cat((frame, f_next[-1:]), dim=0)
         xi_seq = torch.cat((xi, xi[-1:]), dim=0)
@@ -1851,7 +1950,7 @@ class Trainer:
             "states": (p, quat, v, w, q, qd),
             "objects": obj_flat,
             "frames": f_seq.reshape(-1),
-            "goals": motion.goal(f_seq.reshape(-1), GOAL_FRAMES),
+            "goals": mdp.goal(f_seq.reshape(-1), GOAL_FRAMES),
             "xi": xi_seq.reshape(-1, xi_seq.shape[-1]),
             "reward": (reward / scale).detach(),
             # Hard fall, not the imagination's soft termination. Truncation is not
@@ -1961,28 +2060,28 @@ class Trainer:
         for name in self.term_names:
             row.append(reward_grads[name])
         row.append(reward_grad_boot)
-        disc_loss = _mean(self.agg["disc"])
-        disc_real = _mean(self.agg["disc_real"])
-        disc_fake = _mean(self.agg["disc_fake"])
-        disc_acc = _mean(self.agg["disc_acc"])
-        wm_mse = _mean(self.agg["wm_mse"])
-        wm_adv = _mean(self.agg["wm_adv"])
-        wm_reward = _mean(self.agg["wm_reward"])
-        wm_contact = _mean(self.agg["wm_contact"])
-        wm_contact_prec = _mean(self.agg["wm_contact_prec"])
-        wm_contact_recall = _mean(self.agg["wm_contact_recall"])
+        disc_loss = self._series("disc")
+        disc_real = self._series("disc_real")
+        disc_fake = self._series("disc_fake")
+        disc_acc = self._series("disc_acc")
+        wm_mse = self._series("wm_mse")
+        wm_adv = self._series("wm_adv")
+        wm_reward = self._series("wm_reward")
+        wm_contact = self._series("wm_contact")
+        wm_contact_prec = self._series("wm_contact_prec")
+        wm_contact_recall = self._series("wm_contact_recall")
         row.extend(
             (
-                disc_loss,
-                disc_real,
-                disc_fake,
-                disc_acc,
-                wm_mse,
-                wm_adv,
-                wm_reward,
-                wm_contact,
-                wm_contact_prec,
-                wm_contact_recall,
+                float("nan") if disc_loss is None else disc_loss,
+                float("nan") if disc_real is None else disc_real,
+                float("nan") if disc_fake is None else disc_fake,
+                float("nan") if disc_acc is None else disc_acc,
+                float("nan") if wm_mse is None else wm_mse,
+                float("nan") if wm_adv is None else wm_adv,
+                float("nan") if wm_reward is None else wm_reward,
+                float("nan") if wm_contact is None else wm_contact,
+                float("nan") if wm_contact_prec is None else wm_contact_prec,
+                float("nan") if wm_contact_recall is None else wm_contact_recall,
             )
         )
         row.extend(
@@ -2002,12 +2101,6 @@ class Trainer:
         self._log_f.flush()
         metrics = {
             "train/wm_loss": row[2],
-            "train/wm_loss_mse": wm_mse,
-            "train/wm_loss_adv": wm_adv,
-            "train/wm_loss_reward": wm_reward,
-            "train/wm_loss_contact": wm_contact,
-            "train/wm_contact_prec": wm_contact_prec,
-            "train/wm_contact_recall": wm_contact_recall,
             "train/wm_err8": row[3],
             "train/pi_loss": row[4],
             "train/v_loss": row[5],
@@ -2030,16 +2123,33 @@ class Trainer:
             "time/policy_s": seconds["policy"],
             "time/critic_s": seconds["critic"],
         }
+        for key, name in (
+            (wm_mse, "train/wm_loss_mse"),
+            (wm_adv, "train/wm_loss_adv"),
+            (wm_reward, "train/wm_loss_reward"),
+            (wm_contact, "train/wm_loss_contact"),
+            (wm_contact_prec, "train/wm_contact_prec"),
+            (wm_contact_recall, "train/wm_contact_recall"),
+        ):
+            if key is not None:
+                metrics[name] = key
         for name in self.term_names:
             metrics[f"score/sim_{name}"] = sim_terms[name]
             metrics[f"score/ep_{name}"] = ep_terms[name]
             metrics[f"score/imag_{name}"] = imag_terms[name]
             metrics[f"grad/reward_{name}"] = reward_grads[name]
         metrics["grad/reward_bootstrap"] = reward_grad_boot
-        metrics["train/disc_loss"] = disc_loss
-        metrics["train/disc_real"] = disc_real
-        metrics["train/disc_fake"] = disc_fake
-        metrics["train/disc_acc"] = disc_acc
+        for key, values in self.agg.items():
+            if isinstance(values, list) and values and key not in _LOGGED_SERIES:
+                metrics[f"train/wm_loss_{key}"] = _mean(values)
+        for key, name in (
+            (disc_loss, "train/disc_loss"),
+            (disc_real, "train/disc_real"),
+            (disc_fake, "train/disc_fake"),
+            (disc_acc, "train/disc_acc"),
+        ):
+            if key is not None:
+                metrics[name] = key
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
         if self.reward_norm is not None:
@@ -2051,26 +2161,61 @@ class Trainer:
                     self._tb.add_scalar(key, value, iteration)
             self._tb.flush()
         ent_s = f" H {entropy:.3f} |" if math.isfinite(entropy) else ""
-        track = " ".join(
-            f"{n[0]}{sim_terms[n]:.2f}"
-            for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
+        tracking_names = (
+            "body_pos",
+            "body_ori",
+            "body_lin_vel",
+            "body_ang_vel",
+            "root_pos",
+            "root_ori",
         )
+        summary_names = tracking_names if all(n in sim_terms for n in tracking_names) else tuple(self.term_names)
+        track = " ".join(f"{n[:6]} {sim_terms[n]:.2f}" for n in summary_names)
         # Share of Σ_k ||∇L_k|| (bootstrap excluded) — flags saturated exp terms (~0).
         grad_sum = sum(reward_grads.values()) + 1e-12
         grad_share = " ".join(
-            f"{n[:3]}{reward_grads[n] / grad_sum:.2f}"
-            for n in ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "root_pos", "root_ori")
+            f"{n[:6]} {reward_grads[n] / grad_sum:.2f}" for n in summary_names if n in reward_grads
+        )
+        def _stat(label: str, value: float | None, spec: str) -> str:
+            return "" if value is None else f" {label} {value:{spec}}"
+
+        extra_s = "".join(
+            f" {key} {_mean(values):.4f}"
+            for key, values in self.agg.items()
+            if isinstance(values, list) and values and key not in _LOGGED_SERIES
+        )
+        contact_s = "".join(
+            (
+                _stat("contact", wm_contact, ".4f"),
+                _stat("P", wm_contact_prec, ".2f"),
+                _stat("R", wm_contact_recall, ".2f"),
+            )
+        )
+        disc_s = "".join(
+            (
+                _stat("D loss", disc_loss, ".3f"),
+                _stat("real", disc_real, ".2f"),
+                _stat("fake", disc_fake, ".2f"),
+                _stat("acc", disc_acc, ".2f"),
+            )
         )
         print(
-            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f} mse {wm_mse:.4f} adv {wm_adv:.4f} r {wm_reward:.4f} "
-            f"contact {wm_contact:.4f} P {wm_contact_prec:.2f} R {wm_contact_recall:.2f} e8 {row[3]:.4f} | "
+            f"it {iteration} | {row[1]:.3f} h | wm {row[2]:.4f}"
+            f"{_stat('mse', wm_mse, '.4f')}{_stat('adv', wm_adv, '.4f')}{_stat('r', wm_reward, '.4f')}"
+            f"{contact_s}{extra_s} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} V {row[6]:.3f} imag {row[7]:.3f} surv {row[8]:.3f} | "
             f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} trunc {trunc:.2f} | "
-            f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} |"
+            f"[{track}]"
+            + (
+                f" rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g}"
+                if "action_rate" in sim_terms and "joint_limit" in sim_terms
+                else ""
+            )
+            + " |"
             f"{ent_s} {row[12]:.2f} it/s | pi_lr {pi_lr:.2e} | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
-            f"D loss {disc_loss:.3f} real {disc_real:.2f} fake {disc_fake:.2f} acc {disc_acc:.2f} | "
+            f"{disc_s + ' | ' if disc_s else ''}"
             f"collect {seconds['collect']:.3f}s wm {seconds['wm']:.3f}s "
             f"imagine {seconds['imagine']:.3f}s policy {seconds['policy']:.3f}s critic {seconds['critic']:.3f}s",
             flush=True,
@@ -2085,31 +2230,7 @@ class Trainer:
             "sim_terms": {name: [] for name in self.term_names},
             "ep_terms": {name: [] for name in self.term_names},
         }
-        self.agg = {
-            "wm": [],
-            "wm_mse": [],
-            "wm_adv": [],
-            "wm_reward": [],
-            "wm_contact": [],
-            "wm_contact_prec": [],
-            "wm_contact_recall": [],
-            "err": [],
-            "pi": [],
-            "v": [],
-            "value_mean": [],
-            "score": [],
-            "surv": [],
-            "gn_wm": [],
-            "gn_pi": [],
-            "gn_v": [],
-            "disc": [],
-            "disc_real": [],
-            "disc_fake": [],
-            "disc_acc": [],
-            "imag_terms": {name: [] for name in self.term_names},
-            "reward_grads": {name: [] for name in self.term_names},
-            "reward_grad_boot": [],
-        }
+        self.agg = self._new_agg()
         self.timing = {key: [] for key in self.timing}
 
     def load_pretrained_wm(self, path: str | Path) -> None:

@@ -184,7 +184,7 @@ def evaluate_supermimic(
             obs[:, None, :].expand(-1, HIST, -1),
             torch.cat((obs_hist[:, 1:], obs[:, None, :]), dim=1),
         )
-        goal = motion.goal(sim.f, GOAL_FRAMES)
+        goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
         with torch.no_grad():
             action = policy(obs_hist, goal, norms, deterministic=True)
         return sim.step(action, auto_reset=False)

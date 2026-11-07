@@ -169,7 +169,7 @@ class LoadedPolicy:
         sim = self.sim
         state = wm_state(sim)
         obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
-        goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+        goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
         if self.kind == HISTORY:
             assert self.obs_hist is not None
             fresh = sim.ep_step == 0

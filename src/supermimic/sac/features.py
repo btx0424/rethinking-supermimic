@@ -43,7 +43,7 @@ def policy_obs(sim, *, noise: bool = True) -> torch.Tensor:
     obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
     if noise:
         obs = sim.mdp.add_noise(obs)
-    goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+    goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
     return torch.cat([obs, goal], dim=-1)
 
 
@@ -51,7 +51,7 @@ def critic_parts(sim) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.T
     """Raw critic blocks ``(inv, goal, xi, priv, obj_or_none)`` before ``InputNorms``."""
     p, quat, v, w, q, qd = sim.state()
     inv = invariant_features(p, quat, v, w, q, qd)
-    goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+    goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
     xi_n = normalize_xi(sim.xi)
     obj = sim.object_state() if sim.task.has_object else None
     priv = sim.mdp.privileged(p, quat, v, w, q, qd, sim.f, object_state=obj)
@@ -96,7 +96,7 @@ def update_norms(sim, norms) -> None:
     inv = invariant_features(p, quat, v, w, q, qd)
     state = wm_state(sim)
     obs = sim.mdp.obs(state, sim.a_prev, sim.xi, sim.f)
-    goal = sim.motion.goal(sim.f, GOAL_FRAMES)
+    goal = sim.mdp.goal(sim.f, GOAL_FRAMES)
     xi_n = normalize_xi(sim.xi)
     obj = sim.object_state() if sim.task.has_object else None
     priv = sim.mdp.privileged(p, quat, v, w, q, qd, sim.f, object_state=obj)

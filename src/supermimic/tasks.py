@@ -142,7 +142,11 @@ class TaskSpec:
         directory with the object run.
         """
         if self.object_name is None:
-            return f"{self.name}_noobj" if self.name != "lafan1" else self.name
+            # ``_noobj`` is only for an object task run with the object removed.
+            # A task that never had one (LAFAN1, flat G1) keeps its own name.
+            if self.cache_object_name is not None:
+                return f"{self.name}_noobj"
+            return self.name
         label = f"{self.name}_{self.object_name}"
         if self.split != "train":
             label += f"_{self.split}"
@@ -288,6 +292,133 @@ def _g1_scale(joint_names: tuple[str, ...], *, allow_fingers: bool) -> list[floa
         raise KeyError(f"No action scale for joints {missing}")
     # Inspire finger hinges are not in the 29-DoF G1 map.
     return [0.5 if value is None else float(value) for value in scale]
+
+
+class G1FlatTask(TaskSpec):
+    """mjlab's G1 on flat ground, rewarded for tracking a velocity command.
+
+    The simulator is :class:`supermimic.velocity.VelocitySim`, which builds
+    mjlab's flat locomotion config. This spec only registers the task name and
+    the 29-DoF G1 so the trainer can dispatch without a motion library.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="g1_flat",
+            num_joints=29,
+            tracked_bodies=TRACKED_BODIES,
+            contact_bodies=TRACKED_BODIES,
+            has_object=False,
+            foot_geom_expr=r"^(left|right)_foot[1-7]_collision$",
+        )
+
+    @property
+    def goal_per_frame(self) -> int:
+        """The twist, held constant. Not a reference pose."""
+        return 3
+
+    def compile_model(self):
+        from mjlab.asset_zoo.robots import get_g1_robot_cfg
+        from mjlab.entity import Entity
+
+        model = Entity(get_g1_robot_cfg()).spec.compile()
+        names = []
+        import mujoco
+
+        for joint_id in range(model.njnt):
+            if int(model.jnt_type[joint_id]) == int(mujoco.mjtJoint.mjJNT_FREE):
+                continue
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if name:
+                names.append(name)
+        return model, tuple(names)
+
+    def robot_cfg(self):
+        from mjlab.asset_zoo.robots import get_g1_robot_cfg
+
+        return get_g1_robot_cfg()
+
+    def action_scale(self, joint_names: tuple[str, ...]) -> list[float]:
+        return _g1_scale(joint_names, allow_fingers=False)
+
+    def load_motion(self, device: str):
+        raise RuntimeError("g1_flat tracks a velocity command and has no motion library.")
+
+
+# Go1 links the velocity task does not actually track; TaskSpec still requires a list.
+_GO1_BODIES = (
+    "trunk",
+    "FR_hip",
+    "FR_thigh",
+    "FR_calf",
+    "FL_hip",
+    "FL_thigh",
+    "FL_calf",
+    "RR_hip",
+    "RR_thigh",
+    "RR_calf",
+    "RL_hip",
+    "RL_thigh",
+    "RL_calf",
+)
+
+
+class Go1FlatTask(TaskSpec):
+    """mjlab's Go1 on flat ground, rewarded for tracking a velocity command.
+
+    Same simulator as :class:`G1FlatTask`, with ``unitree_go1_flat_env_cfg``.
+    Twelve hinges, no motion clip.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="go1_flat",
+            num_joints=12,
+            tracked_bodies=_GO1_BODIES,
+            contact_bodies=_GO1_BODIES,
+            has_object=False,
+            foot_geom_expr=r"^(FR|FL|RR|RL)_foot_collision$",
+        )
+
+    @property
+    def goal_per_frame(self) -> int:
+        """The twist, held constant. Not a reference pose."""
+        return 3
+
+    def compile_model(self):
+        import mujoco
+        from mjlab.asset_zoo.robots import get_go1_robot_cfg
+        from mjlab.entity import Entity
+
+        model = Entity(get_go1_robot_cfg()).spec.compile()
+        names = []
+        for joint_id in range(model.njnt):
+            if int(model.jnt_type[joint_id]) == int(mujoco.mjtJoint.mjJNT_FREE):
+                continue
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if name:
+                names.append(name)
+        if len(names) != self.num_joints:
+            raise RuntimeError(f"Go1 model has {len(names)} hinges, expected {self.num_joints}.")
+        return model, tuple(names)
+
+    def robot_cfg(self):
+        from mjlab.asset_zoo.robots import get_go1_robot_cfg
+
+        return get_go1_robot_cfg()
+
+    def action_scale(self, joint_names: tuple[str, ...]) -> list[float]:
+        from mjlab.asset_zoo.robots import GO1_ACTION_SCALE
+        from mjlab.utils.string import resolve_expr
+
+        scale = list(resolve_expr(GO1_ACTION_SCALE, joint_names))
+        missing = [name for name, value in zip(joint_names, scale) if value is None]
+        if missing:
+            raise KeyError(f"No Go1 action scale for joints {missing}")
+        return [float(value) for value in scale]
+
+    def load_motion(self, device: str):
+        raise RuntimeError("go1_flat tracks a velocity command and has no motion library.")
 
 
 class Lafan1Task(TaskSpec):
@@ -484,6 +615,8 @@ class WeaveXHandTask(TaskSpec):
 
 _TASKS: dict[str, type[TaskSpec]] = {
     "lafan1": Lafan1Task,
+    "g1_flat": G1FlatTask,
+    "go1_flat": Go1FlatTask,
     "weave": WeaveTask,
     "weave_xhand": WeaveXHandTask,
 }

@@ -73,7 +73,11 @@ def _term_score(
     """Normalize a reward term for logging (same scaling as SuperMimic ``_log``)."""
     if name in ("action_rate", "joint_limit"):
         return value / CONTROL_DT
-    return value / (REWARD_TERM_WEIGHT[style][name] * CONTROL_DT)
+    weights = REWARD_TERM_WEIGHT[style]
+    if name not in weights:
+        # Velocity terms are already weight × kernel. Tracking terms are not.
+        return value
+    return value / (weights[name] * CONTROL_DT)
 
 
 def actor_lr_at(train_op: int, base: float, warmup_ops: int) -> float:
@@ -88,6 +92,7 @@ def actor_lr_at(train_op: int, base: float, warmup_ops: int) -> float:
 
 @dataclass
 class TrainConfig:
+    algo: str = "sac"
     num_envs: int = 2048
     iterations: int = 320_000
     buffer_steps: int = 1000
@@ -124,13 +129,8 @@ class TrainConfig:
     soft_bound: float = 3.0 * math.pi
     actor_init: str = "zeros"
     vecnorm: bool = True
-    use_amp: bool = True
+    use_amp: bool = False
 
-    task: str = "lafan1"
-    # Weave / weave_xhand: which object's motions and collider to train on.
-    object_name: str | None = None
-    # Weave / weave_xhand clip split. Train is the default; test is for evaluation.
-    split: str = "train"
     anchor: str = "pelvis"
     obs_terms: tuple[str, ...] = ()
     reward_style: str = "gaussian"
@@ -540,6 +540,9 @@ class Trainer:
         torch.manual_seed(cfg.seed)
 
         self.task = make_task_from_config(task_cfg)
+        if self.task.name in ("g1_flat", "go1_flat"):
+            self._init_velocity()
+            return
         self.motion = self.task.load_motion(str(self.device))
         model, names = self.task.compile_model()
         self.kin = make_kinematics(
@@ -580,6 +583,62 @@ class Trainer:
             self.policy_obs_dim,
             critic_dim,
             self.task.num_joints,
+            self.device,
+        )
+        self.rbp = self._load_prior()
+        self._step_acc = 0.0
+        self.stats = {
+            "r": [],
+            "ep": [],
+            "term": [],
+            "trunc": [],
+            "done_n": [],
+            "sim_terms": {name: [] for name in self.term_names},
+            "ep_terms": {name: [] for name in self.term_names},
+        }
+        self.train_agg: dict[str, list] = defaultdict(list)
+        self.timing = {"collect": []}
+        self.started = 0.0
+        self.logged = 0.0
+        self._log_f = None
+        self._tb: SummaryWriter | None = None
+
+    def _init_velocity(self) -> None:
+        """SAC on a flat velocity task. The observation already includes the twist command."""
+        from supermimic.velocity import IdentityCriticNorms, VelocitySim
+
+        cfg = self.cfg
+        robot = "go1" if self.task.name == "go1_flat" else "g1"
+        self.motion = None
+        self.kin = None
+        self.sim = VelocitySim(
+            cfg.num_envs,
+            str(self.device),
+            robot=robot,
+            seed=cfg.seed,
+            history=cfg.buffer_steps,
+            task=self.task,
+        )
+        self.r_max = self.sim.r_max
+        self.policy_obs_dim = self.sim.obs_dim
+        self.critic_dim = self.sim.obs_dim
+        self.term_names = self.sim.term_names
+        self.norms = IdentityCriticNorms().to(self.device)
+        self.agent = SACAgent(
+            cfg,
+            self.policy_obs_dim,
+            self.critic_dim,
+            self.sim.act_dim,
+            self.device,
+            r_max=self.r_max,
+            norms=self.norms,
+        )
+        self.buffer = ReplayBuffer(
+            cfg.buffer_steps,
+            cfg.num_envs,
+            self.policy_obs_dim,
+            self.critic_dim,
+            self.sim.act_dim,
             self.device,
         )
         self.rbp = self._load_prior()
@@ -654,14 +713,22 @@ class Trainer:
                 self.train_agg[key].append(float(value))
 
     def _policy_features(self) -> torch.Tensor:
+        if self.task.name in ("g1_flat", "go1_flat"):
+            return self.sim.actor_obs()
         return sac_features.policy_obs(self.sim)
 
     def _critic_features(self) -> torch.Tensor:
         # Raw features; ``SACAgent`` applies ``self.norms`` at update time so prior
         # rows renormalize with the same running statistics as online rows.
+        # The velocity task has no goal or privileged state, so the critic reads
+        # the same observation as the actor.
+        if self.task.name in ("g1_flat", "go1_flat"):
+            return self.sim.actor_obs()
         return sac_features.critic_input_raw(self.sim)
 
     def _update_norms(self) -> None:
+        if self.task.name in ("g1_flat", "go1_flat"):
+            return
         sac_features.update_norms(self.sim, self.norms)
 
     def _collect_step(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:

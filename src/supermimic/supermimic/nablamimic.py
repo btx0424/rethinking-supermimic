@@ -12,7 +12,7 @@ enter the autograd tape used for ``∂J/∂a``.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 
 import torch
@@ -38,7 +38,6 @@ from supermimic.mdp import (
 from supermimic.utils.optim import build_optimizer
 from supermimic.utils.nn import soft_copy_
 from supermimic.supermimic.supermimic import (
-    TrainConfig,
     Trainer,
     _clip_grads,
     _flatten_object_time,
@@ -46,26 +45,29 @@ from supermimic.supermimic.supermimic import (
     _init_wm_state,
     _stack,
     _term_score,
+    standalone_config,
     timed,
 )
 
 
-@dataclass
-class NablaTrainConfig(TrainConfig):
-    """SuperMimic config plus ∇Mimic action-target hyperparameters (paper Table 10)."""
-
-    # Per-sample clip of ||∂J/∂a|| to this × batch median (None disables).
-    act_cot_clip: float | None = 3.0
-    # M regression Adam steps per update; K ring-buffer windows; δ RMS rad step.
-    action_target_steps: int = 8
-    action_target_windows: int = 1
-    action_target_delta: float = 0.03
-    # Cosine-anneal δ down to this fraction of action_target_delta with lr_decay_iters.
-    action_target_delta_floor: float = 0.3
-    # Minibatch size for each regression step.
-    action_target_batch: int = 16384
-    # Regression Adam LR (overrides TrainConfig.pi_lr for the policy optimizer).
-    action_target_lr: float = 6e-4
+NablaTrainConfig = standalone_config(
+    "NablaTrainConfig",
+    "nablamimic",
+    overrides={
+        "pi_lr": 6e-4,
+        "grad_clip_value": 0.1,
+        "normalize_reward": False,
+    },
+    extra=[
+        ("act_cot_clip", float | None, field(default=3.0)),
+        ("action_target_steps", int, field(default=8)),
+        ("action_target_windows", int, field(default=1)),
+        ("action_target_delta", float, field(default=0.03)),
+        ("action_target_delta_floor", float, field(default=0.3)),
+        ("action_target_batch", int, field(default=16384)),
+        ("action_target_lr", float, field(default=6e-4)),
+    ],
+)
 
 
 def nabla_wm_step(
@@ -82,7 +84,7 @@ def nabla_wm_step(
     """WM transition + next (obs, goal). Action is an external free variable."""
     state, logit = wm.step(state, action, xi_n, norms, contact, mdp)
     frame = frame + 1
-    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    goal = mdp.goal(frame, GOAL_FRAMES)
     obs = mdp.add_noise(mdp.obs(state, action, xi, frame))
     return state, frame, goal, obs, logit.sigmoid()
 
@@ -154,7 +156,7 @@ def nabla_imagine_horizon(
     obs_hist = mdp.add_noise(obs).view(batch, HIST, -1).detach()
     state = _init_wm_state(s, body_pos, body_quat, obj)
     xi_n = normalize_xi(xi)
-    goal = mdp.motion.goal(frame, GOAL_FRAMES)
+    goal = mdp.goal(frame, GOAL_FRAMES)
     states = [state]
     frames = [frame]
     goals = [goal]

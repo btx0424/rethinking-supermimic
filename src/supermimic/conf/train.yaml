@@ -1,5 +1,6 @@
 defaults:
   - task: lafan1
+  - actor: trunk
   - algo: supermimic
   - _self_
 

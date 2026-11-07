@@ -1,6 +1,0 @@
-# @package _global_
-defaults:
-  - supermimic
-  - _self_
-
-algo: supermimic_vfirst

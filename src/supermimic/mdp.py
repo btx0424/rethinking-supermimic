@@ -230,8 +230,23 @@ def resolve_object_reward_terms(task: TaskSpec) -> tuple[str, ...]:
     return tuple(chosen)
 
 
+# State terms shared by the flat velocity tasks. Sensor foot costs stay in the
+# simulator; imagination only needs what a predicted root and joints determine.
+VELOCITY_REWARD_TERMS = (
+    "track_linear_velocity",
+    "track_angular_velocity",
+    "upright",
+    "pose",
+    "body_ang_vel",
+    "dof_pos_limits",
+    "action_rate_l2",
+)
+
+
 def reward_term_names(task: TaskSpec | None = None) -> tuple[str, ...]:
     """Reward terms that sum to the step reward for this task."""
+    if task is not None and task.name in ("g1_flat", "go1_flat"):
+        return VELOCITY_REWARD_TERMS
     if task is not None and task.has_object:
         # Object terms sit with the other tracking kernels, before the penalties.
         base = REWARD_TERM_NAMES[:-2]
@@ -599,6 +614,15 @@ class MDP:
                 for term in self._obs_terms
             ]
         )
+
+    def goal(self, frame: torch.Tensor, horizon: int) -> torch.Tensor:
+        """Future goal at ``frame``. Clips read the motion library; callers do not."""
+        return self.motion.goal(frame, horizon)
+
+    def episode_last(self, frame: torch.Tensor) -> torch.Tensor:
+        """Last frame that still belongs to this episode (inclusive)."""
+        motion = self.motion
+        return motion.clip_end[motion.clip_id[frame]] - 1
 
     def needs_body_pose(self) -> bool:
         """Whether observation terms read tracked-body poses from the state."""
