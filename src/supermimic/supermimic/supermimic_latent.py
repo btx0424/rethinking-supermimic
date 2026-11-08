@@ -58,7 +58,7 @@ from supermimic.utils.optim import build_optimizer
 LatentTrainConfig = standalone_config(
     "LatentTrainConfig",
     "supermimic_latent",
-    overrides={"imagine_wm": "ema"},
+    overrides={"imagine_wm": "live"},
     extra=[
         ("latent_dim", int, field(default=256)),
         ("consistency_coef", float, field(default=1.0)),
@@ -789,8 +789,8 @@ class LatentTrainer(Trainer):
 
         Same windows as :meth:`Trainer.sim_critic_batch`: the latest ``horizon_v``
         steps of each environment, reward and hard termination from the analytic
-        MDP. Each state is encoded with the live encoder and the code is detached,
-        so the critic learns ``V(h(s), goal)`` of the simulator return.
+        MDP. Each state is encoded with the actor's selected world model and the
+        code is detached, so the critic and actor use the same latent coordinates.
         """
         horizon = self.horizon_v
         buf = self.buffer
@@ -848,7 +848,7 @@ class LatentTrainer(Trainer):
         scale = self.reward_norm.scale().detach() if self.reward_norm is not None else reward.new_ones(())
         with torch.no_grad():
             z = self._encode_flat(
-                self.wm,
+                self.policy_wm(),
                 s_seq.reshape(seq_n, -1),
                 xi_seq.reshape(seq_n, -1),
                 c_seq.reshape(seq_n, -1),
@@ -902,7 +902,7 @@ class LatentTrainer(Trainer):
                 if obj is not None and self.norms.obj is not None:
                     self.norms.obj.update(object_features(p, quat, *obj))
             with torch.no_grad():
-                z = self._encode(self.wm, p, quat, v, w, q, qd, self.sim.xi, self.sim.ground_contact(), obj)
+                z = self._encode(self.policy_wm(), p, quat, v, w, q, qd, self.sim.xi, self.sim.ground_contact(), obj)
                 action = self.policy(z, goal, self.norms, deterministic=not cfg.stochastic_actor)
             executed = action + cfg.action_noise * torch.randn_like(action)
             if not self.wm_frozen:

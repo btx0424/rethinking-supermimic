@@ -263,7 +263,10 @@ def _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_po
         simnorm_dim=int(saved_cfg.get("simnorm_dim", 8)),
         wm_step=str(saved_cfg.get("wm_step", "absolute")),
     ).to(device)
-    wm.load_state_dict(saved["wm"])
+    # Latent coordinates belong to the selected encoder. Match training rather
+    # than silently switching a live-trained actor to the EMA encoder at play.
+    wm_key = "wm_live" if saved_cfg.get("imagine_wm", "ema") == "live" and "wm_live" in saved else "wm"
+    wm.load_state_dict(saved[wm_key])
     wm.eval()
     trunk = tuple(saved_cfg.get("policy_trunk", (512, 512, 512)))
     actor = LatentActor(
