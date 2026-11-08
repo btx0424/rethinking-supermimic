@@ -200,7 +200,8 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
             # (``terminated``) or the clip ran out (``truncated``).
             return not bool(out["done"].any())
 
-        return PolicyOverlay("supermimic", sim, reset, step, pose_np, object_pose_np)
+        algo = str(saved_cfg.get("algo", "supermimic"))
+        return PolicyOverlay(algo, sim, reset, step, pose_np, object_pose_np)
 
     if "actor" in saved:
         from supermimic.sac.network import NormalActor
@@ -241,7 +242,10 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
         return PolicyOverlay("sac", sim, reset, step, pose_np, object_pose_np)
 
     keys = ", ".join(sorted(saved.keys()))
-    raise ValueError(f"Checkpoint is not SuperMimic (pi), latent (encoder), or SAC (actor). Keys: {keys}")
+    raise ValueError(
+        f"Checkpoint is not a pi actor (supermimic / nablamimic / scoremimic), "
+        f"latent (encoder), or SAC (actor). Keys: {keys}"
+    )
 
 
 def _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_pose_np, device: str) -> PolicyOverlay:
@@ -575,7 +579,10 @@ def _velocity_actor(sim, saved: dict, saved_cfg: dict, device: str):
         return act
 
     keys = ", ".join(sorted(saved.keys()))
-    raise ValueError(f"Checkpoint is not SuperMimic (pi) or SAC (actor). Keys: {keys}")
+    raise ValueError(
+        f"Checkpoint is not a pi actor (supermimic / nablamimic / scoremimic) "
+        f"or SAC (actor). Keys: {keys}"
+    )
 
 
 def play(
