@@ -90,9 +90,11 @@ class ReplayBuffer:
         live = self._live()
         step, ep = self.step, self.ep
 
-        # A window start stays inside one episode with consecutive steps.
+        # Each row already stores its successor in s1/c1/obj1. Only the K
+        # transition rows must share an episode; requiring row K as well would
+        # exclude the final (possibly terminal) transition of every episode.
         ok = live.clone()
-        for j in range(1, window + 1):
+        for j in range(1, window):
             same = (
                 torch.roll(live, -j, 0)
                 & (torch.roll(ep, -j, 0) == ep)
