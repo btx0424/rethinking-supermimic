@@ -202,7 +202,7 @@ def evaluate_supermimic(
         fail_height,
         fail_tilt,
         live=live,
-        algo="supermimic",
+        algo=str(saved_cfg.get("algo", "supermimic")),
     )
 
 

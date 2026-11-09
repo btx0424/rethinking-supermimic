@@ -1,15 +1,16 @@
 """Load a trained policy from a checkpoint, for ``play`` and ``collect``.
 
-``supermimic`` and ``nablamimic`` share the same actor (``pi``: an encoder-decoder
-over a history of observations plus the goal), so one loader covers both. ``sac``
-stored a different actor (``actor``: a flat ``[obs, goal]`` input behind its own
-running observation normalizer).
+``supermimic``, ``nablamimic`` and ``scoremimic`` share the same actor (``pi``: an
+encoder-decoder over a history of observations plus the goal), so one loader
+covers all three. ``sac`` stores a different actor (``actor``: a flat ``[obs, goal]``
+input behind its own running observation normalizer).
 
 The distinction that matters to callers is ``kind``:
 
 ``history``
     The policy consumed a ``HIST``-frame observation history, built from the
-    simulator's observations. Used by SuperMimic / NablaMimic.
+    simulator's observations. Used by SuperMimic, NablaMimic, and ScoreMimic.
+    Playback uses the Gaussian mean.
 ``flat``
     The policy consumed a single concatenated ``[obs, goal]`` vector, optionally
     normalized. Used by SAC.
@@ -215,7 +216,7 @@ def load_policy(
 ) -> LoadedPolicy:
     """Bind the checkpoint's actor to ``sim``.
 
-    Accepts SuperMimic, NablaMimic (both store ``pi``) and SAC (``actor``).
+    Accepts SuperMimic, NablaMimic, ScoreMimic (all store ``pi``) and SAC (``actor``).
     Defaults to the EMA weights (``live=False``), matching ``supermimic.eval``.
     """
     weights = policy_state_dict(saved, live=live)
@@ -227,8 +228,8 @@ def load_policy(
         actor.eval()
         norms = InputNorms(sim.mdp.obs_dim, task).to(device)
         norms.load_state_dict(saved["norms"])
-        # NablaMimic shares SuperMimic's actor; report which trainer produced it.
-        algo = "nablamimic" if "act_cot_clip" in cfg else "supermimic"
+        # These trainers share one actor. The checkpoint config names which one.
+        algo = str(cfg.get("algo") or ("nablamimic" if "act_cot_clip" in cfg else "supermimic"))
         return LoadedPolicy(algo, HISTORY, sim, actor, norms=norms, live=live)
 
     if "actor" in saved:

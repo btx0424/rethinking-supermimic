@@ -14,13 +14,11 @@ from dataclasses import field
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from supermimic.mdp import (
     GOAL_FRAMES,
     WorldModelState,
-    heading_body_pos,
     invariant_features,
     normalize_xi,
     object_features,
@@ -40,14 +38,13 @@ from supermimic.utils.math import (
     yaw_quat,
 )
 from supermimic.supermimic.network import MLP, ScalarCritic
+from supermimic.supermimic.latent_wm import LatentWM, build_latent_wm
 from supermimic.supermimic.supermimic import (
     HIST,
     Trainer,
     _clip_grads,
     _mean,
     _term_score,
-    contact_bce,
-    contact_precision_recall,
     standalone_config,
 )
 from supermimic.tasks import TaskSpec
@@ -69,125 +66,14 @@ LatentTrainConfig = standalone_config(
         ("simnorm_dim", int, field(default=8)),
         # absolute: next simplex. logit: residual in logit space. residual: Euclidean z + Δ, SimNorm off.
         ("wm_step", str, field(default="logit")),
+        # tdmpc: the SimNorm dynamics above. lewm: next-embedding prediction + SIGReg.
+        ("wm_arch", str, field(default="tdmpc")),
+        ("sigreg_coef", float, field(default=0.09)),
+        # Off unless set. LeWM's embedding loss does not need them.
+        ("lewm_reward_coef", float, field(default=0.0)),
+        ("lewm_contact_coef", float, field(default=0.0)),
     ],
 )
-
-# Floor for ``log z`` in the logit residual. Softmax coordinates can sit near 0.
-_LOGIT_EPS = 1e-8
-_WM_STEPS = ("absolute", "logit", "residual")
-
-
-class SimNorm(nn.Module):
-    """Split the latent into groups and softmax each group into a simplex.
-
-    The same map TD-MPC2 puts on the encoder and the dynamics. A group size of
-    0 is the identity, so the latent stays an unbounded vector.
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = int(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.dim <= 0:
-            return x
-        groups = x.view(*x.shape[:-1], -1, self.dim)
-        return F.softmax(groups, dim=-1).view(x.shape)
-
-
-class LatentWorldModel(nn.Module):
-    """Encoder, latent step, reward head, and termination head. No state decoder."""
-
-    def __init__(
-        self,
-        task: TaskSpec,
-        latent_dim: int,
-        goal_dim: int,
-        norm: str,
-        frame: str,
-        simnorm_dim: int = 8,
-        wm_step: str = "absolute",
-    ):
-        super().__init__()
-        if frame not in ("heading", "pelvis"):
-            raise ValueError(f"wm frame must be 'heading' or 'pelvis', got {frame!r}.")
-        if wm_step not in _WM_STEPS:
-            raise ValueError(f"wm_step must be one of {_WM_STEPS}, got {wm_step!r}.")
-        self.task = task
-        self.frame = frame
-        self.wm_step = wm_step
-        self.latent_dim = int(latent_dim)
-        # The Euclidean residual lives in an unbounded code, so SimNorm is off.
-        self.simnorm_dim = 0 if wm_step == "residual" else int(simnorm_dim)
-        if wm_step == "logit" and self.simnorm_dim <= 0:
-            raise ValueError("wm_step='logit' needs simnorm_dim > 0.")
-        if self.simnorm_dim < 0:
-            raise ValueError(f"simnorm_dim must be >= 0, got {self.simnorm_dim}.")
-        if self.simnorm_dim and self.latent_dim % self.simnorm_dim:
-            raise ValueError(
-                f"latent_dim={self.latent_dim} must be divisible by simnorm_dim={self.simnorm_dim}."
-            )
-        feat_dim = task.pelvis_feat_dim if frame == "pelvis" else task.inv_dim
-        enc_in = feat_dim + task.xi_dim + task.body_pos_dim + task.n_contact + task.object_feat_dim
-        hidden = [512, 512]
-        self.encoder = MLP(enc_in, hidden, self.latent_dim, norm)
-        self.dynamics = MLP(self.latent_dim + task.num_joints, hidden, self.latent_dim, norm)
-        self.reward_head = MLP(self.latent_dim + task.num_joints + goal_dim, hidden, 1, norm)
-        self.termination_head = MLP(self.latent_dim + goal_dim, hidden, 1, norm)
-        # Same contents the encoder reads, minus ξ and contact: the pose features,
-        # tracked-body positions, and the object block.
-        self.recon_dim = feat_dim + task.body_pos_dim + task.object_feat_dim
-        self.decoder = MLP(self.latent_dim, hidden, self.recon_dim, norm)
-        self.contact_head = MLP(self.latent_dim, hidden, task.n_contact, norm)
-        self.simnorm = SimNorm(self.simnorm_dim)
-        nn.init.zeros_(self.reward_head.head.weight)
-        nn.init.zeros_(self.reward_head.head.bias)
-        nn.init.zeros_(self.termination_head.head.weight)
-        nn.init.zeros_(self.termination_head.head.bias)
-        nn.init.zeros_(self.decoder.head.weight)
-        nn.init.zeros_(self.decoder.head.bias)
-        nn.init.zeros_(self.contact_head.head.weight)
-        nn.init.zeros_(self.contact_head.head.bias)
-        # Δ = 0 leaves z unchanged for the logit and Euclidean residuals.
-        if wm_step != "absolute":
-            nn.init.zeros_(self.dynamics.head.weight)
-            nn.init.zeros_(self.dynamics.head.bias)
-
-    def step(self, z: torch.Tensor, action_n: torch.Tensor) -> torch.Tensor:
-        """One latent transition.
-
-        ``absolute`` predicts the next code and applies SimNorm. ``logit`` adds a
-        delta in logit space, ``softmax(log z + Δ)``. ``residual`` adds the delta
-        in the Euclidean code, with SimNorm disabled.
-        """
-        delta = self.dynamics(torch.cat((z, action_n), dim=-1))
-        if self.wm_step == "residual":
-            return z + delta
-        if self.wm_step == "logit":
-            return self.simnorm(z.clamp(min=_LOGIT_EPS).log() + delta)
-        return self.simnorm(delta)
-
-    def reward(self, z: torch.Tensor, action_n: torch.Tensor, goal_n: torch.Tensor) -> torch.Tensor:
-        return self.reward_head(torch.cat((z, action_n, goal_n), dim=-1)).squeeze(-1)
-
-    def termination_logit(self, z: torch.Tensor, goal_n: torch.Tensor) -> torch.Tensor:
-        return self.termination_head(torch.cat((z, goal_n), dim=-1)).squeeze(-1)
-
-    def encode(self, norms, mdp, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
-        """``h(s)``. ``xi`` is raw; ``contact`` is the per-body ground-contact bit."""
-        body_pos = mdp.bodies(p, quat, v, w, q, qd)[0]
-        if self.frame == "pelvis":
-            state_n = norms.dyn(pelvis_features(p, quat, v, w, q, qd))
-            body = pelvis_body_pos(p, quat, body_pos)
-        else:
-            state_n = norms.state(invariant_features(p, quat, v, w, q, qd))
-            body = heading_body_pos(p, quat, body_pos)
-        parts = [state_n, norms.xi(normalize_xi(xi)), norms.body(body), contact]
-        if self.task.has_object:
-            if obj is None:
-                raise ValueError("Object features are required for this encoder.")
-            parts.append(norms.obj(object_features(p, quat, *obj)))
-        return self.simnorm(self.encoder(torch.cat(parts, dim=-1)))
 
 
 class LatentActor(nn.Module):
@@ -306,16 +192,8 @@ class LatentTrainer(Trainer):
     def _install_latent(self) -> None:
         cfg = self.cfg
         goal_dim = self.task.goal_dim
-        wm = LatentWorldModel(
-            self.task,
-            int(cfg.latent_dim),
-            goal_dim,
-            cfg.wm_norm,
-            cfg.wm_frame,
-            simnorm_dim=int(cfg.simnorm_dim),
-            wm_step=str(cfg.wm_step),
-        ).to(self.device)
-        self.wm = wm
+        self.wm = build_latent_wm(cfg, self.task, goal_dim).to(self.device)
+        wm = self.wm
         if self.wm_ema_tau is not None:
             self.wm_ema = copy.deepcopy(self.wm)
             self.wm_ema.requires_grad_(False)
@@ -344,50 +222,19 @@ class LatentTrainer(Trainer):
 
     # ------------------------------------------------------------------ features
 
-    def _encode(self, wm: LatentWorldModel, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
+    def _encode(self, wm: LatentWM, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
         """``h(s)``. ``xi`` is raw; contact is the recorded per-body bit."""
         return wm.encode(self.norms, self.sim.mdp, p, quat, v, w, q, qd, xi, contact, obj)
 
     def _recon_scale(self) -> torch.Tensor:
-        """Per-component divisors matching the explicit world-model MSE.
-
-        The explicit loss divides ``local_state_error`` by nominal scales of
-        0.25 m, 0.5 rad, 1 m/s, 3.14 rad/s, 0.5 rad and 5 rad/s. The decoder
-        target is the absolute invariant pose (global xy and yaw are not in the
-        latent), each block divided by the scale of that quantity. Gravity and
-        6D rotation are already dimensionless, so their scale is 1.
-        """
-        nj = self.task.num_joints
-        if self.wm.frame == "pelvis":
-            groups = [(1, 0.25), (3, 1.0), (3, 1.0), (3, 3.14), (nj, 0.5), (nj, 5.0)]
-        else:
-            groups = [(1, 0.25), (6, 1.0), (3, 1.0), (3, 3.14), (nj, 0.5), (nj, 5.0)]
-        groups.append((self.task.body_pos_dim, 0.25))
-        if self.task.has_object:
-            groups.extend(((3, 0.25), (6, 1.0), (3, 1.0), (3, 3.14)))
-        return torch.cat(
-            [torch.full((n,), scale, device=self.device) for n, scale in groups]
-        )
+        """Per-component divisors matching the explicit world-model MSE."""
+        return self.wm.feature_scale(self.device)
 
     def _recon_target(self, state: torch.Tensor, obj: torch.Tensor | None) -> torch.Tensor:
         """Normalized pose features of a real state. No gradient into the target."""
-        p, quat, v, w, q, qd = unflatten_state(state)
-        body_pos = self.sim.mdp.bodies(p, quat, v, w, q, qd)[0]
-        if self.wm.frame == "pelvis":
-            feat = pelvis_features(p, quat, v, w, q, qd)
-            body = pelvis_body_pos(p, quat, body_pos)
-        else:
-            feat = invariant_features(p, quat, v, w, q, qd)
-            body = heading_body_pos(p, quat, body_pos)
-        parts = [feat, body]
-        if self.task.has_object:
-            if obj is None:
-                raise ValueError("Object features are required for this decoder.")
-            parts.append(object_features(p, quat, *unflatten_object(obj)))
-        raw = torch.cat(parts, dim=-1)
-        return (raw / self._recon_scale()).detach()
+        return self.wm.pose_target(None, self.sim.mdp, state, obj)
 
-    def _encode_flat(self, wm: LatentWorldModel, state: torch.Tensor, xi, contact, obj) -> torch.Tensor:
+    def _encode_flat(self, wm: LatentWM, state: torch.Tensor, xi, contact, obj) -> torch.Tensor:
         p, quat, v, w, q, qd = unflatten_state(state)
         obj_t = unflatten_object(obj) if obj is not None else None
         return self._encode(wm, p, quat, v, w, q, qd, xi, contact, obj_t)
@@ -424,74 +271,24 @@ class LatentTrainer(Trainer):
         return reward, terminated, goal
 
     def update_world_model(self, log_now: bool = False):
-        """Consistency against encoded real states, plus reward and termination heads."""
+        """One world-model step. The loss is whatever ``wm.compute_loss`` defines."""
         del log_now
         cfg = self.cfg
-        zero = torch.zeros((), device=self.device)
-        cons_all, rew_all, term_all, dec_all, contact_all = [], [], [], [], []
-        prec_all, recall_all, norms = [], [], []
-        rho = float(cfg.rho)
+        coefs = {
+            "consistency_coef": cfg.consistency_coef,
+            "reward_coef": cfg.reward_coef,
+            "termination_coef": cfg.termination_coef,
+            "decode_coef": cfg.decode_coef,
+            "rho": cfg.rho,
+            "sigreg_coef": cfg.sigreg_coef,
+            "lewm_reward_coef": cfg.lewm_reward_coef,
+            "lewm_contact_coef": cfg.lewm_contact_coef,
+        }
+        totals, errs, norms = [], [], []
+        buckets: dict[str, list] = {}
         for _ in range(cfg.wm_batches):
             batch = self.buffer.sample_windows(cfg.wm_batch, self._open_loop)
-            reward_t, terminated_t, goal = self._transition_targets(batch)
-            b, k, _ = batch["s"].shape
-            obj0 = None if "obj" not in batch else batch["obj"][:, 0]
-            obj1 = None if "obj1" not in batch else batch["obj1"]
-            # Live encodings. The consistency target detaches them so the dynamics
-            # cannot collapse by dragging the encoder onto a constant code. The
-            # decoder is what forces those codes to keep the pose.
-            z = self._encode_flat(self.wm, batch["s"][:, 0], batch["xi"][:, 0], batch["c"][:, 0], obj0)
-            z_next = self._encode_flat(
-                self.wm,
-                batch["s1"].reshape(b * k, -1),
-                batch["xi"].reshape(b * k, -1),
-                batch["c1"].reshape(b * k, -1),
-                None if obj1 is None else obj1.reshape(b * k, -1),
-            ).view(b, k, -1)
-            pose0 = self._recon_target(batch["s"][:, 0], obj0)
-            pose1 = self._recon_target(
-                batch["s1"].reshape(b * k, -1),
-                None if obj1 is None else obj1.reshape(b * k, -1),
-            ).view(b, k, -1)
-            dec = (self.wm.decoder(z) - pose0).square().mean()
-            contact_logit = [self.wm.contact_head(z)]
-            contact_true = [batch["c"][:, 0]]
-            cons = zero
-            rew = zero
-            term_logits = []
-            for t in range(k):
-                action_n = self.norms.action(batch["a"][:, t])
-                goal_n = self.norms.goal(goal[:, t])
-                weight = rho**t
-                rew = rew + weight * (self.wm.reward(z, action_n, goal_n) - reward_t[:, t]).square().mean()
-                z = self.wm.step(z, action_n)
-                cons = cons + weight * (z - z_next[:, t].detach()).square().mean()
-                dec = dec + weight * (self.wm.decoder(z) - pose1[:, t]).square().mean()
-                dec = dec + weight * (self.wm.decoder(z_next[:, t]) - pose1[:, t]).square().mean()
-                # Contact of the open-loop latent and of the real next encoding.
-                contact_logit.append(self.wm.contact_head(z))
-                contact_logit.append(self.wm.contact_head(z_next[:, t]))
-                contact_true.append(batch["c1"][:, t])
-                contact_true.append(batch["c1"][:, t])
-                term_logits.append(self.wm.termination_logit(z, goal_n))
-            cons = cons / k
-            rew = rew / k
-            dec = dec / (2 * k + 1)
-            # ``(steps, batch, bodies)`` so the shared contact metrics apply.
-            contact_logit_t = torch.stack(contact_logit, dim=0)
-            contact_true_t = torch.stack(contact_true, dim=0)
-            contact = contact_bce(contact_logit_t, contact_true_t)
-            contact_prec, contact_recall = contact_precision_recall(
-                contact_logit_t.detach(), contact_true_t
-            )
-            term_logit = torch.stack(term_logits, dim=1)
-            term = F.binary_cross_entropy_with_logits(term_logit, terminated_t)
-            loss = (
-                cfg.consistency_coef * cons
-                + cfg.reward_coef * rew
-                + cfg.termination_coef * term
-                + cfg.decode_coef * (dec + contact)
-            )
+            loss, stats = self.wm.compute_loss(batch, self.norms, self.sim.mdp, coefs)
             self.opt_wm.zero_grad(set_to_none=True)
             if self.wm_frozen:
                 norms.append(0.0)
@@ -501,36 +298,12 @@ class LatentTrainer(Trainer):
                 self.opt_wm.step()
                 if self.wm_ema_tau is not None and self.wm_ema is not None:
                     soft_copy_(self.wm, self.wm_ema, self.wm_ema_tau)
-            cons_all.append(cons.detach())
-            rew_all.append(rew.detach())
-            term_all.append(term.detach())
-            dec_all.append(dec.detach())
-            contact_all.append(contact.detach())
-            prec_all.append(contact_prec.detach())
-            recall_all.append(contact_recall.detach())
-        consistency = torch.stack(cons_all).mean()
-        reward = torch.stack(rew_all).mean()
-        termination = torch.stack(term_all).mean()
-        decode = torch.stack(dec_all).mean()
-        decode_contact = torch.stack(contact_all).mean()
-        total = (
-            cfg.consistency_coef * consistency
-            + cfg.reward_coef * reward
-            + cfg.termination_coef * termination
-            + cfg.decode_coef * (decode + decode_contact)
-        )
-        disc_stats = {
-            "mse": consistency,
-            "reward": reward,
-            "contact_prec": torch.stack(prec_all).mean(),
-            "contact_recall": torch.stack(recall_all).mean(),
-            "termination": termination,
-            "decode": decode,
-            "decode_contact": decode_contact,
-        }
-        return total, consistency, _mean(norms), disc_stats
-
-    # ------------------------------------------------------------------ imagination
+            totals.append(loss.detach())
+            errs.append(stats["mse"].detach())
+            for key, value in stats.items():
+                buckets.setdefault(key, []).append(value.detach())
+        disc_stats = {key: torch.stack(values).mean() for key, values in buckets.items()}
+        return torch.stack(totals).mean(), torch.stack(errs).mean(), _mean(norms), disc_stats
 
     def _integrate_decode(self, raw: torch.Tensor, p_prev, quat_prev, obj_prev):
         """World state from one decoded pose, carrying xy and yaw from ``p_prev``.
@@ -581,7 +354,7 @@ class LatentTrainer(Trainer):
         state = WorldModelState(p, quat, v, w, q, qd, **obj_kwargs)
         return state, p, quat, obj_next
 
-    def _latent_rollout(self, start: dict[str, torch.Tensor], horizon: int, wm: LatentWorldModel):
+    def _latent_rollout(self, start: dict[str, torch.Tensor], horizon: int, wm: LatentWM):
         """H-step latent rollout scored by the analytic reward of the decoded pose.
 
         The encoder of the real start is detached. Reward and termination are the

@@ -1,4 +1,4 @@
-"""Train SuperMimic, NablaMimic, or SAC on the LAFAN1 clips."""
+"""Train SuperMimic, NablaMimic, ScoreMimic, or SAC."""
 
 from __future__ import annotations
 
@@ -85,6 +85,7 @@ def _register_configs() -> None:
     """Register each trainer's config as an ``algo`` group, merged at the root."""
     from supermimic.sac.sac import TrainConfig as SACTrainConfig
     from supermimic.supermimic.nablamimic import NablaTrainConfig
+    from supermimic.supermimic.scoremimic import ScoreTrainConfig
     from supermimic.supermimic.supermimic import TrainConfig
     from supermimic.supermimic.supermimic_latent import LatentTrainConfig
     from supermimic.supermimic.supermimic_vfirst import VFirstTrainConfig
@@ -95,6 +96,7 @@ def _register_configs() -> None:
         ("supermimic_vfirst", VFirstTrainConfig),
         ("supermimic_latent", LatentTrainConfig),
         ("nablamimic", NablaTrainConfig),
+        ("scoremimic", ScoreTrainConfig),
         ("sac", SACTrainConfig),
     ):
         # Not struct: train.yaml still adds task, obs, and swanlab beside these fields.
@@ -116,6 +118,7 @@ def main(cfg: DictConfig) -> None:
 
     from supermimic.sac.sac import TrainConfig as SACTrainConfig
     from supermimic.supermimic.nablamimic import NablaTrainConfig
+    from supermimic.supermimic.scoremimic import ScoreTrainConfig
     from supermimic.supermimic.supermimic import TrainConfig
     from supermimic.supermimic.supermimic_latent import LatentTrainConfig
     from supermimic.supermimic.supermimic_vfirst import VFirstTrainConfig
@@ -125,6 +128,7 @@ def main(cfg: DictConfig) -> None:
         "supermimic_vfirst": (VFirstTrainConfig, "supermimic.algos.supermimic_vfirst"),
         "supermimic_latent": (LatentTrainConfig, "supermimic.algos.supermimic_latent"),
         "nablamimic": (NablaTrainConfig, "supermimic.algos.nablamimic"),
+        "scoremimic": (ScoreTrainConfig, "supermimic.algos.scoremimic"),
         "sac": (SACTrainConfig, "supermimic.sac"),
     }
     algo = str(cfg.algo)

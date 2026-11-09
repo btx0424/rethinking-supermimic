@@ -250,19 +250,12 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
 
 def _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_pose_np, device: str) -> PolicyOverlay:
     """Play a ``supermimic_latent`` checkpoint: encode the real state, then act on ``z``."""
-    from supermimic.supermimic.supermimic_latent import LatentActor, LatentWorldModel
+    from supermimic.supermimic.latent_wm import build_latent_wm
+    from supermimic.supermimic.supermimic_latent import LatentActor
 
     task = sim.mdp.task
     latent_dim = int(saved_cfg.get("latent_dim", 256))
-    wm = LatentWorldModel(
-        task,
-        latent_dim,
-        task.goal_dim,
-        str(saved_cfg.get("wm_norm", "rms")),
-        str(saved_cfg.get("wm_frame", "pelvis")),
-        simnorm_dim=int(saved_cfg.get("simnorm_dim", 8)),
-        wm_step=str(saved_cfg.get("wm_step", "absolute")),
-    ).to(device)
+    wm = build_latent_wm(saved_cfg, task, task.goal_dim).to(device)
     # Latent coordinates belong to the selected encoder. Match training rather
     # than silently switching a live-trained actor to the EMA encoder at play.
     wm_key = "wm_live" if saved_cfg.get("imagine_wm", "ema") == "live" and "wm_live" in saved else "wm"
