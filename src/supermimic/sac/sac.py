@@ -590,6 +590,7 @@ class Trainer:
         self.stats = {
             "r": [],
             "ep": [],
+            "ep_len": [],
             "term": [],
             "trunc": [],
             "done_n": [],
@@ -646,6 +647,7 @@ class Trainer:
         self.stats = {
             "r": [],
             "ep": [],
+            "ep_len": [],
             "term": [],
             "trunc": [],
             "done_n": [],
@@ -699,6 +701,7 @@ class Trainer:
         if bool(done.any().item()):
             length = out["ep_len"][done].float().clamp(min=1)
             self.stats["ep"].append((out["ep_ret"][done] / (self.r_max * length)).mean().detach())
+            self.stats["ep_len"].append(length.sum().detach())
             for name, value in out["ep_term"].items():
                 self.stats["ep_terms"][name].append(
                     _term_score(name, (value[done] / length).mean().detach(), style)
@@ -766,6 +769,8 @@ class Trainer:
         seconds = {key: _mean(self.timing[key]) for key in self.timing}
         sim_score = _mean(self.stats["r"])
         ep_score = _mean(self.stats["ep"])
+        done_n = sum(self.stats["done_n"])
+        ep_len = float("nan") if float(done_n) == 0.0 else float(sum(self.stats["ep_len"]) / done_n)
         sim_terms = {name: _mean(self.stats["sim_terms"][name]) for name in self.term_names}
         ep_terms = {name: _mean(self.stats["ep_terms"][name]) for name in self.term_names}
 
@@ -790,6 +795,7 @@ class Trainer:
             (now - self.started) / 3600,
             sim_score,
             ep_score,
+            ep_len,
             term,
             trunc,
             rb_size,
@@ -834,6 +840,8 @@ class Trainer:
         for name in self.term_names:
             metrics[f"score/sim_{name}"] = sim_terms[name]
             metrics[f"score/ep_{name}"] = ep_terms[name]
+        if math.isfinite(ep_len):
+            metrics["train/ep_len"] = ep_len
         if math.isfinite(q_term):
             metrics["train/q_value_terminated"] = q_term
         if self.agent.reward_norm is not None:
@@ -852,7 +860,7 @@ class Trainer:
         )
         q_term_s = f" Q_term {q_term:.3g}" if math.isfinite(q_term) else ""
         print(
-            f"it {iteration} | {row[1]:.3f} h | sim {sim_score:.3f} ep {ep_score:.3f} "
+            f"it {iteration} | {row[1]:.3f} h | sim {sim_score:.3f} ep {ep_score:.3f} len {ep_len:.1f} "
             f"term {term:.2f} trunc {trunc:.2f} | "
             f"[{track}] rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g} | "
             f"critic {critic_loss:.4f} actor {actor_loss:.3f} Q {q_value:.3f}{q_term_s} α {alpha:.4g} H {entropy:.3f} | "
@@ -865,6 +873,7 @@ class Trainer:
         self.stats = {
             "r": [],
             "ep": [],
+            "ep_len": [],
             "term": [],
             "trunc": [],
             "done_n": [],
@@ -931,7 +940,7 @@ class Trainer:
         ep_cols = ",".join(f"ep_{n}" for n in self.term_names)
         self._log_f = (self.log_dir / "train_log.csv").open("w")
         self._log_f.write(
-            "iteration,wall_h,sim_score,ep_score,term_frac,trunc_frac,rb_size,critic_loss,actor_loss,q_value,q_value_terminated,alpha,entropy,"
+            "iteration,wall_h,sim_score,ep_score,ep_len,term_frac,trunc_frac,rb_size,critic_loss,actor_loss,q_value,q_value_terminated,alpha,entropy,"
             f"grad_critic,grad_actor,it_per_s,lr,t_collect,{term_cols},{ep_cols}\n"
         )
         self.started = time.time()

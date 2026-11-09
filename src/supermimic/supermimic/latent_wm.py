@@ -1,13 +1,14 @@
 """Latent world models behind one interface.
 
-Both expose ``encode``, ``step``, ``decoder``, and ``compute_loss``. The trainer
-optimizes whatever ``compute_loss`` returns and rolls the actor out with ``step``.
+Both expose ``encode``, ``step``, and ``compute_loss``. The trainer optimizes
+whatever ``compute_loss`` returns and rolls the actor out with ``step``. Loss
+weights are fixed when the module is built. The pose decoder is created only
+when ``decode_coef`` is positive.
 
 TD-MPC predicts the next code with SimNorm and trains it against a detached
-encoding, plus reward, termination, contact, and pose-decoder heads. LeWM predicts
-the next embedding with an MLP, compares it to the live encoding (the target is
-not detached), and adds the sketch isotropic Gaussian regularizer. A pose decoder
-is on both so the actor can score the analytic reward.
+encoding, plus reward, termination, and contact heads. LeWM predicts the next
+embedding with an MLP, compares it to the live encoding (the target is not
+detached), and adds the sketch isotropic Gaussian regularizer.
 """
 
 from __future__ import annotations
@@ -78,26 +79,34 @@ class SIGReg(nn.Module):
 
 
 class LatentWM(nn.Module):
-    """Shared proprioceptive encoder, pose decoder, and one-step dynamics."""
+    """Shared proprioceptive encoder and one-step dynamics.
+
+    The pose decoder exists only when ``decode_coef`` is positive. That weight,
+    like the other loss weights, is fixed when the module is built.
+    """
 
     arch = ""
 
-    def __init__(self, task, latent_dim: int, norm: str, frame: str):
+    def __init__(self, task, latent_dim: int, norm: str, frame: str, decode_coef: float = 1.0):
         super().__init__()
         if frame not in ("heading", "pelvis"):
             raise ValueError(f"wm frame must be 'heading' or 'pelvis', got {frame!r}.")
         self.task = task
         self.frame = frame
         self.latent_dim = int(latent_dim)
+        self.decode_coef = float(decode_coef)
         feat_dim = task.pelvis_feat_dim if frame == "pelvis" else task.inv_dim
         enc_in = feat_dim + task.xi_dim + task.body_pos_dim + task.n_contact + task.object_feat_dim
         hidden = [512, 512]
         self.encoder = MLP(enc_in, hidden, self.latent_dim, norm)
         self.dynamics = MLP(self.latent_dim + task.num_joints, hidden, self.latent_dim, norm)
         self.recon_dim = feat_dim + task.body_pos_dim + task.object_feat_dim
-        self.decoder = MLP(self.latent_dim, hidden, self.recon_dim, norm)
-        nn.init.zeros_(self.decoder.head.weight)
-        nn.init.zeros_(self.decoder.head.bias)
+        if self.decode_coef > 0.0:
+            self.decoder = MLP(self.latent_dim, hidden, self.recon_dim, norm)
+            nn.init.zeros_(self.decoder.head.weight)
+            nn.init.zeros_(self.decoder.head.bias)
+        else:
+            self.decoder = None
 
     def encode(self, norms, mdp, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
         raise NotImplementedError
@@ -105,8 +114,8 @@ class LatentWM(nn.Module):
     def step(self, z: torch.Tensor, action_n: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-    def compute_loss(self, batch, norms, mdp, coefs: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Scalar loss and detached terms. ``coefs`` holds the trainer weights."""
+    def compute_loss(self, batch, norms, mdp) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Scalar loss and detached terms. Weights were fixed in ``__init__``."""
         raise NotImplementedError
 
     def _features(self, norms, mdp, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
@@ -174,8 +183,17 @@ class TDMPCWorldModel(LatentWM):
         frame: str,
         simnorm_dim: int = 8,
         wm_step: str = "absolute",
+        decode_coef: float = 1.0,
+        consistency_coef: float = 1.0,
+        reward_coef: float = 1.0,
+        termination_coef: float = 1.0,
+        rho: float = 1.0,
     ):
-        super().__init__(task, latent_dim, norm, frame)
+        super().__init__(task, latent_dim, norm, frame, decode_coef=decode_coef)
+        self.consistency_coef = float(consistency_coef)
+        self.reward_coef = float(reward_coef)
+        self.termination_coef = float(termination_coef)
+        self.rho = float(rho)
         if wm_step not in _WM_STEPS:
             raise ValueError(f"wm_step must be one of {_WM_STEPS}, got {wm_step!r}.")
         self.wm_step = wm_step
@@ -220,10 +238,10 @@ class TDMPCWorldModel(LatentWM):
     def termination_logit(self, z: torch.Tensor, goal_n: torch.Tensor) -> torch.Tensor:
         return self.termination_head(torch.cat((z, goal_n), dim=-1)).squeeze(-1)
 
-    def compute_loss(self, batch, norms, mdp, coefs: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def compute_loss(self, batch, norms, mdp) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         from supermimic.supermimic.supermimic import contact_bce, contact_precision_recall
 
-        rho = float(coefs["rho"])
+        rho = self.rho
         b, k, _ = batch["s"].shape
         obj0 = None if "obj" not in batch else batch["obj"][:, 0]
         obj1 = None if "obj1" not in batch else batch["obj1"]
@@ -237,19 +255,22 @@ class TDMPCWorldModel(LatentWM):
             batch["c1"].reshape(b * k, -1),
             None if obj1 is None else obj1.reshape(b * k, -1),
         ).view(b, k, -1)
-        pose0 = self.pose_target(None, mdp, batch["s"][:, 0], obj0)
-        pose1 = self.pose_target(
-            None,
-            mdp,
-            batch["s1"].reshape(b * k, -1),
-            None if obj1 is None else obj1.reshape(b * k, -1),
-        ).view(b, k, -1)
-        dec = (self.decoder(z) - pose0).square().mean()
         contact_logit = [self.contact_head(z)]
         contact_true = [batch["c"][:, 0]]
         cons = z.new_zeros(())
         rew = z.new_zeros(())
         term_logits = []
+        dec = z.new_zeros(())
+        pose0 = pose1 = None
+        if self.decoder is not None:
+            pose0 = self.pose_target(None, mdp, batch["s"][:, 0], obj0)
+            pose1 = self.pose_target(
+                None,
+                mdp,
+                batch["s1"].reshape(b * k, -1),
+                None if obj1 is None else obj1.reshape(b * k, -1),
+            ).view(b, k, -1)
+            dec = (self.decoder(z) - pose0).square().mean()
         for t in range(k):
             action_n = norms.action(batch["a"][:, t])
             goal_n = norms.goal(goal[:, t])
@@ -257,8 +278,9 @@ class TDMPCWorldModel(LatentWM):
             rew = rew + weight * (self.reward(z, action_n, goal_n) - reward_t[:, t]).square().mean()
             z = self.step(z, action_n)
             cons = cons + weight * (z - z_next[:, t].detach()).square().mean()
-            dec = dec + weight * (self.decoder(z) - pose1[:, t]).square().mean()
-            dec = dec + weight * (self.decoder(z_next[:, t]) - pose1[:, t]).square().mean()
+            if self.decoder is not None:
+                dec = dec + weight * (self.decoder(z) - pose1[:, t]).square().mean()
+                dec = dec + weight * (self.decoder(z_next[:, t]) - pose1[:, t]).square().mean()
             contact_logit.append(self.contact_head(z))
             contact_logit.append(self.contact_head(z_next[:, t]))
             contact_true.append(batch["c1"][:, t])
@@ -266,27 +288,24 @@ class TDMPCWorldModel(LatentWM):
             term_logits.append(self.termination_logit(z, goal_n))
         cons = cons / k
         rew = rew / k
-        dec = dec / (2 * k + 1)
         contact_logit_t = torch.stack(contact_logit, dim=0)
         contact_true_t = torch.stack(contact_true, dim=0)
         contact = contact_bce(contact_logit_t, contact_true_t)
         contact_prec, contact_recall = contact_precision_recall(contact_logit_t.detach(), contact_true_t)
         term = F.binary_cross_entropy_with_logits(torch.stack(term_logits, dim=1), terminated_t)
-        loss = (
-            float(coefs["consistency_coef"]) * cons
-            + float(coefs["reward_coef"]) * rew
-            + float(coefs["termination_coef"]) * term
-            + float(coefs["decode_coef"]) * (dec + contact)
-        )
+        loss = self.consistency_coef * cons + self.reward_coef * rew + self.termination_coef * term
         stats = {
             "mse": cons.detach(),
             "reward": rew.detach(),
             "contact_prec": contact_prec.detach(),
             "contact_recall": contact_recall.detach(),
             "termination": term.detach(),
-            "decode": dec.detach(),
-            "decode_contact": contact.detach(),
         }
+        if self.decoder is not None:
+            dec = dec / (2 * k + 1)
+            loss = loss + self.decode_coef * (dec + contact)
+            stats["decode"] = dec.detach()
+            stats["decode_contact"] = contact.detach()
         return loss, stats
 
 
@@ -294,8 +313,9 @@ class LeWM(LatentWM):
     """Next-embedding prediction without a stop-gradient, plus SIGReg.
 
     The dynamics are an MLP on ``(z, a)``. There is no SimNorm: the regularizer
-    is what keeps the embedding from collapsing. Reward and contact heads are
-    present but only enter the loss when their coefficients are positive.
+    is what keeps the embedding from collapsing. The reward head, contact head,
+    and pose decoder are created only when their coefficients are positive. The
+    termination head is always created and trained against the real fall.
     """
 
     arch = "lewm"
@@ -309,18 +329,34 @@ class LeWM(LatentWM):
         frame: str,
         sigreg_knots: int = 17,
         sigreg_proj: int = 1024,
+        decode_coef: float = 1.0,
+        sigreg_coef: float = 0.09,
+        reward_coef: float = 0.0,
+        contact_coef: float = 0.0,
+        termination_coef: float = 1.0,
     ):
-        super().__init__(task, latent_dim, norm, frame)
+        super().__init__(task, latent_dim, norm, frame, decode_coef=decode_coef)
         hidden = [512, 512]
+        self.sigreg_coef = float(sigreg_coef)
+        self.reward_coef = float(reward_coef)
+        self.contact_coef = float(contact_coef)
+        self.termination_coef = float(termination_coef)
         self.sigreg = SIGReg(sigreg_knots, sigreg_proj)
-        self.reward_head = MLP(self.latent_dim + task.num_joints + goal_dim, hidden, 1, norm)
-        self.contact_head = MLP(self.latent_dim, hidden, task.n_contact, norm)
+        self.reward_head = None
+        self.contact_head = None
+        self.termination_head = MLP(self.latent_dim + goal_dim, hidden, 1, norm)
+        nn.init.zeros_(self.termination_head.head.weight)
+        nn.init.zeros_(self.termination_head.head.bias)
+        if self.reward_coef > 0.0:
+            self.reward_head = MLP(self.latent_dim + task.num_joints + goal_dim, hidden, 1, norm)
+            nn.init.zeros_(self.reward_head.head.weight)
+            nn.init.zeros_(self.reward_head.head.bias)
+        if self.contact_coef > 0.0:
+            self.contact_head = MLP(self.latent_dim, hidden, task.n_contact, norm)
+            nn.init.zeros_(self.contact_head.head.weight)
+            nn.init.zeros_(self.contact_head.head.bias)
         nn.init.zeros_(self.dynamics.head.weight)
         nn.init.zeros_(self.dynamics.head.bias)
-        nn.init.zeros_(self.reward_head.head.weight)
-        nn.init.zeros_(self.reward_head.head.bias)
-        nn.init.zeros_(self.contact_head.head.weight)
-        nn.init.zeros_(self.contact_head.head.bias)
 
     def encode(self, norms, mdp, p, quat, v, w, q, qd, xi, contact, obj) -> torch.Tensor:
         return self.encoder(self._features(norms, mdp, p, quat, v, w, q, qd, xi, contact, obj))
@@ -331,7 +367,17 @@ class LeWM(LatentWM):
     def reward(self, z: torch.Tensor, action_n: torch.Tensor, goal_n: torch.Tensor) -> torch.Tensor:
         return self.reward_head(torch.cat((z, action_n, goal_n), dim=-1)).squeeze(-1)
 
-    def compute_loss(self, batch, norms, mdp, coefs: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def termination_logit(self, z: torch.Tensor, goal_n: torch.Tensor) -> torch.Tensor:
+        return self.termination_head(torch.cat((z, goal_n), dim=-1)).squeeze(-1)
+
+    def compute_loss(self, batch, norms, mdp) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Open-loop next-embedding loss, SIGReg, and decode of the predicted codes.
+
+        The rollout starts at ``h(s_0)`` and applies ``step`` with the stored
+        actions, which is the chain the actor differentiates. Each predicted code
+        is matched to ``h(s_t)`` (target not detached) and, when a decoder exists,
+        decoded onto the real future pose.
+        """
         b, k, _ = batch["s"].shape
         obj_seq = None if "obj" not in batch else torch.cat((batch["obj"][:, :1], batch["obj1"]), dim=1)
         s_seq = torch.cat((batch["s"][:, :1], batch["s1"]), dim=1)
@@ -347,39 +393,55 @@ class LeWM(LatentWM):
             c_seq.reshape(flat, -1),
             None if obj_seq is None else obj_seq.reshape(flat, -1),
         ).view(b, length, -1)
-        pred = self.step(emb[:, :-1].reshape(b * k, -1), norms.action(batch["a"]).reshape(b * k, -1))
-        pred = pred.view(b, k, -1)
+        action_n = norms.action(batch["a"])
+        z = emb[:, 0]
+        predicted = []
+        for t in range(k):
+            z = self.step(z, action_n[:, t])
+            predicted.append(z)
+        pred = torch.stack(predicted, dim=1)
         # The target embedding stays in the graph. SIGReg is the anti-collapse term.
         pred_loss = (pred - emb[:, 1:]).pow(2).mean()
+        _reward_t, terminated_t, goal = _transition_targets(mdp, batch)
+        term_logits = [
+            self.termination_logit(pred[:, t], norms.goal(goal[:, t])) for t in range(k)
+        ]
+        term = F.binary_cross_entropy_with_logits(torch.stack(term_logits, dim=1), terminated_t)
         sigreg = self.sigreg(emb.transpose(0, 1))
-        poses = []
-        for t in range(length):
-            obj_t = None if obj_seq is None else obj_seq[:, t]
-            poses.append(self.pose_target(None, mdp, s_seq[:, t], obj_t))
-        decode = (self.decoder(emb) - torch.stack(poses, dim=1)).square().mean()
-        loss = pred_loss + float(coefs["sigreg_coef"]) * sigreg + float(coefs["decode_coef"]) * decode
-        stats = {"mse": pred_loss.detach(), "sigreg": sigreg.detach(), "decode": decode.detach()}
-        reward_coef = float(coefs.get("lewm_reward_coef", 0.0))
-        contact_coef = float(coefs.get("lewm_contact_coef", 0.0))
-        if reward_coef > 0.0 or contact_coef > 0.0:
+        loss = pred_loss + self.sigreg_coef * sigreg + self.termination_coef * term
+        stats = {"mse": pred_loss.detach(), "sigreg": sigreg.detach(), "termination": term.detach()}
+        # Latents the actor will actually read: the real start, then each open-loop step.
+        z_chain = torch.cat((emb[:, :1], pred), dim=1)
+        if self.decoder is not None:
+            poses = []
+            for t in range(length):
+                obj_t = None if obj_seq is None else obj_seq[:, t]
+                poses.append(self.pose_target(None, mdp, s_seq[:, t], obj_t))
+            pose = torch.stack(poses, dim=1)
+            dec_real = (self.decoder(emb) - pose).square().mean()
+            dec_open = (self.decoder(pred) - pose[:, 1:]).square().mean()
+            decode = 0.5 * (dec_real + dec_open)
+            loss = loss + self.decode_coef * decode
+            stats["decode"] = decode.detach()
+            stats["decode_open"] = dec_open.detach()
+        if self.reward_head is not None:
+            reward_t = _reward_t
+            z_pre = z_chain[:, :-1].reshape(b * k, -1)
+            rew = self.reward(z_pre, action_n.reshape(b * k, -1), norms.goal(goal).reshape(b * k, -1))
+            rew = (rew.view(b, k) - reward_t).square().mean()
+            loss = loss + self.reward_coef * rew
+            stats["reward"] = rew.detach()
+        if self.contact_head is not None:
             from supermimic.supermimic.supermimic import contact_bce, contact_precision_recall
 
-            if reward_coef > 0.0:
-                reward_t, _terminated, goal = _transition_targets(mdp, batch)
-                z_pre = emb[:, :-1].reshape(b * k, -1)
-                rew = self.reward(z_pre, norms.action(batch["a"]).reshape(b * k, -1), norms.goal(goal).reshape(b * k, -1))
-                rew = (rew.view(b, k) - reward_t).square().mean()
-                loss = loss + reward_coef * rew
-                stats["reward"] = rew.detach()
-            if contact_coef > 0.0:
-                logits = self.contact_head(emb).transpose(0, 1)
-                target = c_seq.transpose(0, 1)
-                contact = contact_bce(logits, target)
-                prec, recall = contact_precision_recall(logits.detach(), target)
-                loss = loss + contact_coef * contact
-                stats["decode_contact"] = contact.detach()
-                stats["contact_prec"] = prec.detach()
-                stats["contact_recall"] = recall.detach()
+            logits = self.contact_head(z_chain).transpose(0, 1)
+            target = c_seq.transpose(0, 1)
+            contact = contact_bce(logits, target)
+            prec, recall = contact_precision_recall(logits.detach(), target)
+            loss = loss + self.contact_coef * contact
+            stats["decode_contact"] = contact.detach()
+            stats["contact_prec"] = prec.detach()
+            stats["contact_recall"] = recall.detach()
         return loss, stats
 
 
@@ -400,6 +462,11 @@ def build_latent_wm(cfg, task, goal_dim: int) -> LatentWM:
             str(get("wm_frame", "pelvis")),
             simnorm_dim=int(get("simnorm_dim", 8)),
             wm_step=str(get("wm_step", "absolute")),
+            decode_coef=float(get("decode_coef", 1.0)),
+            consistency_coef=float(get("consistency_coef", 1.0)),
+            reward_coef=float(get("reward_coef", 1.0)),
+            termination_coef=float(get("termination_coef", 1.0)),
+            rho=float(get("rho", 1.0)),
         )
     if arch == "lewm":
         return LeWM(
@@ -408,6 +475,11 @@ def build_latent_wm(cfg, task, goal_dim: int) -> LatentWM:
             goal_dim,
             str(get("wm_norm", "rms")),
             str(get("wm_frame", "pelvis")),
+            decode_coef=float(get("decode_coef", 1.0)),
+            sigreg_coef=float(get("sigreg_coef", 0.09)),
+            reward_coef=float(get("lewm_reward_coef", 0.0)),
+            contact_coef=float(get("lewm_contact_coef", 0.0)),
+            termination_coef=float(get("termination_coef", 1.0)),
         )
     raise ValueError(f"wm_arch must be one of {_ARCHES}, got {arch!r}.")
 

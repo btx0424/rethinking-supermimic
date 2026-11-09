@@ -285,6 +285,14 @@ def _wm_state_error(true_root, pred: WorldModelState, frame: str, true_obj=None)
     return err
 
 
+def _mean_episode_length(stats: dict) -> float:
+    """Mean length of episodes that finished in this log window. ``nan`` if none did."""
+    done = sum(stats["done_n"])
+    if float(done) == 0.0:
+        return float("nan")
+    return float(sum(stats["ep_len"]) / done)
+
+
 def _mean(xs: list) -> float:
     """Host mean. CUDA tensors are reduced on-device and synced once here (log time)."""
     if not xs:
@@ -1159,6 +1167,7 @@ class Trainer:
         self.stats = {
             "r": [],
             "ep": [],
+            "ep_len": [],
             "term": [],
             "trunc": [],
             "done_n": [],
@@ -1204,7 +1213,7 @@ class Trainer:
         grad_r_cols = ",".join(f"grad_r_{n}" for n in self.term_names)
         self._log_f.write(
             "iteration,wall_h,wm_loss,wm_err8,pi_loss,v_loss,value_mean,imag_score,imag_survival,"
-            "sim_score,ep_score,term_frac,trunc_frac,it_per_s,lr,pi_lr,entropy,"
+            "sim_score,ep_score,ep_len,term_frac,trunc_frac,it_per_s,lr,pi_lr,entropy,"
             f"{term_cols},"
             f"{grad_r_cols},grad_r_boot,"
             "disc_loss,disc_real,disc_fake,disc_acc,wm_loss_mse,wm_loss_adv,wm_loss_reward,wm_loss_contact,wm_contact_prec,wm_contact_recall,"
@@ -1431,6 +1440,7 @@ class Trainer:
                 self.stats["ep"].append(
                     (out["ep_ret"][done] / (self.r_max * length)).mean().detach()
                 )
+                self.stats["ep_len"].append(length.sum().detach())
                 for name, value in out["ep_term"].items():
                     self.stats["ep_terms"][name].append(
                         _term_score(name, (value[done] / length).mean().detach(), style)
@@ -2022,6 +2032,7 @@ class Trainer:
         now = time.time()
         term = sum(self.stats["term"]) / max(sum(self.stats["done_n"]), 1.0)
         trunc = sum(self.stats["trunc"]) / max(sum(self.stats["done_n"]), 1.0)
+        ep_len = _mean_episode_length(self.stats)
         seconds = {key: _mean(self.timing[key]) for key in self.timing}
         gn_wm = _mean(self.agg["gn_wm"])
         gn_pi = _mean(self.agg["gn_pi"])
@@ -2048,6 +2059,7 @@ class Trainer:
             _mean(self.agg["surv"]),
             _mean(self.stats["r"]),
             _mean(self.stats["ep"]),
+            ep_len,
             term,
             trunc,
             cfg.log_every / (now - self.logged),
@@ -2111,7 +2123,7 @@ class Trainer:
             "train/ep_score": row[10],
             "train/term_frac": term,
             "train/trunc_frac": trunc,
-            "train/it_per_s": row[12],
+            "train/it_per_s": row[13],
             "train/lr": lr,
             "train/pi_lr": pi_lr,
             "grad/wm": gn_wm,
@@ -2152,6 +2164,8 @@ class Trainer:
                 metrics[name] = key
         if math.isfinite(entropy):
             metrics["train/entropy"] = entropy
+        if math.isfinite(ep_len):
+            metrics["train/ep_len"] = ep_len
         if self.reward_norm is not None:
             metrics["train/reward_scale"] = float(self.reward_norm.scale())
         experiment_log.log(metrics, step=iteration)
@@ -2204,7 +2218,7 @@ class Trainer:
             f"{_stat('mse', wm_mse, '.4f')}{_stat('adv', wm_adv, '.4f')}{_stat('r', wm_reward, '.4f')}"
             f"{contact_s}{extra_s} e8 {row[3]:.4f} | "
             f"pi {row[4]:.3f} v {row[5]:.4f} V {row[6]:.3f} imag {row[7]:.3f} surv {row[8]:.3f} | "
-            f"sim {row[9]:.3f} ep {row[10]:.3f} term {term:.2f} trunc {trunc:.2f} | "
+            f"sim {row[9]:.3f} ep {row[10]:.3f} len {ep_len:.1f} term {term:.2f} trunc {trunc:.2f} | "
             f"[{track}]"
             + (
                 f" rate {sim_terms['action_rate']:.3g} lim {sim_terms['joint_limit']:.3g}"
@@ -2212,7 +2226,7 @@ class Trainer:
                 else ""
             )
             + " |"
-            f"{ent_s} {row[12]:.2f} it/s | pi_lr {pi_lr:.2e} | "
+            f"{ent_s} {row[13]:.2f} it/s | pi_lr {pi_lr:.2e} | "
             f"gn wm {gn_wm:.3g} pi {gn_pi:.3g} v {gn_v:.3g} | "
             f"∇r [{grad_share}] boot {reward_grad_boot:.3g} | "
             f"{disc_s + ' | ' if disc_s else ''}"
@@ -2224,6 +2238,7 @@ class Trainer:
         self.stats = {
             "r": [],
             "ep": [],
+            "ep_len": [],
             "term": [],
             "trunc": [],
             "done_n": [],

@@ -70,8 +70,10 @@ LatentTrainConfig = standalone_config(
         ("wm_arch", str, field(default="tdmpc")),
         ("sigreg_coef", float, field(default=0.09)),
         # Off unless set. LeWM's embedding loss does not need them.
-        ("lewm_reward_coef", float, field(default=0.0)),
-        ("lewm_contact_coef", float, field(default=0.0)),
+        ("lewm_reward_coef", float, field(default=1.0)),
+        ("lewm_contact_coef", float, field(default=1.0)),
+        # decode: analytic reward of the decoded pose. head: the reward prediction head.
+        ("rollout_reward", str, field(default="decode")),
     ],
 )
 
@@ -184,6 +186,7 @@ class LatentTrainer(Trainer):
         super().__init__(cfg, task_cfg, log_dir)
         cfg.resume = resume
         self._install_latent()
+        self._check_rollout_reward()
         # Replaced each iteration by prepare_replay with the length the buffer can supervise.
         self._open_loop = int(self.horizon_pi)
         if resume:
@@ -219,6 +222,20 @@ class LatentTrainer(Trainer):
         # model does not produce.
         self.critic = ScalarCritic(int(cfg.latent_dim) + goal_dim, ensemble=cfg.critic_ensemble).to(self.device)
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.v_lr)
+
+    def _check_rollout_reward(self) -> None:
+        mode = str(self.cfg.rollout_reward)
+        if mode == "decode":
+            if float(self.cfg.decode_coef) == 0.0:
+                raise ValueError("rollout_reward='decode' requires decode_coef > 0.")
+            return
+        if mode == "head":
+            coef = self.cfg.lewm_reward_coef if self.wm.arch == "lewm" else self.cfg.reward_coef
+            name = "lewm_reward_coef" if self.wm.arch == "lewm" else "reward_coef"
+            if float(coef) == 0.0:
+                raise ValueError(f"rollout_reward='head' requires {name} > 0.")
+            return
+        raise ValueError(f"rollout_reward must be 'decode' or 'head', got {mode!r}.")
 
     # ------------------------------------------------------------------ features
 
@@ -274,21 +291,11 @@ class LatentTrainer(Trainer):
         """One world-model step. The loss is whatever ``wm.compute_loss`` defines."""
         del log_now
         cfg = self.cfg
-        coefs = {
-            "consistency_coef": cfg.consistency_coef,
-            "reward_coef": cfg.reward_coef,
-            "termination_coef": cfg.termination_coef,
-            "decode_coef": cfg.decode_coef,
-            "rho": cfg.rho,
-            "sigreg_coef": cfg.sigreg_coef,
-            "lewm_reward_coef": cfg.lewm_reward_coef,
-            "lewm_contact_coef": cfg.lewm_contact_coef,
-        }
         totals, errs, norms = [], [], []
         buckets: dict[str, list] = {}
         for _ in range(cfg.wm_batches):
             batch = self.buffer.sample_windows(cfg.wm_batch, self._open_loop)
-            loss, stats = self.wm.compute_loss(batch, self.norms, self.sim.mdp, coefs)
+            loss, stats = self.wm.compute_loss(batch, self.norms, self.sim.mdp)
             self.opt_wm.zero_grad(set_to_none=True)
             if self.wm_frozen:
                 norms.append(0.0)
@@ -355,11 +362,11 @@ class LatentTrainer(Trainer):
         return state, p, quat, obj_next
 
     def _latent_rollout(self, start: dict[str, torch.Tensor], horizon: int, wm: LatentWM):
-        """H-step latent rollout scored by the analytic reward of the decoded pose.
+        """H-step latent rollout.
 
-        The encoder of the real start is detached. Reward and termination are the
-        same functions the explicit model uses, evaluated on the pose decoded from
-        each latent, so the actor gradient is a tracking gradient.
+        ``rollout_reward='decode'`` scores the analytic reward of the decoded pose.
+        ``rollout_reward='head'`` uses the reward prediction head and does not decode.
+        The encoder of the real start is detached.
         """
         z = self._encode_flat(
             wm,
@@ -368,6 +375,44 @@ class LatentTrainer(Trainer):
             start["c"],
             start.get("obj"),
         ).detach()
+        frame = start["f"]
+        a_prev = start["a_prev"]
+        zs = [z]
+        goals = [self.sim.mdp.goal(frame, GOAL_FRAMES)]
+        actions = []
+        prevs = []
+        if str(self.cfg.rollout_reward) == "head":
+            rewards = []
+            terminateds = []
+            for _ in range(horizon):
+                action = self.policy(z, goals[-1], self.norms, deterministic=not self.cfg.stochastic_actor)
+                action_n = self.norms.action(action)
+                last = self.sim.mdp.episode_last(frame)
+                f_next = torch.minimum(frame + 1, last)
+                goal_next = self.sim.mdp.goal(f_next, GOAL_FRAMES)
+                rewards.append(wm.reward(z, action_n, self.norms.goal(goal_next)))
+                z = wm.step(z, action_n)
+                if hasattr(wm, "termination_logit"):
+                    terminateds.append(wm.termination_logit(z, self.norms.goal(goal_next)).sigmoid())
+                else:
+                    terminateds.append(torch.zeros(action.shape[0], device=action.device))
+                actions.append(action)
+                prevs.append(a_prev)
+                a_prev = action
+                frame = f_next
+                zs.append(z)
+                goals.append(goal_next)
+            reward = torch.stack(rewards, 0)
+            terminated = torch.stack(terminateds, 0)
+            parts = {name: torch.zeros_like(reward) for name in self.term_names}
+            return {
+                "z": torch.stack(zs),
+                "goals": torch.stack(goals),
+                "reward": reward,
+                "parts": parts,
+                "terminated": terminated,
+                "actions": actions,
+            }
         p, quat, _v, _w, _q, _qd = unflatten_state(start["s"])
         p = p.detach()
         quat = quat.detach()
@@ -375,15 +420,9 @@ class LatentTrainer(Trainer):
         if self.task.has_object:
             obj_p, obj_quat, _ov, _ow = unflatten_object(start["obj"])
             obj_prev = (obj_p.detach(), obj_quat.detach())
-        frame = start["f"]
-        a_prev = start["a_prev"]
         scale = self._recon_scale()
-        zs = [z]
-        goals = [self.sim.mdp.goal(frame, GOAL_FRAMES)]
         states: list[WorldModelState] = []
         frames = []
-        actions = []
-        prevs = []
         for _ in range(horizon):
             action = self.policy(z, goals[-1], self.norms, deterministic=not self.cfg.stochastic_actor)
             z = wm.step(z, self.norms.action(action))
@@ -692,6 +731,7 @@ class LatentTrainer(Trainer):
             if bool(done.any().item()):
                 length = out["ep_len"][done].float().clamp(min=1)
                 self.stats["ep"].append((out["ep_ret"][done] / (self.r_max * length)).mean().detach())
+                self.stats["ep_len"].append(length.sum().detach())
                 for name, value in out["ep_term"].items():
                     self.stats["ep_terms"][name].append(
                         _term_score(name, (value[done] / length).mean().detach(), style)
