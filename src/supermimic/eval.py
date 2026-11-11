@@ -309,7 +309,19 @@ def evaluate(ckpt: Path, device: str, *, live: bool = False, progress: bool = Tr
     saved = torch.load(ckpt, map_location=device, weights_only=False)
     # One flat mapping: the trainer ``cfg`` plus the ``task_cfg`` node beside it.
     saved_cfg = _flatten_saved(saved)
-    if "pi" in saved or "pi_live" in saved:
+    if saved.get("format") in ("maxcoord_v1", "maxcoord_v2", "maxcoord_v3", "maxcoord_v4"):
+        from supermimic.maxcoord.inference import load_policy
+
+        task = _task_from_cfg(saved_cfg)
+        n = task.load_motion(device).num_clips
+        sim = _build_sim(saved_cfg, n, device)
+        act = load_policy(saved, sim, device)
+        sim.reset(torch.arange(n, device=device), sim.motion.clip_start)
+        result = _run_rollout(sim, sim.motion, n, device,
+                              lambda sim, motion, alive: sim.step(act(), auto_reset=False),
+                              progress=progress)
+        _print_results(sim.motion, sim, *result, live=live, algo="supermimic_maxcoord")
+    elif "pi" in saved or "pi_live" in saved:
         evaluate_supermimic(saved, saved_cfg, device, live=live, progress=progress)
     elif "actor" in saved or "actor_live" in saved:
         evaluate_sac(saved, saved_cfg, device, live=live, progress=progress)

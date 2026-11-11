@@ -59,3 +59,7 @@ swanlab:
   # Derived from the task spec: `<task>`, or `<task>_<object>[_<split>]` for object tasks,
   # with a `_noobj` suffix when the object is switched off.
   experiment: ${task_run_name:${task.name},${task.object_name},${task.split},${task.has_object},${task.simple_hands}}
+
+wandb:
+  project: rethinking-supermimic
+  mode: online

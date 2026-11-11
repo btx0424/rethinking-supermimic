@@ -165,6 +165,18 @@ def _load_policy_overlay(ckpt: Path, task: TaskSpec, saved_cfg: dict, device: st
         start_f = sim.motion.clip_start[clip].to(device).view(1)
         sim.reset(torch.zeros(1, dtype=torch.long, device=device), start_f)
 
+    if saved.get("format") in ("maxcoord_v1", "maxcoord_v2", "maxcoord_v3", "maxcoord_v4"):
+        from supermimic.maxcoord.inference import load_policy
+
+        act = load_policy(saved, sim, device)
+
+        def step_maxcoord() -> bool:
+            out = sim.step(act(), auto_reset=False)
+            return not bool(out["done"].any())
+
+        return PolicyOverlay("supermimic_maxcoord", sim, reset_policy, step_maxcoord,
+                             pose_np, object_pose_np)
+
     wm_state = saved.get("wm") or {}
     if any(str(key).startswith("encoder.") for key in wm_state):
         return _load_latent_overlay(saved, saved_cfg, sim, reset_policy, pose_np, object_pose_np, device)

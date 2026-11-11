@@ -5,6 +5,9 @@ backpropagating through short imagined windows, and a critic that bootstraps the
 mjlab supplies the G1 and the physics step; the world model and the policy update never call the
 simulator.
 
+An independent maximal-coordinate implementation with explicit/latent world
+models and decoupled actors is documented in [MAXCOORD.md](MAXCOORD.md).
+
 ## Installation
 
 We use mjlab for its lightweightness. The robot model will be the G1 shipped with mjlab.

@@ -66,6 +66,10 @@ def _trainer_cfg(cls, cfg: DictConfig, run_dir: Path):
     raw["swanlab_project"] = str(cfg.swanlab.project)
     raw["swanlab_mode"] = str(cfg.swanlab.mode)
     raw["swanlab_experiment"] = _experiment_name(run_dir)
+    if "wandb_mode" in names:
+        raw["wandb_mode"] = str(cfg.wandb.mode)
+        raw["wandb_project"] = str(cfg.wandb.project)
+        raw["wandb_experiment"] = _experiment_name(run_dir)
     if "actor" in cfg and "policy_kind" in names:
         actor = cfg.actor
         raw["policy_kind"] = str(actor.kind)
@@ -89,10 +93,12 @@ def _register_configs() -> None:
     from supermimic.supermimic.supermimic import TrainConfig
     from supermimic.supermimic.supermimic_latent import LatentTrainConfig
     from supermimic.supermimic.supermimic_vfirst import VFirstTrainConfig
+    from supermimic.maxcoord.trainer import MaxCoordConfig
 
     store = ConfigStore.instance()
     for name, node in (
         ("supermimic", TrainConfig),
+        ("supermimic_maxcoord", MaxCoordConfig),
         ("supermimic_vfirst", VFirstTrainConfig),
         ("supermimic_latent", LatentTrainConfig),
         ("nablamimic", NablaTrainConfig),
@@ -122,9 +128,11 @@ def main(cfg: DictConfig) -> None:
     from supermimic.supermimic.supermimic import TrainConfig
     from supermimic.supermimic.supermimic_latent import LatentTrainConfig
     from supermimic.supermimic.supermimic_vfirst import VFirstTrainConfig
+    from supermimic.maxcoord.trainer import MaxCoordConfig
 
     trainers = {
         "supermimic": (TrainConfig, "supermimic.algos.supermimic"),
+        "supermimic_maxcoord": (MaxCoordConfig, "supermimic.maxcoord.trainer"),
         "supermimic_vfirst": (VFirstTrainConfig, "supermimic.algos.supermimic_vfirst"),
         "supermimic_latent": (LatentTrainConfig, "supermimic.algos.supermimic_latent"),
         "nablamimic": (NablaTrainConfig, "supermimic.algos.nablamimic"),
