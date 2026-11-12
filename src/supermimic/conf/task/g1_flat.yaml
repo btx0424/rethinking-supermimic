@@ -1,7 +1,0 @@
-# Flat-ground G1 velocity tracking. Rewards, commands, and the robot are mjlab's
-# unitree_g1_flat_env_cfg. There is no motion clip.
-name: g1_flat
-has_object: false
-object_name: null
-split: train
-simple_hands: false

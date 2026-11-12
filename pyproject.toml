@@ -4,62 +4,43 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rethinking-supermimic"
-version = "0.1.0"
-description = "SuperMimic motion tracking with a differentiable world model on mjlab."
+version = "0.2.0"
+description = "G1 LAFAN tracking with explicit and latent world models."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "matplotlib>=3.11.2",
-    "mjlab>=1.6.0",
-    "mujoco>=3.11.0,<3.12",
-]
-
-[project.optional-dependencies]
-# CUDA 13 (driver >= 580): PyPI torch / Warp are CUDA 13 builds.
-# uv sync --no-default-groups --extra cu13
-cu13 = [
-    "torch>=2.14.0",
-    "torchvision",
-    "warp-lang==1.18.0",
+    "mjlab==1.6.0",
+    "mujoco==3.11.0",
+    "mujoco-warp==3.11.0",
+    "warp-lang==1.16.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "numpy>=2.2,<3",
+    "tensordict==0.13.0",
+    "omegaconf>=2.3,<3",
+    "tensorboard>=2.21,<3",
+    "wandb>=0.29,<0.30",
 ]
 
 [dependency-groups]
-# CUDA 12.6 torch + Warp +cu12 wheel. Default for older drivers.
-# Requires wheels/warp_lang-1.18.0+cu12-*.whl (GitHub releases often time out).
-# uv sync
-cu12 = [
-    "torch>=2.7.0",
-    "torchvision",
-    "warp-lang==1.18.0+cu12",
-]
-
-[tool.uv]
-default-groups = ["cu12"]
-conflicts = [
-    [{ group = "cu12" }, { extra = "cu13" }],
-]
-required-environments = [
-    "sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
+dev = ["pytest>=8", "ruff>=0.9"]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu126", group = "cu12" },
-]
-torchvision = [
-    { index = "pytorch-cu126", group = "cu12" },
-]
-warp-lang = [
-    { path = "wheels/warp_lang-1.18.0+cu12-py3-none-manylinux_2_28_x86_64.whl", group = "cu12" },
-]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

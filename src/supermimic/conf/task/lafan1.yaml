@@ -1,6 +1,0 @@
-# LAFAN1: mjlab G1, 29 hinges, no object in the scene.
-name: lafan1
-has_object: false
-object_name: null
-split: train
-simple_hands: false

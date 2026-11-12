@@ -1,7 +1,6 @@
-"""Quaternion and rotation helpers. Quaternions are (w, x, y, z)."""
+"""Quaternion helpers; wxyz convention throughout."""
 
 from __future__ import annotations
-
 import torch
 
 
@@ -51,47 +50,18 @@ def quat_to_mat(q: torch.Tensor) -> torch.Tensor:
     two = 2.0
     return torch.stack(
         (
-            torch.stack((1 - two * (y * y + z * z), two * (x * y - z * w), two * (x * z + y * w)), -1),
-            torch.stack((two * (x * y + z * w), 1 - two * (x * x + z * z), two * (y * z - x * w)), -1),
-            torch.stack((two * (x * z - y * w), two * (y * z + x * w), 1 - two * (x * x + y * y)), -1),
+            torch.stack(
+                (1 - two * (y * y + z * z), two * (x * y - z * w), two * (x * z + y * w)), -1
+            ),
+            torch.stack(
+                (two * (x * y + z * w), 1 - two * (x * x + z * z), two * (y * z - x * w)), -1
+            ),
+            torch.stack(
+                (two * (x * z - y * w), two * (y * z + x * w), 1 - two * (x * x + y * y)), -1
+            ),
         ),
         -2,
     )
-
-
-def mat_to_quat(m: torch.Tensor) -> torch.Tensor:
-    """Shepperd's method. ``m`` is (..., 3, 3)."""
-    batch = m.shape[:-2]
-    flat = m.reshape(-1, 9)
-    m00, m01, m02, m10, m11, m12, m20, m21, m22 = flat.unbind(-1)
-
-    def _sqrt_pos(x: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt(x.clamp(min=0))
-
-    q_abs = _sqrt_pos(
-        torch.stack(
-            (
-                1.0 + m00 + m11 + m22,
-                1.0 + m00 - m11 - m22,
-                1.0 - m00 + m11 - m22,
-                1.0 - m00 - m11 + m22,
-            ),
-            -1,
-        )
-    )
-    quat_by = torch.stack(
-        (
-            torch.stack((q_abs[:, 0].square(), m21 - m12, m02 - m20, m10 - m01), -1),
-            torch.stack((m21 - m12, q_abs[:, 1].square(), m10 + m01, m02 + m20), -1),
-            torch.stack((m02 - m20, m10 + m01, q_abs[:, 2].square(), m12 + m21), -1),
-            torch.stack((m10 - m01, m20 + m02, m21 + m12, q_abs[:, 3].square()), -1),
-        ),
-        1,
-    )
-    quat_candidates = quat_by / (2.0 * q_abs.clamp(min=0.1).unsqueeze(-1))
-    best = q_abs.argmax(dim=-1)
-    quat = quat_candidates[torch.arange(best.shape[0], device=best.device), best]
-    return quat_normalize(quat).reshape(*batch, 4)
 
 
 def mat_to_6d(m: torch.Tensor) -> torch.Tensor:
@@ -108,20 +78,6 @@ def yaw_quat(q: torch.Tensor) -> torch.Tensor:
     out[..., 0] = half.cos()
     out[..., 3] = half.sin()
     return quat_normalize(out)
-
-
-def yaw_matrix(q: torch.Tensor) -> torch.Tensor:
-    return quat_to_mat(yaw_quat(q))
-
-
-def rotvec_to_quat(rotvec: torch.Tensor) -> torch.Tensor:
-    angle = rotvec.norm(dim=-1, keepdim=True)
-    half = 0.5 * angle
-    small = angle < 1e-8
-    scale = torch.where(small, 0.5 - angle.square() / 48.0, half.sin() / angle.clamp(min=1e-8))
-    xyz = rotvec * scale
-    w = torch.where(small.squeeze(-1), 1.0 - angle.square().squeeze(-1) / 8.0, half.squeeze(-1).cos())
-    return quat_normalize(torch.cat((w.unsqueeze(-1), xyz), -1))
 
 
 def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
@@ -155,16 +111,3 @@ def quat_from_euler_xyz(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tens
 def quat_error_angle(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     """Rotation angle in radians between two quaternions."""
     return quat_to_rotvec(quat_mul(q1, quat_inv(q2))).norm(dim=-1)
-
-
-def skew(v: torch.Tensor) -> torch.Tensor:
-    x, y, z = v.unbind(-1)
-    o = torch.zeros_like(x)
-    return torch.stack(
-        (
-            torch.stack((o, -z, y), -1),
-            torch.stack((z, o, -x), -1),
-            torch.stack((-y, x, o), -1),
-        ),
-        -2,
-    )

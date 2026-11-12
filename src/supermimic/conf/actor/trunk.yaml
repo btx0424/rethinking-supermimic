@@ -1,5 +1,0 @@
-# One MLP on the concatenated goal and proprioceptive history. No tanh code.
-# Select with `actor=trunk`.
-kind: trunk
-hidden: [1024, 1024, 512]
-norm: layer
