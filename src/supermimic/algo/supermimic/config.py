@@ -19,14 +19,14 @@ class TrainConfig:
     simnorm_dim: int = 8
     actor_hidden: tuple[int, ...] = (512, 512, 512)
     consistency_weight: float = 1.0
-    num_envs: int = 1024
+    num_envs: int = 4096
     iterations: int = 40000
     buffer_steps: int = 1000
     collect_steps: int = 4
     wm_window: int = 8
     wm_batches: int = 10
-    wm_batch: int = 512
-    pi_batch: int = 512
+    wm_batch: int = 2048
+    pi_batch: int = 4096
     horizon: int = 32
     pi_warmup: int = 50
     wm_lr: float = 2e-4

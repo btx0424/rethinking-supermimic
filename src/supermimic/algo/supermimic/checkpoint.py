@@ -8,7 +8,7 @@ from supermimic.algo.supermimic.policy.actor import Actor
 from .normalization import VecNorm
 
 FORMAT = "g1_lafan_v1"
-PROTOCOL = "task_terms_command_state_all_collision_friction_v1"
+PROTOCOL = "task_terms_command_state_all_collision_friction_robot_root_goal_v2"
 
 
 def save(algo, iteration):

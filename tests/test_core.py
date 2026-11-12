@@ -104,13 +104,20 @@ class CoreTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(a.grad).all())
                 self.assertGreater(float(a.grad.abs().sum()), 0)
 
-    def test_goal_full_orientation(self):
+    def test_goal_reference_root_in_robot_frame(self):
         motion = motion_fixture()
         motion.root_p[1:, 0] = 1
         motion.root_quat[:] = torch.tensor([2**-0.5, 0.0, 2**-0.5, 0.0])
-        result = goal(motion, torch.tensor([0]), motion.root_quat[:1])
+        result = goal(motion, torch.tensor([0]), motion.root_p[:1], motion.root_quat[:1])
         torch.testing.assert_close(
             result[0, :3], torch.tensor([0.0, 0.0, 1.0]), atol=1e-6, rtol=1e-6
+        )
+        # The robot offset from the reference enters the goal (robot root frame).
+        robot_pos = torch.tensor([[0.0, 0.5, 0.0]])
+        robot_quat = torch.tensor([[2**-0.5, 0.0, 0.0, 2**-0.5]])  # yaw +90 deg
+        result = goal(motion, torch.tensor([0]), robot_pos, robot_quat)
+        torch.testing.assert_close(
+            result[0, :3], torch.tensor([-0.5, -1.0, 0.0]), atol=1e-6, rtol=1e-6
         )
 
     def test_same_policy_loop_and_raw_replay(self):

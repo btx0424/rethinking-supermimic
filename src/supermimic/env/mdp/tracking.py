@@ -26,6 +26,7 @@ class TrackingTask(TrackingTermination):
             goal(
                 self.motion,
                 self.command.frame(state.command),
+                physical.aux[..., :3],
                 physical.aux[..., 3:7],
                 self.goal_frames,
             ),

@@ -39,11 +39,13 @@ def main():
         wandb=WandbConfig(mode="disabled"),
     )
     if args.full_size:
-        cfg.num_envs = 1024
+        defaults = TrainConfig()
+        cfg.num_envs = defaults.num_envs
         cfg.buffer_steps = 1000
         cfg.wm_hidden = cfg.actor_hidden = (512, 512, 512)
         cfg.latent_dim = 256
-        cfg.wm_batch = cfg.pi_batch = 512
+        cfg.wm_batch = defaults.wm_batch
+        cfg.pi_batch = defaults.pi_batch
         cfg.wm_batches = 10
         cfg.wm_window = 8
         cfg.horizon = 32
