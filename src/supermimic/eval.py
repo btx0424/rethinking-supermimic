@@ -1,6 +1,7 @@
 """Native G1 LAFAN tracking evaluation, using the same real env/policy loop."""
 
-import argparse, json
+import argparse
+import json
 import torch
 from supermimic.algo.supermimic.checkpoint import load_policy
 from supermimic.env.sim.env import SimulationEnv

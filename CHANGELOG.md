@@ -2,6 +2,18 @@
 
 ## 2026-11-12
 
+### Explicit optimizer comparison controls
+
+- Add critic optimizer selection and actor elementwise gradient clipping after
+  global norm clipping, including CUDA Graph execution. Defaults retain pure
+  Adam critic and no value clipping. Resume rejects incompatible settings.
+- Add explicit `muon_adam` selection for official zero-decay Adam splitting;
+  existing `muon` retains its AdamW behavior. Actor betas remain 0.9/0.95.
+- Let training and eager/graph checks accept TrainConfig overrides.
+- Validation: 12 local CPU unit tests pass; Ruff checks changed files and
+  repository E4/E7/E9/F rules. Remote full-size checks recorded in task artifacts.
+
+
 ### G1-only modular cleanup
 
 - Keep explicit/latent world models and explicit actor only. Remove legacy

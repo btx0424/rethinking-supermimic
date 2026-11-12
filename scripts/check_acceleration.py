@@ -4,12 +4,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import argparse, copy, json
+import argparse
+import copy
+import json
+
 import torch
+
+from supermimic.algo.supermimic.capture import _optimizers, _tensor_state
 from supermimic.algo.supermimic.config import TrainConfig, WandbConfig
 from supermimic.algo.supermimic.trainer import Trainer
 from supermimic.algo.supermimic.updates import Updates
-from supermimic.algo.supermimic.capture import _tensor_state, _optimizers
 from supermimic.nn.optim import build_optimizer
 
 
@@ -18,6 +22,7 @@ def main():
     p.add_argument("--wm", choices=["explicit", "latent"], required=True)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--full-size", action="store_true")
+    p.add_argument("overrides", nargs="*", help="TrainConfig key=value overrides")
     args = p.parse_args()
     torch.set_num_threads(8)
     cfg = TrainConfig(
@@ -51,6 +56,11 @@ def main():
         cfg.horizon = 32
         cfg.critic_epochs = 5
         cfg.critic_minibatches = 4
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.to_object(
+        OmegaConf.merge(OmegaConf.structured(cfg), OmegaConf.from_dotlist(args.overrides))
+    )
     algo = Trainer(cfg)
     algo.collect(32)
     algo.buffer.prepare(cfg.wm_window, cfg.horizon, algo.motion)
@@ -86,7 +96,7 @@ def main():
     reference_opts = (
         build_optimizer(algo.wm, cfg.wm_lr, cfg.optim),
         build_optimizer(algo.actor, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95)),
-        build_optimizer(algo.critic, cfg.v_lr, "adam"),
+        build_optimizer(algo.critic, cfg.v_lr, cfg.critic_optim),
     )
     for source, target in zip(fast_opts, reference_opts, strict=True):
         target.load_state_dict(copy.deepcopy(source.state_dict()))

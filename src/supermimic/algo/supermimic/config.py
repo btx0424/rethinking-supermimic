@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+
 from supermimic.env.mdp.config import TaskConfig
 
 
@@ -42,6 +43,8 @@ class TrainConfig:
     normalize_reward: bool = True
     vecnorm_decay: float = 0.9999
     optim: str = "muon"
+    critic_optim: str = "adam"
+    actor_grad_clip_value: float = 0.0
     cuda_graphs: bool = True
     device: str = "cuda"
     seed: int = 0
@@ -83,5 +86,13 @@ class TrainConfig:
             or self.consistency_weight < 0
         ):
             raise ValueError("Invalid learning scale")
+        if self.optim not in ("adam", "muon", "muon_adam") or self.critic_optim not in (
+            "adam",
+            "muon",
+            "muon_adam",
+        ):
+            raise ValueError("Unknown optimizer")
+        if not 0 <= self.actor_grad_clip_value < float("inf"):
+            raise ValueError("actor_grad_clip_value must be finite and nonnegative")
         if self.wandb.mode not in ("online", "disabled"):
             raise ValueError("Use online logging, or disabled for smoke tests")

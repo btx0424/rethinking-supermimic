@@ -62,12 +62,14 @@ class CapturedUpdate:
         return self.outputs
 
 
-def optimize_capturable(loss, module, optimizer, max_norm):
+def optimize_capturable(loss, module, optimizer, max_norm, clip_value=0.0):
     # Device assertions preserve fail-fast checks without Tensor -> bool syncs.
     torch._assert_async(torch.isfinite(loss), "Non-finite learner loss")
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm, error_if_nonfinite=False)
     torch._assert_async(torch.isfinite(norm), "Non-finite learner gradient norm")
+    if clip_value > 0:
+        torch.nn.utils.clip_grad_value_(module.parameters(), clip_value)
     optimizer.step()
     return norm.detach()

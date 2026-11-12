@@ -6,26 +6,29 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+
 import torch
-from supermimic.env.mdp.observation import observation_width, concatenate
-from supermimic.env.sim.env import SimulationEnv
-from supermimic.algo.supermimic.wm.env import WorldModelEnv
-from supermimic.env.rollout.policy import rollout
-from supermimic.env.mdp import CONTROL_DT
-from supermimic.dataset.motion import MotionDataset
-from supermimic.env.mdp.reference import TrackingReference
-from supermimic.env.mdp.tracking import TrackingTask
-from supermimic.algo.supermimic.wm import MaxCoordRepresentation, build_world_model
+
 from supermimic.algo.supermimic.policy.actor import Actor
 from supermimic.algo.supermimic.policy.critic import Critic
+from supermimic.algo.supermimic.wm import MaxCoordRepresentation, build_world_model
+from supermimic.algo.supermimic.wm.env import WorldModelEnv
+from supermimic.dataset.motion import MotionDataset
+from supermimic.env.mdp import CONTROL_DT
+from supermimic.env.mdp.observation import concatenate, observation_width
+from supermimic.env.mdp.reference import TrackingReference
+from supermimic.env.mdp.tracking import TrackingTask
+from supermimic.env.rollout.policy import rollout
+from supermimic.env.sim.env import SimulationEnv
 from supermimic.nn.optim import build_optimizer
-from supermimic.utils.timing import IterationTimer
 from supermimic.utils.logging import Logger
+from supermimic.utils.timing import IterationTimer
+
+from . import checkpoint
 from .normalization import build_vecnorms
 from .replay import ReplayBuffer
 from .reward_norm import RewardNormalizer
 from .updates import Updates
-from . import checkpoint
 
 
 class Trainer:
@@ -67,7 +70,7 @@ class Trainer:
         self.imagined = WorldModelEnv(self.wm, self.task)
         self.opt_wm = build_optimizer(self.wm, cfg.wm_lr, cfg.optim)
         self.opt_pi = build_optimizer(self.actor, cfg.pi_lr, cfg.optim, adam_betas=(0.9, 0.95))
-        self.opt_v = build_optimizer(self.critic, cfg.v_lr, "adam")
+        self.opt_v = build_optimizer(self.critic, cfg.v_lr, cfg.critic_optim)
         self.buffer = ReplayBuffer(
             cfg.buffer_steps, cfg.num_envs, rep.full_state_dim, self.task.num_joints, cfg.device
         )
@@ -118,8 +121,8 @@ class Trainer:
             rewards.append(result.reward.mean())
             terminations.append(result.terminated.float().mean())
             lengths.extend(result.info["episode_length"][done].unbind())
-            for key in terms:
-                terms[key].append(result.terms[key].mean())
+            for key, values in terms.items():
+                values.append(result.terms[key].mean())
             self.collection_state = result.continuation
         return {
             "SimReward/total": torch.stack(rewards).mean() / CONTROL_DT,

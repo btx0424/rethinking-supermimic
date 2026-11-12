@@ -7,7 +7,7 @@ MLPs mark their first Linear and their output head that way.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class OptimizerGroup(torch.optim.Optimizer):
@@ -70,6 +70,7 @@ class MuonAdamW(OptimizerGroup):
         weight_decay: float = 0.01,
         adam_betas: tuple[float, float] = (0.9, 0.999),
         ignore_frozen: bool = True,
+        adam_kind: str = "adamw",
     ):
         seen: set[int] = set()
         muon_params: list[nn.Parameter] = []
@@ -91,8 +92,12 @@ class MuonAdamW(OptimizerGroup):
             optimizers.append(torch.optim.Muon(muon_params, lr=lr, adjust_lr_fn="match_rms_adamw"))
         if adamw_params:
             optimizers.append(
-                torch.optim.AdamW(
-                    adamw_params, lr=lr, weight_decay=weight_decay, betas=adam_betas, fused=True
+                (torch.optim.Adam if adam_kind == "adam" else torch.optim.AdamW)(
+                    adamw_params,
+                    lr=lr,
+                    weight_decay=0.0 if adam_kind == "adam" else weight_decay,
+                    betas=adam_betas,
+                    fused=True,
                 )
             )
         if not optimizers:
@@ -106,12 +111,17 @@ def build_optimizer(
     kind: str,
     adam_betas: tuple[float, float] = (0.9, 0.999),
 ) -> torch.optim.Optimizer:
-    """``adam`` or ``muon``. ``muon`` still uses AdamW on non-matrix and ``_non_muon`` weights."""
+    """``muon`` preserves AdamW; ``muon_adam`` uses zero-decay Adam for the rest."""
     if isinstance(modules, nn.Module):
         modules = [modules]
     if kind == "adam":
         params = [p for module in modules for p in module.parameters() if p.requires_grad]
         return torch.optim.Adam(params, lr=lr, betas=adam_betas)
-    if kind == "muon":
-        return MuonAdamW(modules, lr=lr, adam_betas=adam_betas)
-    raise ValueError(f"Unknown optim {kind!r}. Expected 'adam' or 'muon'.")
+    if kind in ("muon", "muon_adam"):
+        return MuonAdamW(
+            modules,
+            lr=lr,
+            adam_betas=adam_betas,
+            adam_kind="adam" if kind == "muon_adam" else "adamw",
+        )
+    raise ValueError(f"Unknown optim {kind!r}. Expected 'adam', 'muon' or 'muon_adam'.")

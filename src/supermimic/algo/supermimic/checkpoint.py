@@ -1,10 +1,13 @@
 """The G1-only checkpoint contract. Historical formats live on the backup branch."""
 
-from dataclasses import asdict
-import torch
 import json
-from supermimic.env.mdp.observation import observation_width, concatenate
+from dataclasses import asdict
+
+import torch
+
 from supermimic.algo.supermimic.policy.actor import Actor
+from supermimic.env.mdp.observation import concatenate, observation_width
+
 from .normalization import VecNorm
 
 FORMAT = "g1_lafan_v1"
@@ -59,6 +62,9 @@ def resume(algo, path):
         "normalize_reward",
         "optim",
     )
+    for key, default in (("critic_optim", "adam"), ("actor_grad_clip_value", 0.0)):
+        if old.get(key, default) != current[key]:
+            raise ValueError(f"Resume configuration differs: {key}")
     if json.dumps(old["task"], sort_keys=True) != json.dumps(current["task"], sort_keys=True):
         raise ValueError("Resume task configuration differs")
     for key in keys:

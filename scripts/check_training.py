@@ -4,11 +4,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import argparse, csv, json
+import argparse
+import csv
+import json
+
 import torch
+
+from supermimic.algo.supermimic.checkpoint import FORMAT, load_policy
 from supermimic.algo.supermimic.config import TrainConfig, WandbConfig
 from supermimic.algo.supermimic.trainer import Trainer
-from supermimic.algo.supermimic.checkpoint import load_policy, FORMAT
 from supermimic.env.rollout.policy import policy_step
 
 
@@ -16,6 +20,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--wm", choices=["explicit", "latent"], required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("overrides", nargs="*", help="TrainConfig key=value overrides")
     args = p.parse_args()
     torch.set_num_threads(8)
     cfg = TrainConfig(
@@ -36,6 +41,11 @@ def main():
         log_every=3,
         ckpt_every=6,
         wandb=WandbConfig(mode="disabled"),
+    )
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.to_object(
+        OmegaConf.merge(OmegaConf.structured(cfg), OmegaConf.from_dotlist(args.overrides))
     )
     algo = Trainer(cfg)
     calls = []
@@ -84,7 +94,7 @@ def main():
     algo.updates.fit_world_model = frozen(algo.updates.fit_world_model)
     algo.updates.fit_policy = frozen(algo.updates.fit_policy)
     algo.fit()
-    assert calls == [32] + [4] * 6
+    assert calls == [max(2 * cfg.wm_window, 32)] + [cfg.collect_steps] * cfg.iterations
     assert algo.updates.wm_update.graph is not None and algo.updates.policy_update.graph is not None
     rows = list(csv.DictReader((algo.log_dir / "train_log.csv").open()))
     for row in rows:
@@ -97,7 +107,7 @@ def main():
                 < 1e-5
             )
     perf = list(csv.DictReader((algo.log_dir / "performance.csv").open()))
-    assert [int(r["iteration"]) for r in perf] == list(range(1, 7))
+    assert [int(r["iteration"]) for r in perf] == list(range(1, cfg.iterations + 1))
     assert all(float(r["collect_time"]) > 0 and float(r["train_time"]) > 0 for r in perf)
     policy, data = load_policy(algo.log_dir / "last.pt", cfg.device)
     assert data["format"] == FORMAT

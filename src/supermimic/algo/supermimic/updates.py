@@ -1,13 +1,15 @@
 """One learner implementation for eager execution and whole-update CUDA Graphs."""
 
 import torch
+
+from supermimic.algo.supermimic.wm.interface import WMBatch
+from supermimic.env.mdp import CONTROL_DT
 from supermimic.env.mdp.command import CommandState
+from supermimic.env.rollout.policy import rollout
 from supermimic.nn.utils import hold_out_net
 from supermimic.robots.g1 import normalize_context
-from supermimic.env.mdp import CONTROL_DT
-from supermimic.algo.supermimic.wm.interface import WMBatch
-from supermimic.env.rollout.policy import rollout
-from .capture import CapturedUpdate, _tensor_state, _optimizers, optimize_capturable
+
+from .capture import CapturedUpdate, _optimizers, _tensor_state, optimize_capturable
 
 
 class Updates:
@@ -127,7 +129,9 @@ class Updates:
             inputs.append(final_inputs.detach())
             value = algo.critic(final_inputs).mean(-1)
             pi_loss = -(returns + cfg.gamma**cfg.horizon * alive * value).mean()
-            grad_pi = optimize_capturable(pi_loss, algo.actor, algo.opt_pi, cfg.grad_clip_norm)
+            grad_pi = optimize_capturable(
+                pi_loss, algo.actor, algo.opt_pi, cfg.grad_clip_norm, cfg.actor_grad_clip_value
+            )
         x = torch.stack(inputs)
         reward = torch.stack(rewards)
         term = torch.stack(terms)
