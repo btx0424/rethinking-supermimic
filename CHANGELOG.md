@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-11-12
+
+### G1-only modular cleanup
+
+- Keep explicit/latent world models and explicit actor only. Remove legacy
+  algorithms, multi-task/object/dex-hand assets, IK and specialized foot/hand
+  matching, old training/playback scripts and experimental torch.compile paths.
+- Organize real simulation under env/sim, shared MDP terms and physical geometry
+  under env/mdp, and all WM/policy learning under algo/supermimic. Both rollout
+  paths share observations/rewards/command progression. Latent continuation is
+  internal to the WM adapter; term-facing PhysicalState has no latent fields.
+- Full MotionData uses TensorClass (TensorDict 0.13), with typed batched get_slice
+  windows clamped to clip bounds. Dataset is independent of task selection;
+  TrackingReference selects/reorders configured bodies without mutating it.
+- TaskConfig controls observation groups, reward weights/sigmas and termination.
+  Default input/reward semantics, collect-only VecNorm, raw replay, per-component
+  pre-dt logging and per-iteration collect/train timing are retained.
+- Domain randomization selects all robot collision geoms rather than named feet.
+  Only the mjlab G1 asset and prepared LAFAN NPZ input path remain.
+- Validation: seven unit tests; explicit/latent six-iteration simulator/graph
+  smokes; both formal-size eager/graph comparisons (maximum relative update
+  error 0.05553% / 0.03911%); CLI checkpoint resume and native 40-clip eval.
+  These are correctness checks, not a training-quality comparison.
+- Pin the validated runtime and document the new CLI, state/replay contract and
+  checkpoint compatibility. Preserve old source at 49a4d12 on branch
+  maxcoord-before-cleanup-20261111. Existing remote snapshots are untouched.
+
 ## 2026-11-11
 
 ### Unified WM interface and critic context
@@ -125,3 +152,18 @@
 - Checked live/EMA checkpoint encoder selection, including legacy fallbacks.
 - Changed Python files compile successfully; `git diff --check` passed.
 - Full training was not run locally: the environment lacks `omegaconf`.
+
+### Explicit rollout command and episode state
+
+- Store motion id and clip-local integer motion time in CommandState; sim and
+  imagination share MotionCommand.advance and clip-end clamping.
+- Replay preserves paired physical state, command, previous action, raw simulator
+  context and episode step. Imagined reset restores these fields without
+  resampling a motion or resetting the robot to its reference pose.
+- Preserve pre-reset successors separately from reset continuation states;
+  partial resets clear only selected episode counters. Simulator timeout stays
+  500 steps, while imagination retains soft-survival/no-timeout behavior.
+- No term-memory container or history-dependent reward was added.
+- Validation: five CPU unit tests and explicit/latent six-iteration CUDA Graph
+  training checks pass, including mixed-clip restore, partial reset, raw replay,
+  collect-only normalization, reward component logging and checkpoint equality.
