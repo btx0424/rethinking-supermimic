@@ -120,6 +120,21 @@ uv run scripts/check_acceleration.py --wm latent --full-size --output /tmp/g1-la
 uv run scripts/eval.py --checkpoint /path/to/last.pt
 ```
 
+## Playback
+
+```bash
+uv run scripts/play.py --checkpoint /path/to/last.pt --backend sim   # or --backend wm
+uv run scripts/play.py --checkpoint /path/to/last.pt --backend wm --headless --clips 0 20
+```
+
+Opens a viser viewer at `http://localhost:8080` (`--port`). The Play tab
+switches backend (`sim` MuJoCo or the checkpoint's own `wm`) and motion clip.
+The reference G1 is drawn beside the policy; blue/orange points are the policy
+and reference tracked bodies. Sim uses evaluation context and hard height/tilt
+termination. WM rolls open loop from the reference state, never resets and
+reports soft survival; its full-body display is a least-squares fit to the 14
+predicted bodies (fit RMS is shown). Checkpoints of both goal protocols load.
+
 Output directories must be fresh. Eval is a native LAFAN diagnostic, not the
 MotionDecode deployment benchmark. Resume with `resume=/path/to/last.pt` and a
 fresh `run_dir`, keeping architecture/task settings identical. Resume restores
