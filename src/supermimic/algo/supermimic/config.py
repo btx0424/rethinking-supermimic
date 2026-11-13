@@ -29,10 +29,10 @@ class TrainConfig:
     wm_batch: int = 2048
     pi_batch: int = 4096
     horizon: int = 32
-    pi_warmup: int = 50
+    pi_warmup: int = 0
     wm_lr: float = 2e-4
-    pi_lr: float = 5e-4
-    v_lr: float = 5e-4
+    pi_lr: float = 2e-4
+    v_lr: float = 2e-4
     gamma: float = 0.99
     lam: float = 0.95
     action_noise: float = 0.1
@@ -42,9 +42,9 @@ class TrainConfig:
     critic_minibatches: int = 4
     normalize_reward: bool = True
     vecnorm_decay: float = 0.9999
-    optim: str = "muon"
-    critic_optim: str = "adam"
-    actor_grad_clip_value: float = 0.0
+    optim: str = "muon_adam"
+    critic_optim: str = "muon_adam"
+    actor_grad_clip_value: float = 0.1
     cuda_graphs: bool = True
     device: str = "cuda"
     seed: int = 0

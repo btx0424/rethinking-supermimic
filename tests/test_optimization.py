@@ -28,8 +28,8 @@ def test_optimizer_defaults_and_adam_split():
     assert {id(p) for g in aligned.param_groups for p in g["params"]} == {
         id(p) for p in model.parameters()
     }
-    assert TrainConfig().critic_optim == "adam"
-    assert TrainConfig().actor_grad_clip_value == 0
+    assert TrainConfig().critic_optim == "muon_adam"
+    assert TrainConfig().actor_grad_clip_value == 0.1
 
 
 @pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])

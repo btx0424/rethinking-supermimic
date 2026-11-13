@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-13
+
+### Use the aligned explicit run defaults
+
+- Match run `ufl6s97u` by default: 4096 environments, WM batch 2048, actor
+  rollout batch 4096, learning rates of 2e-4 and no actor LR warmup.
+- Use Muon + Adam for WM, actor and critic, with actor elementwise gradient
+  clipping at 0.1 after global norm clipping. Keep the robot-relative root goal
+  and the WM/actor horizons of 8/32.
+- Update the README and existing default assertions to match the selected run.
+- Validation: all non-metadata defaults match the saved `ufl6s97u` config;
+  explicit overrides still reproduce `13uji7un`. All 12 CPU tests, Ruff on the
+  changed Python files, and diff whitespace checks pass.
+
 ## 2026-11-12
 
 ### Explicit optimizer comparison controls

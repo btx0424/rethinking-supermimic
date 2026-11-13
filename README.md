@@ -75,14 +75,21 @@ critic additionally sees `xi_n`. Observation composition determines network and
 VecNorm input sizes. W&B online is required for formal training; short local
 checks use disabled logging.
 
-Defaults: 4096 sim environments, collect 4 steps/iteration, a 1000-step replay
-per environment, 10 WM batches of 2048 eight-step sequences, then 4096 imagined
-starts with horizon 32 for one actor update and 20 critic minibatch updates
+Defaults match the explicit run `ufl6s97u`: 4096 sim environments,
+collect 4 steps/iteration, a 1000-step replay per environment, 10 WM batches of
+2048 eight-step sequences, then 4096 imagined starts with horizon 32 for one actor
+update and 20 critic minibatch updates
 (5 epochs over the 131,072 imagined rows, 4 minibatches each).
 WM windows never cross episode resets; actor starts have enough reference frames
 for the imagined horizon. Replay capacity is 4,096,000 transitions (250 four-step
 collect calls once full). Collection continues from the preceding collect;
 only ended episodes reset.
+
+WM, actor and critic learning rates are all `2e-4`, with no actor learning-rate
+warmup. All three use `muon_adam`: Muon for hidden matrices (weight decay 0.1)
+and Adam for the remaining parameters (weight decay 0). Global gradient norm
+clipping is 1; actor gradients are then clipped elementwise to +/-0.1.
+Other experiment settings remain available through explicit CLI overrides.
 
 The goal term gives, for each of the next 10 reference frames, the reference
 root position and orientation in the current robot root frame
